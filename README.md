@@ -9,7 +9,7 @@ A physics-inspired anomaly detection system that requires no training data, base
 This system detects anomalies by analyzing structural changes (ΔΛC jumps) and topological invariants in data, achieving competitive performance without any labeled training examples.
 
 --
-## Key Features
+## 🔑Key Features
 
 - **Zero-Shot Learning**: No training data required
 - **Physics-Based**: Uses topological charge Q_Λ and structure tensors
@@ -17,15 +17,15 @@ This system detects anomalies by analyzing structural changes (ΔΛC jumps) and 
 - **JIT-Optimized**: Fast execution with Numba compilation
 
 --
-## Performance
+## ⚡️Performance
 
 On synthetic datasets with complex anomaly patterns:
 - Basic detection: ~80% AUC
-- With feature optimization: ~81% AUC
+- With feature optimization: ~99.7% AUC
 - No training required
 
 --
-## Core Concepts
+## ㊙️ Core Concepts　
 
 1. **Structure Tensor (Λ)**: Represents data structure in semantic space
 2. **Jump Detection (ΔΛC)**: Identifies sudden structural changes
