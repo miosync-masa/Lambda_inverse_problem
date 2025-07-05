@@ -1187,23 +1187,27 @@ class Lambda3ZeroShotDetector:
         return final_scores
 
     def detect_anomalies_focused(self, result: Lambda3Result, events: np.ndarray, 
-                           use_optimization: bool = True) -> np.ndarray:
+                                use_optimization: bool = True) -> np.ndarray:
         """
-        Focused anomaly detection using the strongest feature(s) discovered through optimization
+        Focused anomaly detection using the most informative features discovered by optimization.
+        Directly applies the top features for zero-shot detection.
         """
         if use_optimization:
+            # 1. Extract advanced engineered features from the analysis result and raw data
             advanced_features = self.extract_advanced_features(result, events)
+            
+            # 2. Generate pseudo-labels from basic anomaly scores
+            #    (selecting only the clearest normal/anomaly samples by percentiles)
             base_scores = self.detect_anomalies(result, events)
             score_percentiles = np.percentile(base_scores, [10, 90])
             clear_normal = base_scores < score_percentiles[0]
             clear_anomaly = base_scores > score_percentiles[1]
-            clear_indices = np.where(clear_normal | clear_anomaly)[0]
             
             if np.sum(clear_normal) > 10 and np.sum(clear_anomaly) > 10:
-                clear_labels = np.zeros_like(clear_indices)
-                clear_labels[clear_anomaly[clear_indices]] = 1 
+                clear_indices = np.where(clear_normal | clear_anomaly)[0]
+                clear_labels = clear_anomaly[clear_normal | clear_anomaly].astype(int)
                 
-                # Extract features for corresponding indices only
+                # Only keep feature values for clear samples
                 clear_features = {}
                 for feat_name, feat_vals in advanced_features.items():
                     if len(feat_vals) == len(events):
@@ -1211,22 +1215,22 @@ class Lambda3ZeroShotDetector:
                     else:
                         clear_features[feat_name] = feat_vals
                 
-                # 3. Run optimization to discover the strongest feature(s)
+                # 3. Run robust optimization to find the most informative features
                 optimal_weights, _ = self.optimize_feature_weights_robust(
                     clear_features, clear_labels, result, clear_indices
                 )
                 
-                # 4. Get feature(s) with highest weight (use all if multiple)
-                # Set weight threshold (50% of maximum weight)
+                # 4. Select all features with ≥50% of the highest weight
                 max_weight = max(optimal_weights.values())
                 weight_threshold = max_weight * 0.5
-                
-                # Select all important features
-                important_features = [(feat, weight) for feat, weight in optimal_weights.items() 
-                                    if weight >= weight_threshold]
+                important_features = [
+                    (feat, weight)
+                    for feat, weight in optimal_weights.items()
+                    if weight >= weight_threshold
+                ]
                 
                 if len(important_features) == 1:
-                    # Single feature case (traditional approach)
+                    # Only one important feature (classic focused detection)
                     best_feature = important_features[0][0]
                     print(f"\nUsing single best feature: {best_feature} (weight: {optimal_weights[best_feature]:.4f})")
                     
@@ -1235,38 +1239,49 @@ class Lambda3ZeroShotDetector:
                         path_matrix = np.stack(list(result.paths.values()))
                         
                         if len(best_feature_values) == len(path_matrix):
+                            # Path-level feature (per-Λ)
                             scores = np.sum(np.abs(path_matrix) * best_feature_values[:, None], axis=0)
                         else:
+                            # Event-level feature
                             scores = best_feature_values
                         
+                        # Final normalization
                         if np.std(scores) > 0:
                             scores = (scores - np.mean(scores)) / np.std(scores)
                         
                         return scores
                 else:
-                    # Multiple features weighted combination
+                    # Weighted combination of multiple important features (as in optimization)
                     print(f"\nUsing {len(important_features)} important features:")
                     for feat, weight in important_features:
                         print(f"  - {feat}: {weight:.4f}")
                     
-                    # Calculate weighted scores
-                    weighted_scores = self._compute_weighted_scores(
-                        {feat: advanced_features[feat] for feat, _ in important_features},
-                        {feat: weight for feat, weight in important_features},
-                        result
-                    )
+                    path_matrix = np.stack(list(result.paths.values()))
+                    n_events = events.shape[0]
+                    combined_score = np.zeros(n_events)
                     
-                    return weighted_scores
-        
-        # Fallback: use sq_Q_Λ
+                    for feat, weight in important_features:
+                        if feat in advanced_features:
+                            vals = advanced_features[feat]
+                            if len(vals) == len(path_matrix):  # Path-level feature
+                                event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
+                            else:  # Event-level feature
+                                event_scores = vals
+                            combined_score += weight * event_scores
+                    
+                    # Only normalize at the end
+                    if np.std(combined_score) > 0:
+                        combined_score = (combined_score - np.mean(combined_score)) / np.std(combined_score)
+                    
+                    return combined_score
+
+        # Fallback: Use squared topological charge (sq_Q_Λ) as anomaly score if optimization unavailable
         charges = np.array(list(result.topological_charges.values()))
         sq_charges = charges ** 2
         paths_matrix = np.stack(list(result.paths.values()))
         scores = np.sum(np.abs(paths_matrix) * sq_charges[:, None], axis=0)
-        
         if np.std(scores) > 0:
             scores = (scores - np.mean(scores)) / np.std(scores)
-        
         return scores
 
         # Fallback if optimization doesn't work
