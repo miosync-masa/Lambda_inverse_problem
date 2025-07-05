@@ -1,4 +1,3 @@
-
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
@@ -232,21 +231,21 @@ def compute_pulsation_energy_from_jumps(
     # Jump intensity (sum of difference values at detected jumps)
     pos_intensity = 0.0
     neg_intensity = 0.0
-    
+
     for i in range(len(diff)):
         if pos_jumps[i] == 1:
             pos_intensity += diff[i]
         if neg_jumps[i] == 1:
             neg_intensity += np.abs(diff[i])
-    
+
     jump_intensity = pos_intensity + neg_intensity
-    
+
     # Asymmetry (-1 to +1)
     asymmetry = (pos_intensity - neg_intensity) / (pos_intensity + neg_intensity + 1e-10)
-    
+
     # Pulsation power (number of jumps × intensity × average tension)
     n_jumps = np.sum(pos_jumps) + np.sum(neg_jumps)
-    
+
     # Average tension at jump positions
     avg_tension = 0.0
     if n_jumps > 0:
@@ -257,9 +256,9 @@ def compute_pulsation_energy_from_jumps(
                 tension_sum += rho_t[i]
                 count += 1
         avg_tension = tension_sum / count if count > 0 else 0.0
-    
+
     pulsation_power = jump_intensity * n_jumps * (1 + avg_tension) / len(diff)
-    
+
     return jump_intensity, asymmetry, pulsation_power
 
 @njit
@@ -275,23 +274,23 @@ def compute_pulsation_energy_from_path(path: np.ndarray) -> Tuple[float, float, 
     diff = np.diff(path)
     abs_diff = np.abs(diff)
     threshold = np.mean(abs_diff) + 2.0 * np.std(abs_diff)
-    
+
     # Jump detection
     pos_mask = diff > threshold
     neg_mask = diff < -threshold
-    
+
     # Jump intensity
     pos_intensity = np.sum(diff[pos_mask]) if np.any(pos_mask) else 0.0
     neg_intensity = np.sum(np.abs(diff[neg_mask])) if np.any(neg_mask) else 0.0
     jump_intensity = pos_intensity + neg_intensity
-    
+
     # Asymmetry
     asymmetry = (pos_intensity - neg_intensity) / (pos_intensity + neg_intensity + 1e-10)
-    
+
     # Pulsation power
     n_jumps = np.sum(pos_mask) + np.sum(neg_mask)
     pulsation_power = jump_intensity * n_jumps / len(path)
-    
+
     return jump_intensity, asymmetry, pulsation_power
 
 @njit
@@ -588,12 +587,12 @@ class Lambda3ZeroShotDetector:
     Jump-Driven Zero-Shot Anomaly Detection System
     Full-featured integrated version
     """
-    
+
     def __init__(self, config: L3Config = None):
         self.config = config or L3Config()
         self.jump_analyzer = None  # Jump analysis result cache
         self.anomaly_patterns = self._init_anomaly_patterns()
-        
+
     def _init_anomaly_patterns(self):
         """Initialize anomaly pattern generation functions"""
         return {
@@ -609,7 +608,7 @@ class Lambda3ZeroShotDetector:
             'superposition': self._generate_superposition_anomaly,
             'resonance': self._generate_resonance_anomaly
         }
-        
+
     def analyze(self, events: np.ndarray, n_paths: int = None) -> Lambda3Result:
         """
         Complete zero-shot analysis flow:
@@ -617,26 +616,26 @@ class Lambda3ZeroShotDetector:
         """
         if n_paths is None:
             n_paths = self.config.n_paths
-            
+
         # 1. Multi-dimensional jump structure detection (utilizing JIT functions)
         jump_structures = self._detect_multiscale_jumps(events)
         self.jump_analyzer = jump_structures
-        
+
         # 2. Jump-constrained structure tensor estimation (inverse problem)
         paths = self._inverse_problem_jump_constrained(
             events, jump_structures, n_paths
         )
-        
+
         # 3. Jump-consistent physical quantity calculation (topological, entropy)
         charges, stabilities = self._compute_jump_aware_topology(paths, jump_structures)
         energies = self._compute_pulsation_energies(paths, jump_structures)
         entropies = self._compute_jump_conditional_entropies(paths, jump_structures)
-        
+
         # 4. Jump pattern-based classification
         classifications = self._classify_by_jump_signatures(
             paths, jump_structures, charges, stabilities
         )
-        
+
         return Lambda3Result(
             paths=paths,
             topological_charges=charges,
@@ -646,34 +645,34 @@ class Lambda3ZeroShotDetector:
             classifications=classifications,
             jump_structures=jump_structures
         )
-    
+
     def _detect_multiscale_jumps(self, events: np.ndarray) -> Dict:
         """Multi-dimensional and multi-scale jump detection"""
         n_events, n_features = events.shape
         jump_data = {'features': {}, 'integrated': {}}
-        
+
         # Jump detection for each feature dimension (using JIT functions)
         for f in range(n_features):
             data = events[:, f]
-            
+
             # Basic jump detection
             diff, threshold = calculate_diff_and_threshold(data, DELTA_PERCENTILE)
             pos_jumps, neg_jumps = detect_jumps(diff, threshold)
-            
+
             # Local adaptive jumps
             local_std = calculate_local_std(data, LOCAL_WINDOW_SIZE)
             score = np.abs(diff) / (local_std + 1e-8)
             local_threshold = np.percentile(score, LOCAL_JUMP_PERCENTILE)
             local_jumps = (score > local_threshold).astype(int)
-            
+
             # Tension scalar
             rho_t = calculate_rho_t(data, WINDOW_SIZE)
-            
+
             # Pulsation energy (calculated from raw data jumps)
             jump_intensity, asymmetry, pulse_power = compute_pulsation_energy_from_jumps(
                 pos_jumps, neg_jumps, diff, rho_t
             )
-            
+
             jump_data['features'][f] = {
                 'pos_jumps': pos_jumps,
                 'neg_jumps': neg_jumps,
@@ -685,30 +684,30 @@ class Lambda3ZeroShotDetector:
                 'asymmetry': asymmetry,
                 'pulse_power': pulse_power
             }
-        
+
         # Integrated jump patterns (considering all features)
         jump_data['integrated'] = self._integrate_cross_feature_jumps(jump_data['features'])
-        
+
         return jump_data
-    
+
     def _integrate_cross_feature_jumps(self, feature_jumps: Dict) -> Dict:
         """Analyze jump synchronization across features"""
         n_features = len(feature_jumps)
         features_list = list(feature_jumps.keys())
-        
+
         # Integrated jump mask (OR operation)
         first_key = features_list[0]
         n_events = len(feature_jumps[first_key]['pos_jumps'])
         unified_jumps = np.zeros(n_events, dtype=np.int64)  # Unified to int64
-        
+
         # Jump importance (number of synchronized features)
         jump_importance = np.zeros(n_events)
-        
+
         for f in features_list:
             jumps = feature_jumps[f]['pos_jumps'] | feature_jumps[f]['neg_jumps']
             unified_jumps |= jumps
             jump_importance += jumps.astype(float)
-        
+
         # Calculate jump synchronization rate (utilizing JIT functions)
         sync_matrix = np.zeros((n_features, n_features))
         for i, f1 in enumerate(features_list):
@@ -716,7 +715,7 @@ class Lambda3ZeroShotDetector:
                 if i < j:
                     jumps1 = feature_jumps[f1]['pos_jumps'] | feature_jumps[f1]['neg_jumps']
                     jumps2 = feature_jumps[f2]['pos_jumps'] | feature_jumps[f2]['neg_jumps']
-                    
+
                     # Synchronization profile calculation
                     _, _, max_sync, optimal_lag = calculate_sync_profile_jit(
                         jumps1.astype(np.float64),
@@ -725,10 +724,10 @@ class Lambda3ZeroShotDetector:
                     )
                     sync_matrix[i, j] = max_sync
                     sync_matrix[j, i] = max_sync
-        
+
         # Jump cluster detection
         jump_clusters = self._detect_jump_clusters(unified_jumps, jump_importance)
-        
+
         return {
             'unified_jumps': unified_jumps,
             'jump_importance': jump_importance / n_features,  # Normalize
@@ -737,9 +736,9 @@ class Lambda3ZeroShotDetector:
             'n_total_jumps': np.sum(unified_jumps),
             'max_sync': np.max(sync_matrix[np.triu_indices(n_features, k=1)])
         }
-    
+
     def _detect_jump_clusters(
-        self, 
+        self,
         unified_jumps: np.ndarray,
         jump_importance: np.ndarray,
         min_cluster_size: int = 3
@@ -748,7 +747,7 @@ class Lambda3ZeroShotDetector:
         clusters = []
         in_cluster = False
         cluster_start = 0
-        
+
         for i in range(len(unified_jumps)):
             if unified_jumps[i] and not in_cluster:
                 in_cluster = True
@@ -766,7 +765,7 @@ class Lambda3ZeroShotDetector:
                         'total_importance': np.sum(jump_importance[cluster_start:i])
                     })
                 in_cluster = False
-        
+
         # Handle last cluster
         if in_cluster:
             cluster_size = len(unified_jumps) - cluster_start
@@ -779,60 +778,60 @@ class Lambda3ZeroShotDetector:
                     'density': np.mean(jump_importance[cluster_start:]),
                     'total_importance': np.sum(jump_importance[cluster_start:])
                 })
-        
+
         return clusters
-    
+
     def _inverse_problem_jump_constrained(
-        self, 
+        self,
         events: np.ndarray,
         jump_structures: Dict,
         n_paths: int
     ) -> Dict[int, np.ndarray]:
         """Jump structure-aware inverse problem"""
-        
+
         # Global jump information
         jump_mask = jump_structures['integrated']['unified_jumps']
         jump_weights = jump_structures['integrated']['jump_importance']
-        
+
         # Gram matrix calculation
         events_gram = np.ascontiguousarray(events @ events.T)
-        
+
         # Initial values reflecting jump structure
         Lambda_init = self._initialize_with_jump_structure(
             events, jump_mask, jump_weights, n_paths
         )
-        
+
         # Jump-constrained objective function
         def objective(Lambda_flat):
             Lambda_matrix = np.ascontiguousarray(Lambda_flat.reshape(n_paths, events.shape[0]))
-            
+
             # Basic inverse problem term (JIT function)
             base_obj = inverse_problem_objective_jit(
-                Lambda_matrix, events_gram, self.config.alpha, self.config.beta, 
+                Lambda_matrix, events_gram, self.config.alpha, self.config.beta,
                 jump_weight=0.5
             )
-            
+
             # Jump consistency term
             jump_term = self._compute_jump_consistency_term(
                 Lambda_matrix, jump_mask, jump_weights
             )
-            
+
             return base_obj + jump_term
-        
+
         # Execute optimization
         result = minimize(
-            objective, 
-            Lambda_init.flatten(), 
+            objective,
+            Lambda_init.flatten(),
             method='L-BFGS-B',
             options={'maxiter': 1000}
         )
-        
+
         Lambda_opt = result.x.reshape(n_paths, events.shape[0])
-        
+
         # Normalize and return
         return {i: path / (np.linalg.norm(path) + 1e-8)
                 for i, path in enumerate(Lambda_opt)}
-    
+
     def _initialize_with_jump_structure(
         self,
         events: np.ndarray,
@@ -843,15 +842,15 @@ class Lambda3ZeroShotDetector:
         """Generate initial values reflecting jump structure"""
         n_events = events.shape[0]
         Lambda_init = np.zeros((n_paths, n_events))
-        
+
         # Eigenvalue decomposition based
         _, V = np.linalg.eigh(events @ events.T)
         base_paths = V[:, -n_paths:].T
-        
+
         # Introduce discontinuities at jump positions
         for p in range(n_paths):
             Lambda_init[p] = base_paths[p]
-            
+
             # Emphasize values at jump positions
             for i in range(n_events):
                 if jump_mask[i]:
@@ -860,9 +859,9 @@ class Lambda3ZeroShotDetector:
                         Lambda_init[p, i] *= (1 + jump_weights[i])
                     else:
                         Lambda_init[p, i] *= -(1 + jump_weights[i])
-        
+
         return Lambda_init
-    
+
     def _compute_jump_consistency_term(
         self,
         Lambda_matrix: np.ndarray,
@@ -872,23 +871,23 @@ class Lambda3ZeroShotDetector:
         """Evaluate jump consistency"""
         n_paths, n_events = Lambda_matrix.shape
         consistency = 0.0
-        
+
         for p in range(n_paths):
             path = Lambda_matrix[p]
-            
+
             # ΔΛ at jump positions
             for i in range(1, n_events):
                 delta = np.abs(path[i] - path[i-1])
-                
+
                 if jump_mask[i]:
                     # Encourage large ΔΛ at jump positions
                     consistency -= jump_weights[i] * delta
                 else:
                     # Encourage small ΔΛ at non-jump positions
                     consistency += 0.1 * delta
-        
+
         return consistency
-    
+
     def _compute_jump_aware_topology(
         self,
         paths: Dict[int, np.ndarray],
@@ -897,27 +896,27 @@ class Lambda3ZeroShotDetector:
         """Calculate topological quantities considering jump structure"""
         charges = {}
         stabilities = {}
-        
+
         for i, path in paths.items():
             # Basic topological charge (JIT function)
             Q, sigma = compute_topological_charge_jit(path)
-            
+
             # Consider phase changes at jump positions
             jump_mask = jump_structures['integrated']['unified_jumps']
             jump_phase_shift = 0.0
-            
+
             for j in range(1, len(path)):
                 if jump_mask[j]:
                     # Phase change at jump position
                     phase_diff = np.arctan2(path[j], path[j-1]) - np.arctan2(path[j-1], path[j-2] if j > 1 else path[0])
                     jump_phase_shift += phase_diff
-            
+
             # Jump-corrected charge
             charges[i] = Q + jump_phase_shift / (2 * np.pi)
             stabilities[i] = sigma
-        
+
         return charges, stabilities
-    
+
     def _compute_pulsation_energies(
         self,
         paths: Dict[int, np.ndarray],
@@ -925,27 +924,27 @@ class Lambda3ZeroShotDetector:
     ) -> Dict[int, float]:
         """Calculate pulsation energy (prioritizing jump structure)"""
         energies = {}
-        
+
         for i, path in paths.items():
             # Basic energy
             basic_energy = np.sum(path**2)
-            
+
             # Integrate jump energy from corresponding features
             # (Average jumps from multiple features)
             total_pulse_power = 0.0
             n_features = len(jump_structures['features'])
-            
+
             for f_idx, f_data in jump_structures['features'].items():
                 pulse_power = f_data['pulse_power']
                 total_pulse_power += pulse_power
-            
+
             avg_pulse_power = total_pulse_power / n_features if n_features > 0 else 0.0
-            
+
             # Integrated energy
             energies[i] = basic_energy + 0.3 * avg_pulse_power
-        
+
         return energies
-    
+
     def _compute_jump_conditional_entropies(
         self,
         paths: Dict[int, np.ndarray],
@@ -954,40 +953,40 @@ class Lambda3ZeroShotDetector:
         """Conditional entropy at jump events"""
         entropies = {}
         jump_mask = jump_structures['integrated']['unified_jumps']
-        
+
         for i, path in paths.items():
             # Overall entropy (JIT function)
             all_entropies = compute_all_entropies_jit(path)
             entropy_keys = ["shannon", "renyi_2", "tsallis_1.5", "max", "min", "var"]
-            
+
             # Separate jump and non-jump positions
             jump_indices = np.where(jump_mask)[0]
             non_jump_indices = np.where(~jump_mask)[0]
-            
+
             entropy_dict = {}
-            
+
             # Overall entropy
             for j, key in enumerate(entropy_keys):
                 entropy_dict[key] = all_entropies[j]
-            
+
             # Jump-conditional entropy
             if len(jump_indices) > 0:
                 jump_path = path[jump_indices]
                 jump_entropies = compute_all_entropies_jit(jump_path)
                 for j, key in enumerate(entropy_keys):
                     entropy_dict[f"{key}_jump"] = jump_entropies[j]
-            
+
             # Non-jump conditional entropy
             if len(non_jump_indices) > 0:
                 non_jump_path = path[non_jump_indices]
                 non_jump_entropies = compute_all_entropies_jit(non_jump_path)
                 for j, key in enumerate(entropy_keys):
                     entropy_dict[f"{key}_non_jump"] = non_jump_entropies[j]
-            
+
             entropies[i] = entropy_dict
-        
+
         return entropies
-    
+
     def _classify_by_jump_signatures(
         self,
         paths: Dict[int, np.ndarray],
@@ -997,11 +996,11 @@ class Lambda3ZeroShotDetector:
     ) -> Dict[int, str]:
         """Structure classification based on jump patterns"""
         classifications = {}
-        
+
         for i in paths.keys():
             Q = charges[i]
             sigma = stabilities[i]
-            
+
             # Jump characteristics (from raw data)
             if i < len(jump_structures['features']):
                 # Use jump characteristics from corresponding feature
@@ -1014,7 +1013,7 @@ class Lambda3ZeroShotDetector:
                 jump_intensity = np.mean([f['jump_intensity'] for f in jump_structures['features'].values()])
                 asymmetry = np.mean([f['asymmetry'] for f in jump_structures['features'].values()])
                 pulse_power = np.mean([f['pulse_power'] for f in jump_structures['features'].values()])
-            
+
             # Basic classification
             if Q < -0.5:
                 base = "Antimatter Structure (Absorption)"
@@ -1022,34 +1021,34 @@ class Lambda3ZeroShotDetector:
                 base = "Matter Structure (Emission)"
             else:
                 base = "Neutral Structure (Equilibrium)"
-            
+
             # Jump-based modifiers
             tags = []
-            
+
             if pulse_power > 5:
                 tags.append("High-Frequency Pulsation")
             elif pulse_power < 0.1:
                 tags.append("Static Structure")
-            
+
             if abs(asymmetry) > 0.7:
                 if asymmetry > 0:
                     tags.append("Positive-Dominant")
                 else:
                     tags.append("Negative-Dominant")
-            
+
             if sigma > 2.5:
                 tags.append("Unstable/Chaotic")
             elif sigma < 0.5:
                 tags.append("Super-Stable")
-            
+
             # Complete classification
             if tags:
                 classifications[i] = base + " • " + " / ".join(tags)
             else:
                 classifications[i] = base
-        
+
         return classifications
-    
+
     def detect_anomalies(self, result: Lambda3Result, events: np.ndarray) -> np.ndarray:
         """
         Execute zero-shot anomaly detection (adaptive threshold version)
@@ -1057,17 +1056,17 @@ class Lambda3ZeroShotDetector:
         if self.jump_analyzer is None:
             # If jump analysis not executed
             self.jump_analyzer = self._detect_multiscale_jumps(events)
-        
+
         # 1. Jump-based anomaly score (improved version)
         jump_anomaly_scores = self._compute_jump_anomaly_scores(
             self.jump_analyzer, events
         )
-        
+
         # 2. Hybrid Tikhonov score (parameter-tuned version)
         paths_matrix = np.stack(list(result.paths.values()))
         charges = np.array(list(result.topological_charges.values()))
         stabilities = np.array(list(result.stabilities.values()))
-        
+
         # Hybrid Tikhonov score (parameter-tuned version)
         hybrid_scores = compute_lambda3_hybrid_tikhonov_scores(
             paths_matrix, events, charges, stabilities,
@@ -1077,13 +1076,13 @@ class Lambda3ZeroShotDetector:
             w_topo=0.3,  # Emphasize topological features
             w_pulse=0.2   # Suppress pulsation
         )
-        
+
         # 3. Anomaly in kernel space (Laplacian kernel)
         kernel_scores = self._compute_kernel_anomaly_scores(events, result)
-        
+
         # 4. Synchronization anomaly score
         sync_scores = self._compute_sync_anomaly_scores(self.jump_analyzer)
-        
+
         # 5. Integrated score (weight-adjusted version)
         # Emphasize non-jump features for handling severe anomalies
         final_scores = (
@@ -1092,13 +1091,13 @@ class Lambda3ZeroShotDetector:
             0.30 * kernel_scores +             # Kernel (increased)
             0.10 * sync_scores                 # Synchronization anomaly
         )
-        
+
         # 6. Adaptive standardization (robust to outliers)
         # Use median and interquartile range
         median_score = np.median(final_scores)
         q75, q25 = np.percentile(final_scores, [75, 25])
         iqr = q75 - q25
-        
+
         if iqr > 0:
             # Robust standardization
             final_scores = (final_scores - median_score) / (1.5 * iqr)
@@ -1108,39 +1107,39 @@ class Lambda3ZeroShotDetector:
             std_score = np.std(final_scores)
             if std_score > 0:
                 final_scores = (final_scores - mean_score) / std_score
-        
+
         return final_scores
-    
-    def detect_anomalies_advanced(self, result: Lambda3Result, events: np.ndarray, 
+
+    def detect_anomalies_advanced(self, result: Lambda3Result, events: np.ndarray,
                                  use_ensemble: bool = True, optimize_weights: bool = True) -> np.ndarray:
         """
         Advanced zero-shot anomaly detection (improved version: overfitting countermeasures)
         """
         if self.jump_analyzer is None:
             self.jump_analyzer = self._detect_multiscale_jumps(events)
-        
+
         # 1. Get base scores
         base_scores = self.detect_anomalies(result, events)
-        
+
         # 2. Advanced feature extraction
         advanced_features = self.extract_advanced_features(result, events)
-        
+
         # 3. Feature weight optimization (improved version)
         if optimize_weights:
             # More conservative pseudo-label generation
             # Use only samples with clear differences between top and bottom
             score_percentiles = np.percentile(base_scores, [10, 90])
-            
+
             # Use only samples that can be clearly separated as normal/anomalous
             clear_normal = base_scores < score_percentiles[0]
             clear_anomaly = base_scores > score_percentiles[1]
-            
+
             if np.sum(clear_normal) > 10 and np.sum(clear_anomaly) > 10:
                 # Learn using only clear samples
                 clear_indices = np.where(clear_normal | clear_anomaly)[0]
                 clear_events = events[clear_indices]
                 clear_labels = clear_anomaly[clear_normal | clear_anomaly].astype(int)
-                
+
                 # Extract features for corresponding indices only
                 clear_features = {}
                 for feat_name, feat_vals in advanced_features.items():
@@ -1148,15 +1147,15 @@ class Lambda3ZeroShotDetector:
                         clear_features[feat_name] = feat_vals[clear_indices]
                     else:  # Path features remain as is
                         clear_features[feat_name] = feat_vals
-                
+
                 print(f"Using {len(clear_labels)} clear samples for optimization "
                       f"({np.sum(clear_labels)} anomalies, {len(clear_labels)-np.sum(clear_labels)} normal)")
-                
+
                 # Weight optimization
                 optimal_weights, opt_auc = self.optimize_feature_weights_robust(
                     clear_features, clear_labels, result, clear_indices
                 )
-                
+
                 # Calculate weighted scores for all data
                 weighted_scores = self._compute_weighted_scores(
                     advanced_features, optimal_weights, result
@@ -1166,45 +1165,43 @@ class Lambda3ZeroShotDetector:
                 weighted_scores = base_scores
         else:
             weighted_scores = base_scores
-        
+
         # 4. Ensemble detection
         if use_ensemble:
             # Generate pseudo-labels from base scores (for ensemble evaluation)
             pseudo_labels = (base_scores > np.percentile(base_scores, 85)).astype(int)
-            
+
             ensemble_scores, model_info = self.ensemble_anomaly_detection(
                 events, pseudo_labels, n_models=7
             )
-            
+
             # Fusion of base, weighted, and ensemble
             final_scores = (
-                0.3 * base_scores + 
-                0.4 * weighted_scores + 
+                0.3 * base_scores +
+                0.4 * weighted_scores +
                 0.3 * ensemble_scores
             )
         else:
             final_scores = 0.5 * base_scores + 0.5 * weighted_scores
-        
+
         return final_scores
-    
+
     def detect_anomalies_focused(self, result: Lambda3Result, events: np.ndarray, 
-                                use_optimization: bool = True) -> np.ndarray:
+                           use_optimization: bool = True) -> np.ndarray:
         """
-        Focused anomaly detection using the strongest feature discovered through optimization
+        Focused anomaly detection using the strongest feature(s) discovered through optimization
         """
         if use_optimization:
-            # 1. Extract advanced features
             advanced_features = self.extract_advanced_features(result, events)
-            
-            # 2. Generate pseudo-labels from base scores (only clear top/bottom samples)
             base_scores = self.detect_anomalies(result, events)
             score_percentiles = np.percentile(base_scores, [10, 90])
             clear_normal = base_scores < score_percentiles[0]
             clear_anomaly = base_scores > score_percentiles[1]
+            clear_indices = np.where(clear_normal | clear_anomaly)[0]
             
             if np.sum(clear_normal) > 10 and np.sum(clear_anomaly) > 10:
-                clear_indices = np.where(clear_normal | clear_anomaly)[0]
-                clear_labels = clear_anomaly[clear_normal | clear_anomaly].astype(int)
+                clear_labels = np.zeros_like(clear_indices)
+                clear_labels[clear_anomaly[clear_indices]] = 1 
                 
                 # Extract features for corresponding indices only
                 clear_features = {}
@@ -1214,48 +1211,81 @@ class Lambda3ZeroShotDetector:
                     else:
                         clear_features[feat_name] = feat_vals
                 
-                # 3. Run optimization to discover the strongest feature
+                # 3. Run optimization to discover the strongest feature(s)
                 optimal_weights, _ = self.optimize_feature_weights_robust(
                     clear_features, clear_labels, result, clear_indices
                 )
                 
-                # 4. Get the feature with highest weight
-                best_feature = max(optimal_weights.items(), key=lambda x: x[1])[0]
-                print(f"\nUsing best feature: {best_feature} (weight: {optimal_weights[best_feature]:.4f})")
+                # 4. Get feature(s) with highest weight (use all if multiple)
+                # Set weight threshold (50% of maximum weight)
+                max_weight = max(optimal_weights.values())
+                weight_threshold = max_weight * 0.5
                 
-                # 5. Calculate scores using only that feature (simple!)
-                if best_feature in advanced_features:
-                    best_feature_values = advanced_features[best_feature]
-                    path_matrix = np.stack(list(result.paths.values()))
+                # Select all important features
+                important_features = [(feat, weight) for feat, weight in optimal_weights.items() 
+                                    if weight >= weight_threshold]
+                
+                if len(important_features) == 1:
+                    # Single feature case (traditional approach)
+                    best_feature = important_features[0][0]
+                    print(f"\nUsing single best feature: {best_feature} (weight: {optimal_weights[best_feature]:.4f})")
                     
-                    if len(best_feature_values) == len(path_matrix):  # Path feature
-                        scores = np.sum(np.abs(path_matrix) * best_feature_values[:, None], axis=0)
-                    else:  # Event feature
-                        scores = best_feature_values
+                    if best_feature in advanced_features:
+                        best_feature_values = advanced_features[best_feature]
+                        path_matrix = np.stack(list(result.paths.values()))
+                        
+                        if len(best_feature_values) == len(path_matrix):
+                            scores = np.sum(np.abs(path_matrix) * best_feature_values[:, None], axis=0)
+                        else:
+                            scores = best_feature_values
+                        
+                        if np.std(scores) > 0:
+                            scores = (scores - np.mean(scores)) / np.std(scores)
+                        
+                        return scores
+                else:
+                    # Multiple features weighted combination
+                    print(f"\nUsing {len(important_features)} important features:")
+                    for feat, weight in important_features:
+                        print(f"  - {feat}: {weight:.4f}")
                     
-                    # Standardization
-                    if np.std(scores) > 0:
-                        scores = (scores - np.mean(scores)) / np.std(scores)
+                    # Calculate weighted scores
+                    weighted_scores = self._compute_weighted_scores(
+                        {feat: advanced_features[feat] for feat, _ in important_features},
+                        {feat: weight for feat, weight in important_features},
+                        result
+                    )
                     
-                    return scores
-            
-            # Fallback if optimization doesn't work
-            print("Optimization failed, falling back to heuristic approach")
+                    return weighted_scores
         
+        # Fallback: use sq_Q_Λ
+        charges = np.array(list(result.topological_charges.values()))
+        sq_charges = charges ** 2
+        paths_matrix = np.stack(list(result.paths.values()))
+        scores = np.sum(np.abs(paths_matrix) * sq_charges[:, None], axis=0)
+        
+        if np.std(scores) > 0:
+            scores = (scores - np.mean(scores)) / np.std(scores)
+        
+        return scores
+
+        # Fallback if optimization doesn't work
+        print("Optimization failed, falling back to heuristic approach")
+
         # Original heuristic approach (without optimization)
         # Extract all features
         all_features = self.extract_advanced_features(result, events)
-        
+
         # Find the best single feature based on variance or range
         best_feature_name = None
         best_feature_score = -np.inf
-        
+
         path_matrix = np.stack(list(result.paths.values()))
         n_events = events.shape[0]
-        
+
         for feat_name, feat_vals in all_features.items():
             vals = np.array(feat_vals)
-            
+
             # Convert to event scores
             if vals.shape[0] == path_matrix.shape[0]:  # Path features
                 event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
@@ -1263,33 +1293,33 @@ class Lambda3ZeroShotDetector:
                 event_scores = vals
             else:
                 continue
-            
+
             # Evaluate feature quality (variance indicates discriminative power)
             if np.std(event_scores) > 0:
                 # Normalize
                 event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-                
+
                 # Score based on variance and range
                 feature_quality = np.std(event_scores) * (np.max(event_scores) - np.min(event_scores))
-                
+
                 if feature_quality > best_feature_score:
                     best_feature_score = feature_quality
                     best_feature_name = feat_name
-        
+
         print(f"Focused detection using best feature: {best_feature_name} (quality={best_feature_score:.3f})")
-        
+
         # Use only the best feature
         if best_feature_name:
             single_feature = {best_feature_name: all_features[best_feature_name]}
-            
+
             # Simple optimization for single feature
             vals = np.array(single_feature[best_feature_name])
-            
+
             if vals.shape[0] == path_matrix.shape[0]:
                 final_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
             else:
                 final_scores = vals
-            
+
             # Apply sigmoid transformation for better discrimination
             mean_score = np.mean(final_scores)
             std_score = np.std(final_scores)
@@ -1299,9 +1329,9 @@ class Lambda3ZeroShotDetector:
         else:
             # Fallback to base detection
             final_scores = self.detect_anomalies(result, events)
-        
+
         return final_scores
-    
+
     def optimize_feature_weights_robust(self, features: Dict[str, np.ndarray], labels: np.ndarray,
                                       result: Lambda3Result, event_indices: np.ndarray,
                                       n_iter: int = 50) -> Tuple[Dict[str, float], float]:
@@ -1309,18 +1339,18 @@ class Lambda3ZeroShotDetector:
         feature_names = list(features.keys())
         n_features = len(feature_names)
         n_events = len(labels)
-        
+
         # Feature count limitation (more conservative)
         max_features = min(20, n_features // 2)
-        
+
         if n_features > max_features:
             # Feature importance evaluation (correlation-based)
             feature_importance = {}
             path_matrix = np.stack(list(result.paths.values()))
-            
+
             for name in feature_names:
                 vals = np.array(features[name])
-                
+
                 if vals.shape[0] == path_matrix.shape[0]:  # Path features
                     # Convert to event scores
                     event_scores = np.zeros(len(event_indices))
@@ -1330,93 +1360,93 @@ class Lambda3ZeroShotDetector:
                     event_scores = vals
                 else:
                     continue
-                
+
                 if np.std(event_scores) > 1e-10:
                     # Use absolute value of correlation coefficient as importance
                     importance = abs(np.corrcoef(event_scores, labels)[0, 1])
                     feature_importance[name] = importance
-            
+
             # Select top features
             sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
             selected_features = [f[0] for f in sorted_features[:max_features]]
-            
+
             print(f"Selected {len(selected_features)} most correlated features")
             print(f"Top 5: {[f'{f[0]}: {f[1]:.3f}' for f in sorted_features[:5]]}")
-            
+
             feature_names = selected_features
             n_features = len(feature_names)
-        
+
         # Build feature matrix
         event_feature_matrix = self._build_feature_matrix(
             features, feature_names, result, event_indices
         )
-        
+
         # Bayesian optimization approach (more stable)
         from sklearn.linear_model import LogisticRegression
         from sklearn.preprocessing import StandardScaler
-        
+
         # Standardize features
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(event_feature_matrix.T)
-        
+
         # L1-regularized logistic regression for weight estimation
         lr = LogisticRegression(
-            penalty='l1', 
-            solver='liblinear', 
+            penalty='l1',
+            solver='liblinear',
             C=0.1,  # Strong regularization
             max_iter=1000,
             random_state=42
         )
-        
+
         try:
             lr.fit(X_scaled, labels)
-            
+
             # Use coefficients as weights
             weights = np.abs(lr.coef_[0])
-            
+
             # Score calculation
             scores = lr.predict_proba(X_scaled)[:, 1]
             opt_auc = roc_auc_score(labels, scores)
-            
+
         except Exception as e:
             print(f"Logistic regression failed: {e}, using uniform weights")
             weights = np.ones(n_features)
             opt_auc = 0.5
-        
+
         # Weight normalization and dictionary conversion
         if np.sum(weights) > 0:
             weights = weights / np.sum(weights)
         else:
             weights = np.ones(n_features) / n_features
-        
+
         optimal_weights = {feature_names[i]: weights[i] for i in range(n_features)}
-        
+
         print(f"\nRobust feature weight optimization completed:")
         print(f"  Optimized AUC: {opt_auc:.4f}")
         print(f"  Weight diversity (std): {np.std(weights):.4f}")
         print(f"  Non-zero weights: {np.sum(weights > 0.001)}/{n_features}")
-        
+
         # Display important features
         sorted_features = sorted(optimal_weights.items(), key=lambda x: x[1], reverse=True)
         print("\nTop features by weight:")
         for i, (feat, weight) in enumerate(sorted_features[:10]):
             if weight > 0.001:
                 print(f"  {i+1}. {feat}: {weight:.4f}")
-        
+
         return optimal_weights, opt_auc
-    
-    def _build_feature_matrix(self, features: Dict[str, np.ndarray], 
+
+    def _build_feature_matrix(self, features: Dict[str, np.ndarray],
                             feature_names: List[str], result: Lambda3Result,
                             event_indices: np.ndarray) -> np.ndarray:
         """Build feature matrix (supports partial data)"""
         path_matrix = np.stack(list(result.paths.values()))
         n_events = len(event_indices)
-        
+
         event_feature_matrix = []
-        
+
         for name in feature_names:
             vals = np.array(features[name])
-            
+
             if vals.shape[0] == path_matrix.shape[0]:  # Path features
                 # Score calculation for specified events only
                 event_scores = np.zeros(n_events)
@@ -1426,27 +1456,27 @@ class Lambda3ZeroShotDetector:
                 event_scores = vals
             else:
                 event_scores = np.zeros(n_events)
-            
+
             # Standardization
             if np.std(event_scores) > 1e-10:
                 event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-            
+
             event_feature_matrix.append(event_scores)
-        
+
         return np.array(event_feature_matrix)
-    
+
     def extract_advanced_features(self, result: Lambda3Result, events: np.ndarray) -> Dict[str, np.ndarray]:
         """Advanced feature extraction (combinations, nonlinear transforms, statistical features)"""
         n_paths = len(result.paths)
         paths_matrix = np.stack(list(result.paths.values()))
-        
+
         # Basic features
         basic_features = {
             'Q_Λ': np.array([result.topological_charges[i] for i in range(n_paths)]),
             'E': np.array([result.energies[i] for i in range(n_paths)]),
             'σ_Q': np.array([result.stabilities[i] for i in range(n_paths)])
         }
-        
+
         # Entropy features
         for i in range(n_paths):
             ent = result.entropies[i]
@@ -1454,7 +1484,7 @@ class Lambda3ZeroShotDetector:
                 basic_features[f'S_shannon_{i}'] = np.array([ent.get('shannon', 0)])
                 basic_features[f'S_renyi_{i}'] = np.array([ent.get('renyi_2', 0)])
                 basic_features[f'S_tsallis_{i}'] = np.array([ent.get('tsallis_1.5', 0)])
-        
+
         # Pulsation features
         for i in range(n_paths):
             path = paths_matrix[i]
@@ -1462,10 +1492,10 @@ class Lambda3ZeroShotDetector:
             basic_features[f'jump_int_{i}'] = np.array([jump_int])
             basic_features[f'asymm_{i}'] = np.array([asymm])
             basic_features[f'pulse_pow_{i}'] = np.array([pulse_pow])
-        
+
         # Advanced features
         advanced_features = basic_features.copy()
-        
+
         # 1. Feature combinations (interaction terms)
         feature_names = list(basic_features.keys())
         for i, feat1 in enumerate(feature_names):
@@ -1477,7 +1507,7 @@ class Lambda3ZeroShotDetector:
                     with np.errstate(divide='ignore', invalid='ignore'):
                         ratio = basic_features[feat1] / (basic_features[feat2] + 1e-10)
                         advanced_features[f'{feat1}/{feat2}'] = np.nan_to_num(ratio, nan=0.0, posinf=10.0, neginf=-10.0)
-        
+
         # 2. Nonlinear transformations
         for feat, values in basic_features.items():
             if np.all(values >= 0) and np.any(values > 0):
@@ -1489,7 +1519,7 @@ class Lambda3ZeroShotDetector:
             advanced_features[f'sq_{feat}'] = values ** 2
             # Sigmoid transform
             advanced_features[f'sig_{feat}'] = 1 / (1 + np.exp(-values))
-        
+
         # 3. Statistical features (per path)
         for i in range(n_paths):
             path = paths_matrix[i]
@@ -1501,22 +1531,22 @@ class Lambda3ZeroShotDetector:
             if len(path) > 1:
                 autocorr = np.correlate(path - np.mean(path), path - np.mean(path), mode='full')[len(path)-1:] / (np.var(path) * np.arange(len(path), 0, -1))
                 advanced_features[f'autocorr_{i}'] = np.array([np.mean(autocorr[:5])])  # Average of first 5 lags
-        
+
         return advanced_features
-    
+
     def optimize_feature_weights(self, features: Dict[str, np.ndarray], labels: np.ndarray,
                                result: Lambda3Result, n_iter: int = 100) -> Tuple[Dict[str, float], float]:
         """Automatic feature weight optimization (using differential_evolution) - Improved version"""
         feature_names = list(features.keys())
         n_features = len(feature_names)
         n_events = len(labels)
-        
+
         # Limit features if too many
         if n_features > 50:
             # Calculate individual AUC for each feature
             feature_scores = {}
             path_matrix = np.stack(list(result.paths.values()))
-            
+
             for name in feature_names:
                 vals = np.array(features[name])
                 if vals.shape[0] == path_matrix.shape[0]:
@@ -1525,7 +1555,7 @@ class Lambda3ZeroShotDetector:
                     event_scores = vals
                 else:
                     continue
-                
+
                 if np.std(event_scores) > 0:
                     event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
                     try:
@@ -1533,17 +1563,17 @@ class Lambda3ZeroShotDetector:
                         feature_scores[name] = auc
                     except:
                         feature_scores[name] = 0.5
-            
+
             # Select top 50 features
             sorted_features = sorted(feature_scores.items(), key=lambda x: x[1], reverse=True)
             selected_features = [f[0] for f in sorted_features[:50]]
             feature_names = selected_features
             n_features = len(feature_names)
             print(f"Selected top {n_features} features for optimization")
-        
+
         # Path matrix
         path_matrix = np.stack(list(result.paths.values()))
-        
+
         # Project each feature to event-wise scores
         event_feature_matrix = []
         for name in feature_names:
@@ -1554,28 +1584,28 @@ class Lambda3ZeroShotDetector:
                 event_scores = vals
             else:
                 event_scores = np.zeros(n_events)
-            
+
             # Standardization
             if np.std(event_scores) > 0:
                 event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
             event_feature_matrix.append(event_scores)
-        
+
         event_feature_matrix = np.array(event_feature_matrix).T
-        
+
         # Add L2 regularization
         lambda_reg = 0.01
-        
+
         def objective(weights):
             # Weighted composite score
             combined_score = np.dot(event_feature_matrix, weights)
-            
+
             # Standardization
             if np.std(combined_score) > 0:
                 combined_score = (combined_score - np.mean(combined_score)) / np.std(combined_score)
-            
+
             # Sigmoid transform
             combined_score = 1 / (1 + np.exp(-combined_score))
-            
+
             try:
                 # AUC calculation
                 auc = roc_auc_score(labels, combined_score)
@@ -1584,91 +1614,91 @@ class Lambda3ZeroShotDetector:
                 return -(auc - reg_term)  # Negative for minimization
             except Exception as e:
                 return -0.5
-        
+
         # Constraints: each weight between 0 and 1
         bounds = [(0, 1) for _ in range(n_features)]
-        
+
         # Diversify initial values
         x0 = np.random.dirichlet(np.ones(n_features))
-        
+
         # Execute optimization (parameter tuning)
         result_opt = differential_evolution(
-            objective, 
-            bounds, 
+            objective,
+            bounds,
             x0=x0,
-            maxiter=n_iter, 
+            maxiter=n_iter,
             seed=42,
-            atol=1e-8, 
-            tol=0.001, 
+            atol=1e-8,
+            tol=0.001,
             workers=1,
-            updating='deferred', 
-            polish=True, 
+            updating='deferred',
+            polish=True,
             strategy='best1bin',
             popsize=15,
             mutation=(0.5, 1.5),
             recombination=0.7
         )
-        
+
         optimal_weights = {feature_names[i]: result_opt.x[i] for i in range(n_features)}
         best_auc = -result_opt.fun
-        
+
         # Ensure weight diversity (set minimum weight)
         min_weight = 0.01
         for k in optimal_weights:
             if optimal_weights[k] < min_weight:
                 optimal_weights[k] = min_weight
-        
+
         # Weight normalization (L1 normalization)
         weight_sum = sum(optimal_weights.values())
         if weight_sum > 0:
             optimal_weights = {k: v/weight_sum for k, v in optimal_weights.items()}
-        
+
         print(f"\nFeature weight optimization completed:")
         print(f"  Optimized AUC: {best_auc:.4f}")
         print(f"  Weight diversity (std): {np.std(list(optimal_weights.values())):.4f}")
-        
+
         # Display top features (in descending order of weights)
         sorted_features = sorted(optimal_weights.items(), key=lambda x: x[1], reverse=True)[:10]
         print("\nTop 10 features by weight:")
         for feat, weight in sorted_features:
             if weight > 0.01:  # Display only meaningful weights
                 print(f"  {feat}: {weight:.4f}")
-        
+
         return optimal_weights, best_auc
-    
-    def _compute_weighted_scores(self, features: Dict[str, np.ndarray], 
+
+    def _compute_weighted_scores(self, features: Dict[str, np.ndarray],
                                 weights: Dict[str, float], result: Lambda3Result) -> np.ndarray:
         """Calculate scores using optimized weights"""
         path_matrix = np.stack(list(result.paths.values()))
         n_events = path_matrix.shape[1]
-        
+
         weighted_score = np.zeros(n_events)
-        
+
         for feat_name, weight in weights.items():
             if feat_name in features:
                 vals = np.array(features[feat_name])
-                
+
                 if vals.shape[0] == path_matrix.shape[0]:  # Path features
                     event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
                 elif vals.shape[0] == n_events:  # Event features
                     event_scores = vals
                 else:
                     continue
-                
+
                 # Standardize and weight
                 if np.std(event_scores) > 0:
                     event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-                
+
                 weighted_score += weight * event_scores
-        
+
         return weighted_score
-    
+
     def ensemble_anomaly_detection(self, events: np.ndarray, labels: np.ndarray = None,
                                  n_models: int = 5) -> Tuple[np.ndarray, Dict]:
         """Ensemble anomaly detection (multiple models with different parameters)"""
         ensemble_scores = []
         model_info = {}
-        
+
         # Parameter ranges
         param_ranges = {
             'n_paths': [3, 5, 7, 9],
@@ -1677,7 +1707,7 @@ class Lambda3ZeroShotDetector:
             'jump_scale': [1.5, 2.0, 2.5, 3.0],
             'kernel_type': [0, 1, 3]  # RBF, Polynomial, Laplacian
         }
-        
+
         for i in range(n_models):
             # Random parameter selection
             model_params = {
@@ -1687,7 +1717,7 @@ class Lambda3ZeroShotDetector:
                 'jump_scale': np.random.choice(param_ranges['jump_scale']),
                 'kernel_type': np.random.choice(param_ranges['kernel_type'])
             }
-            
+
             # Temporarily change parameters
             original_config = self.config
             self.config = L3Config(
@@ -1695,19 +1725,19 @@ class Lambda3ZeroShotDetector:
                 beta=model_params['beta'],
                 jump_scale=model_params['jump_scale']
             )
-            
+
             try:
                 # Execute analysis
                 result = self.analyze(events, n_paths=model_params['n_paths'])
-                
+
                 # Anomaly detection with specified kernel type
                 model_scores = self.detect_anomalies(result, events)
-                
+
                 # Sigmoid transform
                 model_scores = 1 / (1 + np.exp(-model_scores))
-                
+
                 ensemble_scores.append(model_scores)
-                
+
                 # Record model information
                 if labels is not None:
                     try:
@@ -1718,21 +1748,21 @@ class Lambda3ZeroShotDetector:
                         }
                     except:
                         model_info[f'model_{i}'] = {'auc': 0.5}
-                
+
             except Exception as e:
                 print(f"Model {i} failed: {e}")
                 # Fallback
                 ensemble_scores.append(np.random.rand(len(events)))
-            
+
             # Restore parameters
             self.config = original_config
-        
+
         # Ensemble integration (average)
         if ensemble_scores:
             final_scores = np.mean(ensemble_scores, axis=0)
         else:
             final_scores = np.full(len(events), 0.5)
-        
+
         if labels is not None:
             try:
                 ensemble_auc = roc_auc_score(labels, final_scores)
@@ -1740,69 +1770,69 @@ class Lambda3ZeroShotDetector:
                 print(f"Ensemble AUC: {ensemble_auc:.4f}")
             except:
                 model_info['ensemble_auc'] = 0.5
-        
+
         return final_scores, model_info
-    
+
     def _compute_jump_anomaly_scores(
-        self, 
+        self,
         jump_structures: Dict,
         events: np.ndarray
     ) -> np.ndarray:
         """Calculate anomaly scores directly from jump structures (improved version)"""
         n_events = events.shape[0]
         scores = np.zeros(n_events)
-        
+
         # Integrated jump scores
         integrated = jump_structures['integrated']
-        
+
         # Scores based on jump importance (not just existence)
         jump_mask = integrated['unified_jumps'].astype(float)
         importance = integrated['jump_importance']
-        
+
         # Consider only jumps with high importance (set threshold)
         importance_threshold = np.percentile(importance[importance > 0], 75) if np.any(importance > 0) else 0.5
         significant_jumps = jump_mask * (importance >= importance_threshold)
-        
+
         scores += significant_jumps * importance
-        
+
         # Jump contribution from each feature (intensity-based)
         feature_scores = []
         for f, data in jump_structures['features'].items():
             # Standardize jump intensity
             if data['jump_intensity'] > 0:
                 feature_score = np.zeros(n_events)
-                
+
                 # Consider only strong jumps
                 strong_jumps = (data['pos_jumps'] + data['neg_jumps']) * (
                     np.abs(data['diff']) > np.percentile(np.abs(data['diff']), 98)
                 )
-                
+
                 feature_score = strong_jumps * data['jump_intensity']
-                
+
                 # Penalty for high asymmetry (characteristic of severe anomalies)
                 if np.abs(data['asymmetry']) > 0.8:
                     feature_score *= (1 + np.abs(data['asymmetry']))
-                
+
                 feature_scores.append(feature_score)
-        
+
         if feature_scores:
             # Take maximum instead of average between features (capture more prominent anomalies)
             feature_contribution = np.max(feature_scores, axis=0)
             scores += feature_contribution * 0.5
-        
+
         # Jump cluster anomalies (consider both size and density)
         for cluster in integrated['jump_clusters']:
             cluster_size = cluster['size']
             cluster_density = cluster['density']
-            
+
             # Consider only large and dense clusters as anomalies
             if cluster_size >= 5 and cluster_density > 0.6:
                 anomaly_strength = np.log1p(cluster_size) * cluster_density
                 for idx in cluster['indices']:
                     scores[idx] += anomaly_strength
-        
+
         return scores
-    
+
     def _compute_kernel_anomaly_scores(
         self,
         events: np.ndarray,
@@ -1812,27 +1842,27 @@ class Lambda3ZeroShotDetector:
         """Calculate anomaly scores in kernel space"""
         # Kernel Gram matrix
         K = compute_kernel_gram_matrix(events, kernel_type, gamma=1.0)
-        
+
         # Reconstruction error in kernel space
         paths_matrix = np.stack(list(result.paths.values()))
         n_events = events.shape[0]
-        
+
         # Kernel reconstruction
         K_recon = np.zeros((n_events, n_events))
         for i in range(n_events):
             for j in range(n_events):
                 for k in range(len(paths_matrix)):
                     K_recon[i, j] += paths_matrix[k, i] * K[i, j] * paths_matrix[k, j]
-        
+
         # Normalization
         K_norm = np.sqrt(np.trace(K @ K))
         if K_norm > 0:
             K /= K_norm
-        
+
         recon_norm = np.sqrt(np.trace(K_recon @ K_recon))
         if recon_norm > 0:
             K_recon /= recon_norm
-        
+
         # Per-event error
         kernel_scores = np.zeros(n_events)
         for i in range(n_events):
@@ -1841,30 +1871,30 @@ class Lambda3ZeroShotDetector:
                 diff = K[i, j] - K_recon[i, j]
                 row_error += diff * diff
             kernel_scores[i] = np.sqrt(row_error)
-        
+
         return kernel_scores
-    
+
     def _compute_sync_anomaly_scores(self, jump_structures: Dict) -> np.ndarray:
         """Calculate synchronization anomaly scores"""
         n_events = len(jump_structures['integrated']['unified_jumps'])
         scores = np.zeros(n_events)
-        
+
         # Anomalies in high synchronization clusters
         sync_threshold = 0.7
         sync_matrix = jump_structures['integrated']['sync_matrix']
-        
+
         # Detect feature pairs showing abnormally high synchronization
         high_sync_pairs = np.where(sync_matrix > sync_threshold)
-        
+
         # Synchronization anomaly degree for each feature
         for f in jump_structures['features'].keys():
             feature_sync = np.mean([sync_matrix[f, j] for j in range(len(sync_matrix)) if j != f])
             if feature_sync > sync_threshold:
                 jumps = jump_structures['features'][f]['pos_jumps'] | jump_structures['features'][f]['neg_jumps']
                 scores += jumps * feature_sync
-        
+
         return scores / len(jump_structures['features'])
-    
+
     def explain_anomaly(self, event_idx: int, result: Lambda3Result, events: np.ndarray) -> Dict:
         """Generate physical explanation for anomaly"""
         explanation = {
@@ -1877,11 +1907,11 @@ class Lambda3ZeroShotDetector:
             'kernel_space': {},
             'recommendation': ""
         }
-        
+
         # Calculate anomaly score
         anomaly_scores = self.detect_anomalies(result, events)
         explanation['anomaly_score'] = float(anomaly_scores[event_idx])
-        
+
         # Jump-based explanation
         if self.jump_analyzer:
             integrated = self.jump_analyzer['integrated']
@@ -1890,7 +1920,7 @@ class Lambda3ZeroShotDetector:
                 for f, data in self.jump_analyzer['features'].items():
                     if (data['pos_jumps'][event_idx] or data['neg_jumps'][event_idx]):
                         sync_features.append(f)
-                
+
                 explanation['jump_based'] = {
                     'is_jump': True,
                     'importance': float(integrated['jump_importance'][event_idx]),
@@ -1898,7 +1928,7 @@ class Lambda3ZeroShotDetector:
                     'n_sync_features': len(sync_features),
                     'in_cluster': any(event_idx in c['indices'] for c in integrated['jump_clusters'])
                 }
-        
+
         # Topological explanation
         topo_info = {}
         for p, path in result.paths.items():
@@ -1914,7 +1944,7 @@ class Lambda3ZeroShotDetector:
                         'relative_jump': float(delta / path_std)
                     }
         explanation['topological'] = topo_info
-        
+
         # Energy explanation
         energy_info = {}
         for p in result.paths.keys():
@@ -1923,20 +1953,20 @@ class Lambda3ZeroShotDetector:
                 'local_energy': float(result.paths[p][event_idx]**2)
             }
         explanation['energetic'] = energy_info
-        
+
         # Entropy explanation
         entropy_info = {}
         for p, ent_dict in result.entropies.items():
             # Extract main entropy values
             main_entropy = ent_dict.get('shannon', 0)
             jump_entropy = ent_dict.get('shannon_jump', None)
-            
+
             entropy_info[f'path_{p}'] = {
                 'shannon': float(main_entropy),
                 'jump_conditional': float(jump_entropy) if jump_entropy else None
             }
         explanation['entropic'] = entropy_info
-        
+
         # Recommended action
         if explanation['anomaly_score'] > 2.0:
             if explanation['jump_based'].get('is_jump') and explanation['jump_based']['importance'] > 0.7:
@@ -1947,30 +1977,30 @@ class Lambda3ZeroShotDetector:
             explanation['recommendation'] = "Moderate anomaly detected. Monitor adjacent events for cascading effects."
         else:
             explanation['recommendation'] = "Low anomaly level. Continue normal monitoring."
-        
+
         return explanation
-    
+
     def visualize_results(
-        self, 
-        events: np.ndarray, 
+        self,
+        events: np.ndarray,
         result: Lambda3Result,
         anomaly_scores: np.ndarray = None
     ) -> plt.Figure:
         """Integrated visualization (centered on jump structures)"""
         if anomaly_scores is None:
             anomaly_scores = self.detect_anomalies(result, events)
-            
+
         fig = plt.figure(figsize=(20, 15))
-        
+
         # 1. Jump structure visualization
         ax1 = plt.subplot(3, 4, 1)
         if self.jump_analyzer:
             integrated = self.jump_analyzer['integrated']
             ax1.plot(integrated['jump_importance'], 'b-', label='Jump Importance')
-            ax1.scatter(np.where(integrated['unified_jumps'])[0], 
+            ax1.scatter(np.where(integrated['unified_jumps'])[0],
                        integrated['jump_importance'][integrated['unified_jumps'] == 1],
                        color='red', s=50, label='Jump Events')
-            
+
             # Highlight clusters
             for cluster in integrated['jump_clusters']:
                 ax1.axvspan(cluster['start'], cluster['end'], alpha=0.3, color='yellow')
@@ -1978,7 +2008,7 @@ class Lambda3ZeroShotDetector:
         ax1.set_xlabel('Event Index')
         ax1.set_ylabel('Importance')
         ax1.legend()
-        
+
         # 2. Synchronization matrix
         ax2 = plt.subplot(3, 4, 2)
         if self.jump_analyzer:
@@ -1986,7 +2016,7 @@ class Lambda3ZeroShotDetector:
             im = ax2.imshow(sync_matrix, cmap='viridis', aspect='auto')
             plt.colorbar(im, ax=ax2)
         ax2.set_title('Feature Synchronization Matrix')
-        
+
         # 3. Anomaly score time series
         ax3 = plt.subplot(3, 4, 3)
         ax3.plot(anomaly_scores, 'g-', linewidth=2)
@@ -1996,7 +2026,7 @@ class Lambda3ZeroShotDetector:
         ax3.set_xlabel('Event Index')
         ax3.set_ylabel('Score')
         ax3.legend()
-        
+
         # 4. Topological anomaly map
         ax4 = plt.subplot(3, 4, 4)
         for i in result.paths:
@@ -2007,15 +2037,15 @@ class Lambda3ZeroShotDetector:
         ax4.set_ylabel('Stability σ_Q')
         ax4.set_title('Topological Anomaly Map')
         ax4.legend()
-        
+
         # 5-8. Details of each path (emphasizing jumps)
         for idx, (i, path) in enumerate(result.paths.items()):
             if idx >= 4:
                 break
-                
+
             ax = plt.subplot(3, 4, 5 + idx)
             ax.plot(path, 'b-', alpha=0.7, label='Λ Structure')
-            
+
             # Mark jump events
             if self.jump_analyzer:
                 jump_mask = self.jump_analyzer['integrated']['unified_jumps']
@@ -2023,12 +2053,12 @@ class Lambda3ZeroShotDetector:
                 if len(jump_indices) > 0:
                     ax.scatter(jump_indices, path[jump_indices],
                               color='red', s=50, label='Jumps', zorder=5)
-            
+
             ax.set_title(f'Path {i}: {result.classifications[i]}')
             ax.set_xlabel('Event Index')
             ax.set_ylabel('Λ Amplitude')
             ax.legend()
-            
+
             # Display physical quantities
             textstr = f'Q_Λ={result.topological_charges[i]:.3f}\n' \
                      f'σ_Q={result.stabilities[i]:.3f}\n' \
@@ -2036,7 +2066,7 @@ class Lambda3ZeroShotDetector:
             ax.text(0.02, 0.98, textstr, transform=ax.transAxes,
                    verticalalignment='top', fontsize=8,
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-        
+
         # 9. Entropy comparison
         ax9 = plt.subplot(3, 4, 9)
         entropy_types = ['shannon', 'renyi_2', 'tsallis_1.5']
@@ -2053,7 +2083,7 @@ class Lambda3ZeroShotDetector:
         ax9.set_xlabel('Path Index')
         ax9.set_ylabel('Entropy')
         ax9.legend()
-        
+
         # 10. Pulsation energy distribution (from raw data)
         ax10 = plt.subplot(3, 4, 10)
         if self.jump_analyzer:
@@ -2079,17 +2109,17 @@ class Lambda3ZeroShotDetector:
             ax10.set_title('Pulsation Energy Distribution (Paths)')
             ax10.set_xlabel('Path Index')
             ax10.set_ylabel('Pulse Power')
-        
+
         # 11. PCA projection
         ax11 = plt.subplot(3, 4, 11)
         if events.shape[1] > 2:
             pca = PCA(n_components=2)
             events_2d = pca.fit_transform(events)
-            scatter = ax11.scatter(events_2d[:, 0], events_2d[:, 1], 
+            scatter = ax11.scatter(events_2d[:, 0], events_2d[:, 1],
                                   c=anomaly_scores, cmap='viridis', alpha=0.6)
             plt.colorbar(scatter, ax=ax11)
         ax11.set_title('Event Space (PCA) - Anomaly Colored')
-        
+
         # 12. Kernel space projection
         ax12 = plt.subplot(3, 4, 12)
         # Simple kernel PCA visualization
@@ -2097,13 +2127,13 @@ class Lambda3ZeroShotDetector:
         eigenvalues, eigenvectors = np.linalg.eigh(K)
         idx = np.argsort(eigenvalues)[::-1][:2]
         kernel_proj = eigenvectors[:, idx]
-        ax12.scatter(kernel_proj[:, 0], kernel_proj[:, 1], 
+        ax12.scatter(kernel_proj[:, 0], kernel_proj[:, 1],
                     c=anomaly_scores[:50], cmap='plasma', alpha=0.7)
         ax12.set_title('Kernel Space Projection (Laplacian)')
-        
+
         plt.tight_layout()
         return fig
-    
+
     # ===============================
     # Anomaly Pattern Generation Methods (Production Version)
     # ===============================
@@ -2387,12 +2417,12 @@ class Lambda3ZeroShotDetector:
                           intensity: float = 3) -> np.ndarray:
         """
         Generate anomalies with specified pattern (Production version)
-        
+
         Args:
             events: Input event array
             pattern: Anomaly pattern name
             intensity: Anomaly intensity
-            
+
         Returns:
             Event array with injected anomalies
         """
@@ -2571,34 +2601,34 @@ def evaluate_zero_shot_performance(
     Comprehensive evaluation of zero-shot performance (with focused method)
     """
     print("\n=== Zero-Shot Performance Evaluation ===")
-    
+
     # 1. Lambda³ analysis
     print("Running Lambda³ analysis...")
     start_time = time.time()
     result = detector.analyze(events, n_paths)
     analysis_time = time.time() - start_time
     print(f"Analysis completed in {analysis_time:.3f}s")
-    
+
     # 2. Anomaly detection (comparing basic and advanced versions)
     print("\nDetecting anomalies...")
-    
+
     # Basic version
     basic_scores = detector.detect_anomalies(result, events)
     basic_auc = roc_auc_score(labels, basic_scores)
     print(f"Basic Zero-shot AUC: {basic_auc:.4f}")
-    
+
     # Advanced version
     if use_advanced:
         print("\nRunning advanced detection with feature optimization and ensemble...")
         advanced_scores = detector.detect_anomalies_advanced(
-            result, events, 
-            use_ensemble=True, 
+            result, events,
+            use_ensemble=True,
             optimize_weights=True
         )
         advanced_auc = roc_auc_score(labels, advanced_scores)
         print(f"Advanced Zero-shot AUC: {advanced_auc:.4f}")
         print(f"Improvement: {(advanced_auc - basic_auc) / basic_auc * 100:.1f}%")
-        
+
         # Focused method (using only best feature)
         print("\nRunning focused detection (best feature only)...")
         focused_scores = detector.detect_anomalies_focused(result, events, use_optimization=True)
@@ -2610,7 +2640,7 @@ def evaluate_zero_shot_performance(
         advanced_auc = basic_auc
         focused_scores = basic_scores
         focused_auc = basic_auc
-    
+
     # 3. Detailed metrics
     metrics = {
         'basic_auc': basic_auc,
@@ -2621,12 +2651,12 @@ def evaluate_zero_shot_performance(
         'max_sync': detector.jump_analyzer['integrated']['max_sync'],
         'n_clusters': len(detector.jump_analyzer['integrated']['jump_clusters'])
     }
-    
+
     # 4. Top anomaly analysis with best performance
     best_scores = focused_scores if focused_auc >= advanced_auc else advanced_scores
     best_auc = max(focused_auc, advanced_auc)
     best_method = "Focused" if focused_auc >= advanced_auc else "Advanced"
-    
+
     top_anomaly_indices = np.argsort(best_scores)[-10:]
     print(f"\nTop 10 anomalies ({best_method} method):")
     for i, idx in enumerate(top_anomaly_indices[::-1]):
@@ -2634,14 +2664,14 @@ def evaluate_zero_shot_performance(
         print(f"{i+1}. Event {idx}: Score={best_scores[idx]:.3f}, "
               f"Jump={explanation['jump_based'].get('is_jump', False)}, "
               f"Label={labels[idx]}")
-    
+
     # Calculate accuracy
     correct_in_top10 = sum(labels[idx] for idx in top_anomaly_indices)
     print(f"\nCorrect anomalies in top 10: {correct_in_top10}/10")
-    
+
     metrics['best_auc'] = best_auc
     metrics['best_method'] = best_method
-    
+
     return metrics
 
 # ===============================
@@ -2652,11 +2682,11 @@ def demo_zero_shot_lambda3():
     Demo of complete Lambda³ Zero-Shot Anomaly Detection System
     """
     np.random.seed(42)
-    
+
     print("=== Lambda³ Zero-Shot Anomaly Detection System ===")
     print("Complete Version with Jump-First Architecture")
     print("=" * 60)
-    
+
     # 1. Dataset generation
     print("\n1. Generating complex dataset...")
     events, labels, anomaly_details = create_complex_natural_dataset(
@@ -2667,7 +2697,7 @@ def demo_zero_shot_lambda3():
     print(f"Data shape: {events.shape}")
     print(f"Anomaly ratio: {np.mean(labels):.2%}")
     print(f"Anomaly types: {set(anomaly_details)}")
-    
+
     # 2. Initialize detector
     print("\n2. Initializing detector...")
     config = L3Config(
@@ -2679,21 +2709,21 @@ def demo_zero_shot_lambda3():
         w_pulse=0.4
     )
     detector = Lambda3ZeroShotDetector(config)
-    
+
     # 3. Performance evaluation (using advanced version)
     print("\n3. Evaluating performance...")
     metrics = evaluate_zero_shot_performance(
         detector, events, labels, n_paths=7, use_advanced=True
     )
-    
+
     # 4. Visualization
     print("\n4. Generating visualizations...")
     result = detector.analyze(events, n_paths=7)
     anomaly_scores = detector.detect_anomalies(result, events)
-    
+
     fig = detector.visualize_results(events, result, anomaly_scores)
     plt.suptitle('Lambda³ Zero-Shot Detection Results', fontsize=16)
-    
+
     # 5. Example anomaly explanations
     print("\n5. Example anomaly explanations:")
     top_3_anomalies = np.argsort(anomaly_scores)[-3:]
@@ -2703,7 +2733,7 @@ def demo_zero_shot_lambda3():
         print(f"Anomaly Score: {explanation['anomaly_score']:.3f}")
         print(f"Jump-based: {explanation['jump_based']}")
         print(f"Recommendation: {explanation['recommendation']}")
-    
+
     # 6. Final summary
     print("\n" + "=" * 60)
     print("=== Final Summary ===")
@@ -2716,7 +2746,7 @@ def demo_zero_shot_lambda3():
     print(f"Jumps detected: {metrics['n_jumps_detected']}")
     print(f"Jump clusters: {metrics['n_clusters']}")
     print(f"Max synchronization: {metrics['max_sync']:.3f}")
-    
+
     if metrics['best_auc'] > 0.9:
         print(f"\n🚀 REVOLUTIONARY: {metrics['best_auc']:.1%} AUC with ZERO training!")
         print("Lambda³ theory has shattered the limits of anomaly detection!")
@@ -2726,9 +2756,9 @@ def demo_zero_shot_lambda3():
     elif metrics['best_auc'] > 0.7:
         print(f"\n✨ EXCELLENT: {metrics['best_auc']:.1%} AUC with ZERO training!")
         print("Lambda³ theory demonstrates remarkable performance!")
-    
+
     plt.show()
-    
+
     return detector, result, metrics
 
 # ===============================
@@ -2739,10 +2769,10 @@ if __name__ == "__main__":
     print("Jump-First Architecture with Complete Feature Integration")
     print("Based on Dr. Iizumi's Lambda³ Theory")
     print("=" * 80)
-    
+
     # Run demo
     detector, result, metrics = demo_zero_shot_lambda3()
-    
+
     print("\n" + "=" * 80)
     print("Demo completed successfully!")
     print(f"Achievement: {metrics['best_auc']:.4f} AUC with zero training")
