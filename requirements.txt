@@ -1,0 +1,24 @@
+# Core dependencies
+numpy>=1.21.0
+numba>=0.56.0
+scikit-learn>=1.0.0
+scipy>=1.7.0
+matplotlib>=3.4.0
+
+# Data processing
+pandas>=1.3.0
+
+# Type hints and dataclasses (for older Python versions)
+typing-extensions>=4.0.0
+dataclasses>=0.6; python_version < '3.7'
+
+# Optional dependencies for enhanced performance
+# Uncomment if needed:
+# cupy>=10.0.0  # For GPU acceleration
+# joblib>=1.1.0  # For parallel processing
+
+# Development dependencies (optional)
+# pytest>=6.2.0
+# pytest-cov>=3.0.0
+# black>=22.0.0
+# flake8>=4.0.0
