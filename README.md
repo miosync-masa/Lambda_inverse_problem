@@ -46,13 +46,38 @@ On synthetic datasets with complex anomaly patterns:
 
 *When using multiple important features discovered through optimization
 
-## ㊙️ Core Concepts　
+## ㊙️ Core Mechanism
 
 1. **Structure Tensor (Λ)**: Represents data structure in semantic space
-2. **Jump Detection (ΔΛC)**: Identifies sudden structural changes
-3. **Topological Charge (Q_Λ)**: Measures structural defects
-4. **Multi-Entropy Analysis**: Shannon, Renyi, and Tsallis entropies
-   
+2. **Jump Detection (ΔΛC)**: Identifies sudden structural changes (pulsations)
+3. **Topological Charge (Q_Λ)**: Measures structural defects (winding number)
+4. **Stability Analysis (σ_Q)**: Variance of topological charge across segments
+5. **Multi-Entropy Analysis**: 
+   - Shannon entropy
+   - Renyi entropy (α=2)
+   - Tsallis entropy (q=1.5)
+   - Conditional entropies on jump events
+6. **Inverse Problem Solving**: Jump-constrained optimization to reconstruct Λ
+7. **Tikhonov Regularization**: TV and L1 regularization for stable solutions
+8. **Kernel Extensions**:
+   - RBF (Gaussian) kernel
+   - Polynomial kernel
+   - Laplacian kernel
+   - Sigmoid kernel
+9. **Feature Engineering**:
+   - Nonlinear transformations (log, sqrt, square)
+   - Feature combinations (products, ratios)
+   - Statistical features (skewness, kurtosis)
+10. **Ensemble Methods**: Multiple models with different parameters
+11. **Synchronization Analysis**: Cross-feature jump synchronization rates
+12. **Pulsation Energy**: Jump intensity, asymmetry, and power metrics
+
+## Key Discoveries
+
+- **Q_Λ/σ_Q** ratio often emerges as the most powerful anomaly indicator
+- Combines multiple physical quantities for robust detection
+- Automatically discovers optimal features for each dataset
+
 ## Usage
 
 ```python
