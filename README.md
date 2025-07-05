@@ -1,5 +1,6 @@
 # 📕 Lambda³ Zero-Shot Anomaly Detection
 
+###「Zero-Shot anomaly detection at 99.99% AUC」
 A physics-inspired anomaly detection system that requires no training data, based on Lambda³ (Lambda-Cubed) theory.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/miosync-masa/Lambda_inverse_problem/blob/main/examples/lambda3_demo.ipynb)
@@ -27,7 +28,7 @@ The system is evaluated on synthetic datasets with complex anomaly patterns that
 | **Periodic Burst** | Periodic signals with sudden disruptions | • Phase shifts<br>• Sign reversals<br>• Missing segments | Broken periodicity masks the pattern |
 | **Partial Anomaly** | Localized anomalies in subset of features | • Feature-specific impact<br>• Temporal locality<br>• Mixed with normal behavior | Only affects some dimensions |
 
-### Performance Results
+### ⚡️Performance Results
 
 On synthetic datasets with complex anomaly patterns:
 - Basic detection: ~80% AUC
@@ -43,11 +44,6 @@ On synthetic datasets with complex anomaly patterns:
 
 “Detects the ‘moments of rupture’—the unseen phase transitions, structural cracks, and the birth of new orders—before any black-box model can learn them.”
 *When using multiple important features discovered through optimization
-
---
-## ⚡️Performance
-
-
 
 --
 ## ㊙️ Core Concepts　
