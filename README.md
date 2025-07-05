@@ -1,6 +1,7 @@
 # 📕 Lambda³ Zero-Shot Anomaly Detection
 
 ###「Zero-Shot anomaly detection at 99.99% AUC」
+
 A physics-inspired anomaly detection system that requires no training data, based on Lambda³ (Lambda-Cubed) theory.
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/miosync-masa/Lambda_inverse_problem/blob/main/examples/lambda3_demo.ipynb)
