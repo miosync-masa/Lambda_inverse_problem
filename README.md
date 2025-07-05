@@ -43,6 +43,7 @@ On synthetic datasets with complex anomaly patterns:
 | Traditional Supervised | 70-85% | 1000s of samples | Black box |
 
 “Detects the ‘moments of rupture’—the unseen phase transitions, structural cracks, and the birth of new orders—before any black-box model can learn them.”
+
 *When using multiple important features discovered through optimization
 
 ## ㊙️ Core Concepts　
