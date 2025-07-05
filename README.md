@@ -54,7 +54,7 @@ anomaly_scores = detector.detect_anomalies(result, events)
 4. **scikit-learn
 5. **SciPy
 6. **matplotlib
-7. 
+   
 --
 ## Installation
 
