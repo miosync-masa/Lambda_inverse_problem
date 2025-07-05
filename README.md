@@ -2,6 +2,8 @@
 
 A physics-inspired anomaly detection system that requires no training data, based on Lambda³ (Lambda-Cubed) theory.
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/miosync-masa/Lambda_inverse_problem/blob/main/examples/lambda3_demo.ipynb)
+
 ## Overview
 
 This system detects anomalies by analyzing structural changes (ΔΛC jumps) and topological invariants in data, achieving competitive performance without any labeled training examples.
