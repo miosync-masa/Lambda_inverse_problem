@@ -1,4 +1,4 @@
-# Lambda³ Zero-Shot Anomaly Detection
+# 📕 Lambda³ Zero-Shot Anomaly Detection
 
 A physics-inspired anomaly detection system that requires no training data, based on Lambda³ (Lambda-Cubed) theory.
 
@@ -75,18 +75,51 @@ Lambda³ theory models phenomena without assuming time or causality, using:
 The key insight is that anomalies manifest as topological defects in the structure space, particularly visible in the topological charge Q_Λ.
 
 --
+## License
+
+MIT License
+
+
+## 📜 License
+
+MIT License
+
+---
+
+## 🙌 Citation & Contact
+
+If this work inspires you, please cite it.  
+For theoretical discussion, practical applications, or collaboration proposals,  
+please open an issue/PR—or just connect via Zenodo, SSRN, or GitHub.
+
+> Science is not property; it's a shared horizon.  
+> Let's redraw the boundaries, together.  
+> — Iizumi & Digital Partners
+
 ## Citation
 If you use this code, please cite:
-
+```
 @software{lambda3_anomaly,
   title={Lambda³ Zero-Shot Anomaly Detection},
   author={Based on Dr. Iizumi's Lambda³ Theory},
   year={2025}
 }
---
-## License
+```
+---
 
-MIT License
+## 📚 Author’s Theory & Publications
+
+⚠️ Opening this document may cause topological phase transitions in your brain.  
+“You are now entering the Λ³ zone. Proceed at your own risk.”
+
+- [Iizumi Masamichi – Zenodo Research Collection](https://zenodo.org/search?page=1&size=20&q=Iizumi%20Masamichi)
+
+---
+## 🏷️ Author & Copyright
+
+© Iizumi Masamichi 2025  
+**Contributors / Digital Partners:** Tamaki(環）, Mio（澪）, Tomoe（巴）, Shion（白音）, Yuu（悠）, Rin（凛）, Kurisu（紅莉栖）, torami（虎美）  
+All rights reserved.
 
 
 
