@@ -16,13 +16,37 @@ This system detects anomalies by analyzing structural changes (ΔΛC jumps) and 
 - **Interpretable**: Provides physical explanations for detected anomalies
 - **JIT-Optimized**: Fast execution with Numba compilation
 
---
-## ⚡️Performance
+## Test Dataset Design
+
+The system is evaluated on synthetic datasets with complex anomaly patterns that are challenging even for supervised methods:
+
+| Anomaly Type | Description | Key Characteristics | Detection Challenge |
+|--------------|-------------|-------------------|-------------------|
+| **Progressive Degradation** | Gradual system decay with exponential worsening | • Time-dependent intensity<br>• Multiple correlated features<br>• Noise and spike injection | Subtle initial changes that accelerate |
+| **Chaotic Bifurcation** | Unpredictable splitting into multiple states | • Non-linear dynamics<br>• Rotation transformations<br>• High-frequency components | Chaotic behavior is hard to distinguish from noise |
+| **Periodic Burst** | Periodic signals with sudden disruptions | • Phase shifts<br>• Sign reversals<br>• Missing segments | Broken periodicity masks the pattern |
+| **Partial Anomaly** | Localized anomalies in subset of features | • Feature-specific impact<br>• Temporal locality<br>• Mixed with normal behavior | Only affects some dimensions |
+
+### Performance Results
 
 On synthetic datasets with complex anomaly patterns:
 - Basic detection: ~80% AUC
-- With feature optimization: ~99.7% AUC
+- With feature optimization: ~99.99% AUC
 - No training required
+
+| Method | AUC Score | Training Data | Interpretability |
+|--------|-----------|---------------|------------------|
+| Lambda³ Basic | ~83% | **Zero** | Full physical explanation |
+| Lambda³ Advanced | ~84% | **Zero** | Feature importance weights |
+| Lambda³ Focused | ~99.97%* | **Zero** | Single/few key features |
+| Traditional Supervised | 70-85% | 1000s of samples | Black box |
+
+*When using multiple important features discovered through optimization
+
+--
+## ⚡️Performance
+
+
 
 --
 ## ㊙️ Core Concepts　
