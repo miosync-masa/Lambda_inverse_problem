@@ -41,6 +41,7 @@ On synthetic datasets with complex anomaly patterns:
 | Lambda³ Focused | ~99.97%* | **Zero** | Single/few key features |
 | Traditional Supervised | 70-85% | 1000s of samples | Black box |
 
+“Detects the ‘moments of rupture’—the unseen phase transitions, structural cracks, and the birth of new orders—before any black-box model can learn them.”
 *When using multiple important features discovered through optimization
 
 --
@@ -102,6 +103,8 @@ The key insight is that anomalies manifest as topological defects in the structu
 ## 📜 License
 
 MIT License
+“Warning: Extended use of Lambda³ may result in deeper philosophical insights about reality.”
+
 ---
 ## 🙌 Citation & Contact
 
