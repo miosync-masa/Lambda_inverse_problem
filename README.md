@@ -68,7 +68,7 @@ detector = Lambda3ZeroShotDetector()
 # Analyze data (no training needed)
 result = detector.analyze(events, n_paths=5)
 
-# Detect anomalies
+# events = load_synthetic_data()
 anomaly_scores = detector.detect_anomalies(result, events)
 ```
 --
@@ -99,17 +99,10 @@ Lambda³ theory models phenomena without assuming time or causality, using:
 The key insight is that anomalies manifest as topological defects in the structure space, particularly visible in the topological charge Q_Λ.
 
 --
-## License
-
-MIT License
-
-
 ## 📜 License
 
 MIT License
-
 ---
-
 ## 🙌 Citation & Contact
 
 If this work inspires you, please cite it.  
