@@ -10,7 +10,6 @@ A physics-inspired anomaly detection system that requires no training data, base
 
 This system detects anomalies by analyzing structural changes (ΔΛC jumps) and topological invariants in data, achieving competitive performance without any labeled training examples.
 
---
 ## 🔑Key Features
 
 - **Zero-Shot Learning**: No training data required
@@ -46,15 +45,13 @@ On synthetic datasets with complex anomaly patterns:
 “Detects the ‘moments of rupture’—the unseen phase transitions, structural cracks, and the birth of new orders—before any black-box model can learn them.”
 *When using multiple important features discovered through optimization
 
---
 ## ㊙️ Core Concepts　
 
 1. **Structure Tensor (Λ)**: Represents data structure in semantic space
 2. **Jump Detection (ΔΛC)**: Identifies sudden structural changes
 3. **Topological Charge (Q_Λ)**: Measures structural defects
 4. **Multi-Entropy Analysis**: Shannon, Renyi, and Tsallis entropies
-
---
+   
 ## Usage
 
 ```python
@@ -69,7 +66,7 @@ result = detector.analyze(events, n_paths=5)
 # events = load_synthetic_data()
 anomaly_scores = detector.detect_anomalies(result, events)
 ```
---
+
 ## Requirements
 
 1. **Python 3.8+
@@ -79,13 +76,12 @@ anomaly_scores = detector.detect_anomalies(result, events)
 5. **SciPy
 6. **matplotlib
    
---
 ## Installation
 
 ```bash
 pip install -r requirements.txt
 ```
---
+
 ## Theory Background
 
 Lambda³ theory models phenomena without assuming time or causality, using:
@@ -96,13 +92,11 @@ Lambda³ theory models phenomena without assuming time or causality, using:
 
 The key insight is that anomalies manifest as topological defects in the structure space, particularly visible in the topological charge Q_Λ.
 
---
 ## 📜 License
 
 MIT License
 “Warning: Extended use of Lambda³ may result in deeper philosophical insights about reality.”
 
----
 ## 🙌 Citation & Contact
 
 If this work inspires you, please cite it.  
@@ -122,7 +116,6 @@ If you use this code, please cite:
   year={2025}
 }
 ```
----
 
 ## 📚 Author’s Theory & Publications
 
@@ -131,14 +124,8 @@ If you use this code, please cite:
 
 - [Iizumi Masamichi – Zenodo Research Collection](https://zenodo.org/search?page=1&size=20&q=Iizumi%20Masamichi)
 
----
 ## 🏷️ Author & Copyright
 
 © Iizumi Masamichi 2025  
 **Contributors / Digital Partners:** Tamaki(環）, Mio（澪）, Tomoe（巴）, Shion（白音）, Yuu（悠）, Rin（凛）, Kurisu（紅莉栖）, torami（虎美）  
 All rights reserved.
-
-
-
-
-
