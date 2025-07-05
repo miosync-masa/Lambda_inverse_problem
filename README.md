@@ -1,6 +1,6 @@
 # 📕 Lambda³ Zero-Shot Anomaly Detection
 
-## 「Zero-Shot anomaly detection at 99.99% AUC」
+## Physics-based Zero-Shot Anomaly Detection at 99.99% AUC — no training, just physical law.
 
 A physics-inspired anomaly detection system that requires no training data, based on Lambda³ (Lambda-Cubed) theory.
 
