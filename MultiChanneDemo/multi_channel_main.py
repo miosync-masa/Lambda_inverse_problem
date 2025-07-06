@@ -408,6 +408,3 @@ if __name__ == "__main__":
         demo_multi_channel_system()
     else:
         main()
-改善
-説明
-
