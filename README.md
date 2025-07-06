@@ -42,6 +42,8 @@ The system is evaluated on synthetic datasets with complex anomaly patterns that
 
 *Results on synthetic complex dataset with progressive degradation, periodic bursts, chaotic bifurcations, and partial anomalies.*
 
+![Results](http://www.miosync.link/github/zeroshot.png)
+
 ## 🌟 Key Features
 
 - **Zero Training Required**: Works immediately on new data
