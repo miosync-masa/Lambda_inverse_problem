@@ -3,88 +3,107 @@ Lambda³ Zero-Shot Anomaly Detection System - Fixed Version
 ジャンプ駆動型ゼロショット異常検知システム（修正版）
 Author: Based on Dr. Iizumi's Lambda³ Theory
 """
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
-from scipy.optimize import minimize, differential_evolution
-from sklearn.metrics import roc_auc_score
-from dataclasses import dataclass
-from typing import Dict, Tuple, List, Optional
-from itertools import combinations
-from scipy.signal import hilbert
-import warnings
-from sklearn.linear_model import LogisticRegression
-from sklearn.preprocessing import StandardScaler
-from numba import jit, njit, prange, cuda
-from numba.typed import Dict as NumbaDict
-import numba
+import json
+import os
+import pickle
 import time
+import warnings
+from dataclasses import dataclass
+from itertools import combinations
+from typing import Dict, List, Optional, Tuple
+
+import matplotlib.pyplot as plt
+import networkx as nx
+import numba
+from numba import cuda, jit, njit, prange
+from numba.typed import Dict as NumbaDict
+import numpy as np
+from scipy.decomposition import PCA
+from scipy.manifold import TSNE
+from scipy.optimize import differential_evolution, minimize
+from scipy.signal import hilbert
+
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.manifold import TSNE
+from sklearn.metrics import roc_auc_score
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
 # ===============================
-# グローバル定数（JIT最適化用）
+# Global Constants (for JIT Optimization)
 # ===============================
-DELTA_PERCENTILE = 94.0
-LOCAL_WINDOW_SIZE = 15
-LOCAL_JUMP_PERCENTILE = 91.0
-WINDOW_SIZE = 30
 
-# 追加：マルチスケールジャンプ検出
-MULTI_SCALE_WINDOWS = [5, 10, 20, 40]  # 複数スケールで検出
-MULTI_SCALE_PERCENTILES = [85.0, 90.0, 93.0, 95.0]
+DELTA_PERCENTILE = 94.0          # Percentile threshold for global jump detection (large jumps)
+LOCAL_WINDOW_SIZE = 15           # Window size for local statistics (used in adaptive detection)
+LOCAL_JUMP_PERCENTILE = 91.0     # Percentile threshold for local jumps
+WINDOW_SIZE = 30                 # General-purpose window size (e.g., for rolling std/mean)
+
+# Multi-scale jump detection parameters
+MULTI_SCALE_WINDOWS = [5, 10, 20, 40]      # Detect jumps at multiple temporal resolutions
+MULTI_SCALE_PERCENTILES = [85.0, 90.0, 93.0, 95.0]  # Adaptive thresholds for each scale
 
 # ===============================
 # Global Constants (for KERNEL optimization) - Tuned Version
 # ===============================
-DEFAULT_KERNEL_TYPE = 3  # Laplacian as default
-DEFAULT_GAMMA = 1.0
-DEFAULT_DEGREE = 3
-DEFAULT_COEF0 = 1.0
-DEFAULT_ALPHA = 0.01
+
+DEFAULT_KERNEL_TYPE = 3      # 3 = Laplacian kernel as default (RBF=1, Poly=2, Laplace=3)
+DEFAULT_GAMMA = 1.0          # Gamma parameter for kernel functions
+DEFAULT_DEGREE = 3           # Degree for polynomial kernel
+DEFAULT_COEF0 = 1.0          # Coefficient for polynomial kernel
+DEFAULT_ALPHA = 0.01         # Regularization weight (Tikhonov or ridge-like penalties)
 
 # ===============================
-# データクラス定義
+# Data Class Definitions
 # ===============================
+
 @dataclass
 class Lambda3Result:
-    """Lambda³解析結果を格納するデータクラス"""
-    paths: Dict[int, np.ndarray]
-    topological_charges: Dict[int, float]
-    stabilities: Dict[int, float]
-    energies: Dict[int, float]
-    entropies: Dict[int, Dict[str, float]]
-    classifications: Dict[int, str]
-    jump_structures: Optional[Dict] = None
+    """
+    Data class for storing results of Lambda³ structural analysis.
+    """
+    paths: Dict[int, np.ndarray]                   # Structure tensor paths for each component
+    topological_charges: Dict[int, float]          # Topological charge Q_Λ for each path
+    stabilities: Dict[int, float]                  # Topological stability σ_Q for each path
+    energies: Dict[int, float]                     # Pulsation/energy metrics for each path
+    entropies: Dict[int, Dict[str, float]]         # Multi-type entropies (Shannon, Rényi, Tsallis, etc.)
+    classifications: Dict[int, str]                # Path-level classification labels (if any)
+    jump_structures: Optional[Dict] = None         # Additional jump/transition structure info (optional)
 
 @dataclass
 class L3Config:
-    """Lambda³設定パラメータ"""
-    alpha: float = 0.05  # 0.1から減少（正則化を弱める）
-    beta: float = 0.005  # 0.01から減少
-    n_paths: int = 7     # 5から増加（より多くの構造を捕捉）
-    jump_scale: float = 1.5  # 2.0から減少（より多くのジャンプを検出）
-    use_union: bool = True
-    w_topo: float = 0.3  # 0.2から増加
-    w_pulse: float = 0.2  # 0.3から減少
+    """
+    Configuration parameters for Lambda³ analysis.
+    """
+    alpha: float = 0.05         # L2 regularization (reduced from 0.1)
+    beta: float = 0.005         # L1 regularization (reduced from 0.01)
+    n_paths: int = 7            # Number of structure tensor paths (increased from 5)
+    jump_scale: float = 1.5     # Sensitivity of jump detection (decreased from 2.0)
+    use_union: bool = True      # Whether to use union of jumps across scales
+    w_topo: float = 0.3         # Weight for topological anomaly score (increased from 0.2)
+    w_pulse: float = 0.2        # Weight for pulsation score (decreased from 0.3)
 
 @dataclass
 class OptimizationResult:
-    """最適化結果を格納するデータクラス"""
-    selected_features: List[str]
-    weights: Dict[str, float]
-    auc: float
-    feature_correlations: Dict[str, float]
-    feature_groups: Optional[Dict[str, List[str]]] = None
+    """
+    Data class for storing optimization results (e.g., feature selection, weight tuning).
+    """
+    selected_features: List[str]                # Selected features (after optimization)
+    weights: Dict[str, float]                   # Component/feature weights
+    auc: float                                 # Final AUC score
+    feature_correlations: Dict[str, float]      # Correlation scores for selected features
+    feature_groups: Optional[Dict[str, List[str]]] = None  # Optional grouping (e.g., for ensemble/group detection)
 
 @dataclass
 class DetectionStrategy:
-    """検出戦略を定義するデータクラス"""
-    method: str  # "single", "group", "ensemble"
-    features: List[str]
-    weights: Dict[str, float]
-    confidence: float
+    """
+    Data class defining detection strategy.
+    """
+    method: str                                # "single", "group", "ensemble", etc.
+    features: List[str]                        # Features/components used for detection
+    weights: Dict[str, float]                  # Weights for each feature/component
+    confidence: float                          # Confidence score of current detection logic
 
 # ===============================
 # JIT最適化コア関数（ジャンプ検出）
