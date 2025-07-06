@@ -1,17 +1,19 @@
-
 """
 Multi-Channel Lambda³ Detector - Integration Module
 マルチチャンネル統合異常検知モジュール
 """
 import numpy as np
 import networkx as nx
-from typing import Dict, List, Tuple, Optional, Union
+from typing import Dict, List, Tuple, Optional, Union, Any
 from dataclasses import dataclass
 import matplotlib.pyplot as plt
 from scipy.spatial.distance import cdist
 from scipy.optimize import minimize
 import warnings
+import os
+import json
 
+# 独立したsync_analyzerモジュールからインポート
 from sync_analyzer import SyncAnalyzer, SyncResult, extract_jump_events, prepare_sync_data
 
 warnings.filterwarnings('ignore')
@@ -492,6 +494,99 @@ class MultiChannelDetector:
 # ===============================
 # Utility Functions
 # ===============================
+def load_lambda3_results(channel_name: str,
+                        save_dir: str = "./lambda3_results") -> Dict[str, Any]:
+    """
+    保存されたLambda³解析結果を読み込み
+    
+    Args:
+        channel_name: チャンネル名
+        save_dir: 保存ディレクトリ
+        
+    Returns:
+        読み込んだデータの辞書
+    """
+    import json
+    
+    channel_dir = os.path.join(save_dir, channel_name)
+    if not os.path.exists(channel_dir):
+        raise FileNotFoundError(f"No saved results found for channel {channel_name}")
+    
+    loaded_data = {}
+    
+    # 1. 異常スコア（必須）
+    scores_path = os.path.join(channel_dir, "anomaly_scores.npy")
+    if os.path.exists(scores_path):
+        loaded_data['scores'] = np.load(scores_path)
+    else:
+        raise FileNotFoundError(f"Anomaly scores not found for {channel_name}")
+    
+    # 2. ジャンプイベント（オプション）
+    jump_path = os.path.join(channel_dir, "jump_events.npy")
+    if os.path.exists(jump_path):
+        loaded_data['jump_events'] = np.load(jump_path)
+    
+    # 3. ジャンプ重要度（オプション）
+    importance_path = os.path.join(channel_dir, "jump_importance.npy")
+    if os.path.exists(importance_path):
+        loaded_data['jump_importance'] = np.load(importance_path)
+    
+    # 4. メタデータ（オプション）
+    metadata_path = os.path.join(channel_dir, "metadata.json")
+    if os.path.exists(metadata_path):
+        with open(metadata_path, 'r') as f:
+            loaded_data['metadata'] = json.load(f)
+    
+    print(f"Loaded Lambda³ results for {channel_name}")
+    return loaded_data
+
+def prepare_for_integration(save_dir: str = "./lambda3_results",
+                          channels: Optional[List[str]] = None) -> Dict[str, Dict]:
+    """
+    保存されたLambda³結果を統合解析用に準備
+    
+    Args:
+        save_dir: Lambda³結果の保存ディレクトリ
+        channels: 読み込むチャンネルのリスト（Noneの場合は全て）
+        
+    Returns:
+        multi_channel_detector.integrate_channels()に渡せる形式のデータ
+    """
+    import json
+    
+    integration_data = {}
+    
+    # チャンネルリストの決定
+    if channels is None:
+        # サマリーファイルから取得を試みる
+        summary_path = os.path.join(save_dir, "summary.json")
+        if os.path.exists(summary_path):
+            with open(summary_path, 'r') as f:
+                summary = json.load(f)
+            channels = summary.get('channels', [])
+        else:
+            # サマリーがない場合はディレクトリから推定
+            channels = [d for d in os.listdir(save_dir) 
+                       if os.path.isdir(os.path.join(save_dir, d)) and not d.startswith('.')]
+    
+    # 各チャンネルのデータを読み込み
+    for channel in channels:
+        try:
+            channel_data = load_lambda3_results(channel, save_dir)
+            integration_data[channel] = channel_data
+        except FileNotFoundError as e:
+            print(f"Warning: Skipping {channel} - {e}")
+            continue
+    
+    if not integration_data:
+        raise ValueError("No valid channel data found for integration")
+    
+    print(f"Prepared {len(integration_data)} channels for integration:")
+    for channel in integration_data.keys():
+        print(f"  - {channel}")
+    
+    return integration_data
+
 def save_integration_results(result: IntegrationResult, 
                            base_path: str = "./results"):
     """統合結果を保存"""
