@@ -290,11 +290,19 @@ class MultiChannelDetector:
                               threshold_sigma: float = 2.0,
                               min_duration: int = 5) -> List[Tuple[int, int]]:
         """連続的な異常領域を検出"""
+        # デバッグ情報
+        print(f"\nDetecting anomaly regions...")
+        print(f"  Score stats: mean={np.mean(integrated_scores):.3f}, std={np.std(integrated_scores):.3f}")
+        print(f"  Score range: [{np.min(integrated_scores):.3f}, {np.max(integrated_scores):.3f}]")
+        
         # 閾値設定
         threshold = np.mean(integrated_scores) + threshold_sigma * np.std(integrated_scores)
+        print(f"  Threshold (mean + {threshold_sigma}*std): {threshold:.3f}")
         
         # 異常フラグ
         anomaly_flags = integrated_scores > threshold
+        n_anomaly_points = np.sum(anomaly_flags)
+        print(f"  Points above threshold: {n_anomaly_points}/{len(integrated_scores)}")
         
         # 連続領域の検出
         regions = []
@@ -313,6 +321,8 @@ class MultiChannelDetector:
         # 最後の領域
         if in_region and len(anomaly_flags) - start >= min_duration:
             regions.append((start, len(anomaly_flags)))
+        
+        print(f"  Detected {len(regions)} regions (min_duration={min_duration})")
         
         return regions
     
@@ -603,14 +613,42 @@ def save_integration_results(result: IntegrationResult,
     # 同期マトリックスの保存
     np.save(f"{base_path}/sync_matrix.npy", result.sync_result.sync_matrix)
     
-    # ネットワークの保存
-    nx.write_gexf(result.sync_network, f"{base_path}/sync_network.gexf")
+    # ネットワークの保存（numpy配列属性を除外）
+    # GEXFはnumpy配列を保存できないので、別形式で保存
+    try:
+        # ノード属性からnumpy配列を一時的に除去
+        G_copy = result.sync_network.copy()
+        for node in G_copy.nodes():
+            node_data = G_copy.nodes[node]
+            for key, value in list(node_data.items()):
+                if isinstance(value, np.ndarray):
+                    # numpy配列は文字列に変換
+                    node_data[key + '_shape'] = str(value.shape)
+                    del node_data[key]
+        
+        # エッジ属性も同様に処理
+        for edge in G_copy.edges():
+            edge_data = G_copy.edges[edge]
+            for key, value in list(edge_data.items()):
+                if isinstance(value, (np.ndarray, dict)):
+                    if isinstance(value, dict):
+                        # sync_profileなどの辞書も文字列化
+                        edge_data[key + '_keys'] = str(list(value.keys()))
+                    del edge_data[key]
+        
+        nx.write_gexf(G_copy, f"{base_path}/sync_network.gexf")
+    except Exception as e:
+        print(f"Warning: Could not save network in GEXF format: {e}")
+        # 代替としてpickleで保存
+        import pickle
+        with open(f"{base_path}/sync_network.pkl", 'wb') as f:
+            pickle.dump(result.sync_network, f)
     
     # メタデータ
     import json
     metadata = {
         'anomaly_regions': result.anomaly_regions,
-        'confidence': result.confidence,
+        'confidence': float(result.confidence) if not np.isnan(result.confidence) else 0.0,
         'channels': result.sync_result.series_names
     }
     
@@ -618,8 +656,8 @@ def save_integration_results(result: IntegrationResult,
         metadata['defect_locations'] = {
             k: {
                 'time_range': v['time_range'],
-                'position': v['estimated_position'].tolist(),
-                'confidence': v['confidence']
+                'position': v['estimated_position'].tolist() if isinstance(v['estimated_position'], np.ndarray) else v['estimated_position'],
+                'confidence': float(v['confidence']) if not np.isnan(v['confidence']) else 0.0
             }
             for k, v in result.defect_locations.items()
         }
