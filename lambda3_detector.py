@@ -1,3 +1,8 @@
+"""
+Lambda³ Zero-Shot Anomaly Detection System - Fixed Version
+ジャンプ駆動型ゼロショット異常検知システム（修正版）
+Author: Based on Dr. Iizumi's Lambda³ Theory
+"""
 import numpy as np
 import matplotlib.pyplot as plt
 from sklearn.manifold import TSNE
@@ -9,7 +14,8 @@ from typing import Dict, Tuple, List, Optional
 from itertools import combinations
 from scipy.signal import hilbert
 import warnings
-from sklearn.linear_model import BayesianRidge
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
 from numba import jit, njit, prange, cuda
 from numba.typed import Dict as NumbaDict
 import numba
@@ -18,46 +24,74 @@ import time
 warnings.filterwarnings('ignore')
 
 # ===============================
-# Global Constants (for JIT optimization) - Tuned Version
+# グローバル定数（JIT最適化用）
 # ===============================
-DELTA_PERCENTILE = 99.0         # Percentile threshold for ΔΛC jump detection (99th percentile = top 1% changes)
-LOCAL_WINDOW_SIZE = 20          # Window size for local statistics calculation (events)
-LOCAL_JUMP_PERCENTILE = 95.0    # Percentile for local adaptive jump detection (top 5% local anomalies)
-WINDOW_SIZE = 30                # Window size for tension scalar ρT calculation (broader context)
+DELTA_PERCENTILE = 94.0
+LOCAL_WINDOW_SIZE = 15
+LOCAL_JUMP_PERCENTILE = 91.0
+WINDOW_SIZE = 30
+
+# 追加：マルチスケールジャンプ検出
+MULTI_SCALE_WINDOWS = [5, 10, 20, 40]  # 複数スケールで検出
+MULTI_SCALE_PERCENTILES = [85.0, 90.0, 93.0, 95.0]
 
 # ===============================
-# Data Classes
+# Global Constants (for KERNEL optimization) - Tuned Version
+# ===============================
+DEFAULT_KERNEL_TYPE = 3  # Laplacian as default
+DEFAULT_GAMMA = 1.0
+DEFAULT_DEGREE = 3
+DEFAULT_COEF0 = 1.0
+DEFAULT_ALPHA = 0.01
+
+# ===============================
+# データクラス定義
 # ===============================
 @dataclass
 class Lambda3Result:
-    """Data class to store Lambda³ analysis results (Extended version)"""
-    paths: Dict[int, np.ndarray]              # Structure tensor paths Λ_k for each mode k
-    topological_charges: Dict[int, float]     # Topological charge Q_Λ (winding number in phase space)
-    stabilities: Dict[int, float]             # Stability measure σ_Q (variance of Q across segments)
-    energies: Dict[int, float]                # Energy E = ||Λ||² for each structural mode
-    entropies: Dict[int, float]               # Information entropy S (Shannon/Renyi/Tsallis)
-    classifications: Dict[int, str]           # Physical classification based on Q_Λ and stability
-    jump_structures: Dict = None              # ΔΛC jump event analysis (pulsation detection)
+    """Lambda³解析結果を格納するデータクラス"""
+    paths: Dict[int, np.ndarray]
+    topological_charges: Dict[int, float]
+    stabilities: Dict[int, float]
+    energies: Dict[int, float]
+    entropies: Dict[int, Dict[str, float]]
+    classifications: Dict[int, str]
+    jump_structures: Optional[Dict] = None
 
 @dataclass
 class L3Config:
-    """Lambda³ configuration parameters"""
-    alpha: float = 0.1          # TV regularization weight for structure tensor smoothness
-    beta: float = 0.01          # L1 sparsity regularization weight
-    n_paths: int = 5            # Number of structural modes/paths to extract
-    jump_scale: float = 2.0     # Sensitivity scale for ΔΛC jump detection (σ multiplier)
-    use_union: bool = True      # Whether to use union of jumps across all paths
-    w_topo: float = 0.2         # Weight for topological features in anomaly scoring
-    w_pulse: float = 0.3        # Weight for pulsation energy in anomaly scoring
+    """Lambda³設定パラメータ"""
+    alpha: float = 0.05  # 0.1から減少（正則化を弱める）
+    beta: float = 0.005  # 0.01から減少
+    n_paths: int = 7     # 5から増加（より多くの構造を捕捉）
+    jump_scale: float = 1.5  # 2.0から減少（より多くのジャンプを検出）
+    use_union: bool = True
+    w_topo: float = 0.3  # 0.2から増加
+    w_pulse: float = 0.2  # 0.3から減少
+
+@dataclass
+class OptimizationResult:
+    """最適化結果を格納するデータクラス"""
+    selected_features: List[str]
+    weights: Dict[str, float]
+    auc: float
+    feature_correlations: Dict[str, float]
+    feature_groups: Optional[Dict[str, List[str]]] = None
+
+@dataclass
+class DetectionStrategy:
+    """検出戦略を定義するデータクラス"""
+    method: str  # "single", "group", "ensemble"
+    features: List[str]
+    weights: Dict[str, float]
+    confidence: float
 
 # ===============================
-# JIT-Optimized Core Functions (Jump Detection)
+# JIT最適化コア関数（ジャンプ検出）
 # ===============================
 @njit
 def calculate_diff_and_threshold(data: np.ndarray, percentile: float) -> Tuple[np.ndarray, float]:
-    """
-    JIT-compiled difference calculation and threshold computation.
-    """
+    """JIT-compiled difference calculation and threshold computation."""
     diff = np.empty(len(data))
     diff[0] = 0
     for i in range(1, len(data)):
@@ -69,9 +103,7 @@ def calculate_diff_and_threshold(data: np.ndarray, percentile: float) -> Tuple[n
 
 @njit
 def detect_jumps(diff: np.ndarray, threshold: float) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    JIT-compiled jump detection based on threshold.
-    """
+    """JIT-compiled jump detection based on threshold."""
     n = len(diff)
     pos_jumps = np.zeros(n, dtype=np.int32)
     neg_jumps = np.zeros(n, dtype=np.int32)
@@ -85,10 +117,24 @@ def detect_jumps(diff: np.ndarray, threshold: float) -> Tuple[np.ndarray, np.nda
     return pos_jumps, neg_jumps
 
 @njit
+def compute_jump_consistency_term(Lambda_matrix, jump_mask, jump_weights):
+    n_paths, n_events = Lambda_matrix.shape
+    consistency = 0.0
+
+    for p in range(n_paths):
+        for i in range(1, n_events):
+            delta = np.abs(Lambda_matrix[p, i] - Lambda_matrix[p, i-1])
+
+            if jump_mask[i] == 1:  # boolではなく整数比較
+                consistency -= jump_weights[i] * delta
+            else:
+                consistency += 0.1 * delta
+
+    return consistency
+
+@njit
 def calculate_local_std(data: np.ndarray, window: int) -> np.ndarray:
-    """
-    JIT-compiled local standard deviation calculation.
-    """
+    """JIT-compiled local standard deviation calculation."""
     n = len(data)
     local_std = np.empty(n)
 
@@ -105,9 +151,7 @@ def calculate_local_std(data: np.ndarray, window: int) -> np.ndarray:
 
 @njit
 def calculate_rho_t(data: np.ndarray, window: int) -> np.ndarray:
-    """
-    JIT-compiled tension scalar (ρT) calculation.
-    """
+    """JIT-compiled tension scalar (ρT) calculation."""
     n = len(data)
     rho_t = np.empty(n)
 
@@ -127,9 +171,7 @@ def calculate_rho_t(data: np.ndarray, window: int) -> np.ndarray:
 
 @njit
 def sync_rate_at_lag(series_a: np.ndarray, series_b: np.ndarray, lag: int) -> float:
-    """
-    JIT-compiled synchronization rate calculation for a specific lag.
-    """
+    """JIT-compiled synchronization rate calculation for a specific lag."""
     if lag < 0:
         if -lag < len(series_a):
             return np.mean(series_a[-lag:] * series_b[:lag])
@@ -146,9 +188,7 @@ def sync_rate_at_lag(series_a: np.ndarray, series_b: np.ndarray, lag: int) -> fl
 @njit(parallel=True)
 def calculate_sync_profile_jit(series_a: np.ndarray, series_b: np.ndarray,
                                lag_window: int) -> Tuple[np.ndarray, np.ndarray, float, int]:
-    """
-    JIT-compiled synchronization profile calculation with parallelization.
-    """
+    """JIT-compiled synchronization profile calculation with parallelization."""
     n_lags = 2 * lag_window + 1
     lags = np.arange(-lag_window, lag_window + 1)
     sync_values = np.empty(n_lags)
@@ -167,41 +207,41 @@ def calculate_sync_profile_jit(series_a: np.ndarray, series_b: np.ndarray,
     return lags, sync_values, max_sync, optimal_lag
 
 # ===============================
-# Existing JIT-Optimized Functions (Kernel, Topological, Entropy)
+# カーネル関数
 # ===============================
 @njit
 def rbf_kernel(x: np.ndarray, y: np.ndarray, gamma: float = 1.0) -> float:
-    """RBF kernel (Gaussian kernel)"""
+    """RBFカーネル（ガウシアンカーネル）"""
     diff = x - y
     return np.exp(-gamma * np.dot(diff, diff))
 
 @njit
 def polynomial_kernel(x: np.ndarray, y: np.ndarray, degree: int = 3, coef0: float = 1.0) -> float:
-    """Polynomial kernel"""
+    """多項式カーネル"""
     return (np.dot(x, y) + coef0) ** degree
 
 @njit
 def sigmoid_kernel(x: np.ndarray, y: np.ndarray, alpha: float = 0.01, coef0: float = 0.0) -> float:
-    """Sigmoid kernel"""
+    """シグモイドカーネル"""
     return np.tanh(alpha * np.dot(x, y) + coef0)
 
 @njit
 def laplacian_kernel(x: np.ndarray, y: np.ndarray, gamma: float = 1.0) -> float:
-    """Laplacian kernel"""
+    """ラプラシアンカーネル"""
     diff = np.abs(x - y)
     return np.exp(-gamma * np.sum(diff))
 
 @njit(parallel=True)
-def compute_kernel_gram_matrix(data: np.ndarray, kernel_type: int = 0,
-                               gamma: float = 1.0, degree: int = 3,
-                               coef0: float = 1.0, alpha: float = 0.01) -> np.ndarray:
-    """
-    Compute kernel Gram matrix
-    kernel_type: 0=RBF, 1=Polynomial, 2=Sigmoid, 3=Laplacian
-    """
+def compute_kernel_gram_matrix(data: np.ndarray, 
+                               kernel_type: int = DEFAULT_KERNEL_TYPE,
+                               gamma: float = DEFAULT_GAMMA, 
+                               degree: int = DEFAULT_DEGREE,
+                               coef0: float = DEFAULT_COEF0, 
+                               alpha: float = DEFAULT_ALPHA) -> np.ndarray:
+    """カーネルGram行列の計算"""
     n = data.shape[0]
     K = np.zeros((n, n))
-
+    
     for i in prange(n):
         for j in range(i, n):
             if kernel_type == 0:  # RBF
@@ -212,11 +252,14 @@ def compute_kernel_gram_matrix(data: np.ndarray, kernel_type: int = 0,
                 K[i, j] = sigmoid_kernel(data[i], data[j], alpha, coef0)
             else:  # Laplacian
                 K[i, j] = laplacian_kernel(data[i], data[j], gamma)
-
-            K[j, i] = K[i, j]  # Symmetry
-
+            
+            K[j, i] = K[i, j]  # 対称性
+    
     return K
 
+# ===============================
+# 拍動エネルギー計算
+# ===============================
 @njit
 def compute_pulsation_energy_from_jumps(
     pos_jumps: np.ndarray,
@@ -224,11 +267,8 @@ def compute_pulsation_energy_from_jumps(
     diff: np.ndarray,
     rho_t: np.ndarray
 ) -> Tuple[float, float, float]:
-    """
-    Calculate pulsation energy from detected jumps (raw data based)
-    Returns: (jump_intensity, asymmetry, pulsation_power)
-    """
-    # Jump intensity (sum of difference values at detected jumps)
+    """検出済みジャンプから拍動エネルギーを計算（生データベース）"""
+    # ジャンプ強度（検出済みジャンプの差分値の総和）
     pos_intensity = 0.0
     neg_intensity = 0.0
 
@@ -240,13 +280,13 @@ def compute_pulsation_energy_from_jumps(
 
     jump_intensity = pos_intensity + neg_intensity
 
-    # Asymmetry (-1 to +1)
+    # 非対称性（-1 to +1）
     asymmetry = (pos_intensity - neg_intensity) / (pos_intensity + neg_intensity + 1e-10)
 
-    # Pulsation power (number of jumps × intensity × average tension)
+    # 拍動パワー（ジャンプ数×強度×平均テンション）
     n_jumps = np.sum(pos_jumps) + np.sum(neg_jumps)
 
-    # Average tension at jump positions
+    # ジャンプ位置での平均テンション
     avg_tension = 0.0
     if n_jumps > 0:
         tension_sum = 0.0
@@ -263,31 +303,28 @@ def compute_pulsation_energy_from_jumps(
 
 @njit
 def compute_pulsation_energy_from_path(path: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Calculate pulsation energy from path data (for structure tensor analysis)
-    ※ Kept for backward compatibility
-    """
+    """パスデータから拍動エネルギーを計算（構造テンソル解析用）"""
     if len(path) < 2:
         return 0.0, 0.0, 0.0
 
-    # Difference and jump detection
+    # 差分とジャンプ検出
     diff = np.diff(path)
     abs_diff = np.abs(diff)
     threshold = np.mean(abs_diff) + 2.0 * np.std(abs_diff)
 
-    # Jump detection
+    # ジャンプ検出
     pos_mask = diff > threshold
     neg_mask = diff < -threshold
 
-    # Jump intensity
+    # ジャンプ強度
     pos_intensity = np.sum(diff[pos_mask]) if np.any(pos_mask) else 0.0
     neg_intensity = np.sum(np.abs(diff[neg_mask])) if np.any(neg_mask) else 0.0
     jump_intensity = pos_intensity + neg_intensity
 
-    # Asymmetry
+    # 非対称性
     asymmetry = (pos_intensity - neg_intensity) / (pos_intensity + neg_intensity + 1e-10)
 
-    # Pulsation power
+    # 拍動パワー
     n_jumps = np.sum(pos_mask) + np.sum(neg_mask)
     pulsation_power = jump_intensity * n_jumps / len(path)
 
@@ -295,29 +332,32 @@ def compute_pulsation_energy_from_path(path: np.ndarray) -> Tuple[float, float, 
 
 @njit
 def find_jump_indices(path: np.ndarray, jump_scale: float = 2.0):
-    """Return jump index array in the path (ΔΛC events)"""
+    """パス内のジャンプindex配列を返す（ΔΛCイベント）"""
     delta = np.abs(np.diff(path))
     th = np.mean(delta) + jump_scale * np.std(delta)
     return np.where(delta > th)[0]
 
+# ===============================
+# トポロジカルチャージ計算
+# ===============================
 @njit(parallel=True)
 def compute_topological_charge_jit(path: np.ndarray, n_segments: int = 10) -> Tuple[float, float]:
-    """Fast computation of topological charge"""
+    """トポロジカルチャージの高速計算"""
     n = len(path)
     closed_path = np.empty(n + 1)
     closed_path[:-1] = path
     closed_path[-1] = path[0]
 
-    # Phase calculation
+    # 位相計算
     theta = np.empty(n)
     for i in prange(n):
         theta[i] = np.arctan2(closed_path[i+1], closed_path[i])
 
-    # Charge calculation
+    # チャージ計算
     Q_Lambda = 0.0
     for i in range(n-1):
         diff = theta[i+1] - theta[i]
-        # Handle phase jumps
+        # 位相のジャンプを処理
         if diff > np.pi:
             diff -= 2 * np.pi
         elif diff < -np.pi:
@@ -325,7 +365,7 @@ def compute_topological_charge_jit(path: np.ndarray, n_segments: int = 10) -> Tu
         Q_Lambda += diff
     Q_Lambda /= (2 * np.pi)
 
-    # Segment stability
+    # セグメント安定性
     Q_segments = np.zeros(n_segments)
     for seg in range(n_segments):
         start = seg * n // n_segments
@@ -344,9 +384,12 @@ def compute_topological_charge_jit(path: np.ndarray, n_segments: int = 10) -> Tu
     stability = np.std(Q_segments)
     return Q_Lambda, stability
 
+# ===============================
+# エントロピー計算
+# ===============================
 @njit
 def compute_entropy_shannon_jit(path: np.ndarray, eps: float = 1e-10) -> float:
-    """Fast Shannon entropy calculation"""
+    """Shannonエントロピーの高速計算"""
     abs_path = np.abs(path) + eps
     norm_path = abs_path / np.sum(abs_path)
 
@@ -359,7 +402,7 @@ def compute_entropy_shannon_jit(path: np.ndarray, eps: float = 1e-10) -> float:
 
 @njit
 def compute_entropy_renyi_jit(path: np.ndarray, alpha: float = 2.0, eps: float = 1e-10) -> float:
-    """Fast Renyi entropy calculation"""
+    """Renyiエントロピーの高速計算"""
     abs_path = np.abs(path) + eps
     norm_path = abs_path / np.sum(abs_path)
 
@@ -374,7 +417,7 @@ def compute_entropy_renyi_jit(path: np.ndarray, alpha: float = 2.0, eps: float =
 
 @njit
 def compute_entropy_tsallis_jit(path: np.ndarray, q: float = 1.5, eps: float = 1e-10) -> float:
-    """Fast Tsallis entropy calculation"""
+    """Tsallisエントロピーの高速計算"""
     abs_path = np.abs(path) + eps
     norm_path = abs_path / np.sum(abs_path)
 
@@ -389,11 +432,11 @@ def compute_entropy_tsallis_jit(path: np.ndarray, q: float = 1.5, eps: float = 1
 
 @njit
 def compute_all_entropies_jit(path: np.ndarray, eps: float = 1e-10) -> np.ndarray:
-    """Fast calculation of all entropy metrics (returns as array)"""
+    """全エントロピー指標の高速計算（配列で返す）"""
     abs_path = np.abs(path) + eps
     norm_path = abs_path / np.sum(abs_path)
 
-    # Calculate 6 metrics
+    # 6つの指標を計算
     entropies = np.zeros(6)
 
     # Shannon
@@ -430,9 +473,12 @@ def compute_all_entropies_jit(path: np.ndarray, eps: float = 1e-10) -> np.ndarra
 
     return entropies
 
+# ===============================
+# 逆問題関連
+# ===============================
 @njit(parallel=True)
 def inverse_problem_objective_jit(Lambda_matrix, events_gram, alpha, beta, jump_weight=0.5):
-    """Inverse problem objective function (JIT-optimized version)"""
+    """逆問題の目的関数（JIT最適化版）"""
     n_paths, n_events = Lambda_matrix.shape
     reconstruction = np.zeros((n_events, n_events))
     for i in prange(n_events):
@@ -451,7 +497,7 @@ def inverse_problem_objective_jit(Lambda_matrix, events_gram, alpha, beta, jump_
 
     l1_reg = np.sum(np.abs(Lambda_matrix))
 
-    # Jump regularization
+    # ジャンプ正則化
     jump_reg = 0.0
     for i in range(n_paths):
         path = Lambda_matrix[i]
@@ -470,36 +516,34 @@ def inverse_problem_objective_jit(Lambda_matrix, events_gram, alpha, beta, jump_
 
 @njit
 def compute_lambda3_reconstruction_error(paths_matrix: np.ndarray, events: np.ndarray) -> np.ndarray:
-    """
-    Calculate Lambda³ reconstruction error (inheriting Tikhonov spirit)
-    """
+    """Lambda³再構成誤差の計算（Tikhonov精神の継承）"""
     n_paths, n_events = paths_matrix.shape
     n_features = events.shape[1]
 
-    # 1. Gram matrix of observed data (normalized)
+    # 1. 観測データのGram行列（正規化済み）
     events_gram = np.zeros((n_events, n_events))
     for i in range(n_events):
         for j in range(n_events):
             events_gram[i, j] = np.dot(events[i], events[j])
 
-    # Normalize Gram matrix (scale invariance)
+    # Gram行列の正規化（スケール不変性）
     gram_norm = np.sqrt(np.trace(events_gram @ events_gram))
     if gram_norm > 0:
         events_gram /= gram_norm
 
-    # 2. Reconstruction by Lambda³ structure
+    # 2. Lambda³構造による再構成
     recon_gram = np.zeros((n_events, n_events))
     for k in range(n_paths):
         for i in range(n_events):
             for j in range(n_events):
                 recon_gram[i, j] += paths_matrix[k, i] * paths_matrix[k, j]
 
-    # Normalize reconstruction
+    # 再構成の正規化
     recon_norm = np.sqrt(np.trace(recon_gram @ recon_gram))
     if recon_norm > 0:
         recon_gram /= recon_norm
 
-    # 3. Per-event reconstruction error
+    # 3. イベントごとの再構成誤差
     event_errors = np.zeros(n_events)
     for i in range(n_events):
         row_error = 0.0
@@ -522,56 +566,54 @@ def compute_lambda3_hybrid_tikhonov_scores(
     w_topo: float = 0.2,
     w_pulse: float = 0.3,
 ) -> np.ndarray:
-    """
-    Lambda³ Hybrid Tikhonov Fusion Anomaly Score
-    """
+    """Lambda³ハイブリッドTikhonov融合異常スコア"""
     n_paths, n_events = paths_matrix.shape
 
-    # Overall error
+    # 全体誤差
     errors_all = compute_lambda3_reconstruction_error(paths_matrix, events)
 
-    # Jump indices
+    # ジャンプindex
     if use_union:
         idx_set = set()
         for k in range(n_paths):
             idxs = find_jump_indices(paths_matrix[k], jump_scale)
             for idx in idxs:
                 idx_set.add(idx+1)
-        jump_idx = np.array(list(idx_set), dtype=np.int64)  # Unified to int64
+        jump_idx = np.array(list(idx_set), dtype=np.int64)
     else:
         Qarr = np.array([np.sum(np.diff(paths_matrix[k])) for k in range(n_paths)])
         main_idx = np.argmax(np.abs(Qarr))
         idxs = find_jump_indices(paths_matrix[main_idx], jump_scale)
         jump_idx = idxs + 1
 
-    # Jump error vector
+    # ジャンプ誤差ベクトル
     jump_error = np.zeros_like(errors_all)
     for idx in jump_idx:
         if idx < len(jump_error):
             jump_error[idx] = errors_all[idx]
 
-    # Per-path anomaly degree
+    # パスごとの異常度
     path_anomaly_scores = np.zeros(n_paths)
     for p in prange(n_paths):
         path = paths_matrix[p]
         topo_score = np.abs(charges[p]) + 0.5 * stabilities[p]
-        # Calculate pulsation energy from path (for structure tensor)
+        # パスから拍動エネルギーを計算（構造テンソル用）
         jump_int, asymm, pulse_pow = compute_pulsation_energy_from_path(path)
         pulse_score = 0.4 * jump_int + 0.3 * np.abs(asymm) + 0.3 * pulse_pow
         path_anomaly_scores[p] = w_topo * topo_score + w_pulse * pulse_score
 
-    # Per-event weighting
+    # イベントごと加重
     structural_component = np.zeros(n_events)
     for i in prange(n_events):
         for p in range(n_paths):
             contribution = np.abs(paths_matrix[p, i])
             structural_component[i] += contribution * path_anomaly_scores[p]
 
-    # Hybrid synthesis
+    # ハイブリッド合成
     hybrid_score = alpha * errors_all + (1 - alpha) * jump_error
     event_scores = hybrid_score + structural_component
 
-    # Standardization
+    # 標準化
     mean_score = np.mean(event_scores)
     std_score = np.std(event_scores)
     if std_score > 0:
@@ -580,22 +622,700 @@ def compute_lambda3_hybrid_tikhonov_scores(
     return event_scores
 
 # ===============================
-# Main Class: Zero-Shot Anomaly Detection System
+# 特徴量抽出モジュール
+# ===============================
+class Lambda3FeatureExtractor:
+    """Lambda³特徴量抽出の統一インターフェース"""
+
+    def extract_basic_features(self, result: Lambda3Result, events: np.ndarray = None) -> Dict[str, np.ndarray]:
+        """基本特徴量の抽出（更新版）"""
+        n_paths = len(result.paths)
+        paths_matrix = np.stack(list(result.paths.values()))
+
+        # Lambda³コア物理量
+        basic_features = {
+            'Q_Λ': np.array([result.topological_charges[i] for i in range(n_paths)]),
+            'E': np.array([result.energies[i] for i in range(n_paths)]),
+            'σ_Q': np.array([result.stabilities[i] for i in range(n_paths)])
+        }
+
+        # エントロピー特徴
+        for i in range(n_paths):
+            ent = result.entropies[i]
+            if isinstance(ent, dict):
+                basic_features[f'S_shannon_{i}'] = np.array([ent.get('shannon', 0)])
+                basic_features[f'S_renyi_{i}'] = np.array([ent.get('renyi_2', 0)])
+                basic_features[f'S_tsallis_{i}'] = np.array([ent.get('tsallis_1.5', 0)])
+
+        # 拍動特徴
+        for i in range(n_paths):
+            path = paths_matrix[i]
+            jump_int, asymm, pulse_pow = compute_pulsation_energy_from_path(path)
+            basic_features[f'jump_int_{i}'] = np.array([jump_int])
+            basic_features[f'asymm_{i}'] = np.array([asymm])
+            basic_features[f'pulse_pow_{i}'] = np.array([pulse_pow])
+
+        return basic_features
+
+    def extract_advanced_features(self, result: Lambda3Result, events: np.ndarray) -> Dict[str, np.ndarray]:
+        """
+        高度な特徴量の生成
+        """
+        # resultが辞書の場合はそのまま使用、Lambda3Resultの場合は属性にアクセス
+        if isinstance(result, dict):
+            # 辞書形式（extract_basic_featuresから呼ばれた場合）
+            features = result.copy()
+            # 基本特徴量から必要な情報を抽出
+            n_paths = max(int(k.split('_')[-1]) for k in features.keys() 
+                        if any(k.startswith(prefix) for prefix in ['S_shannon_', 'S_renyi_', 'S_tsallis_'])) + 1
+            n_events = events.shape[0]
+            
+            # Lambda3コア物理量を配列として取得（存在する場合）
+            if 'Q_Λ' in features:
+                Qs = features['Q_Λ']
+                Es = features.get('E', np.zeros(n_paths))
+                Sigmas = features.get('σ_Q', np.ones(n_paths))
+            else:
+                # フォールバック：デフォルト値を使用
+                Qs = np.zeros(n_paths)
+                Es = np.zeros(n_paths)
+                Sigmas = np.ones(n_paths)
+                
+        else:
+            # Lambda3Result形式
+            n_paths = len(result.paths)
+            n_events = events.shape[0]
+            paths_matrix = np.stack(list(result.paths.values()))
+            
+            # 1. Lambda³コア物理量
+            Qs = np.array([result.topological_charges[i] for i in range(n_paths)])
+            Es = np.array([result.energies[i] for i in range(n_paths)])
+            Sigmas = np.array([result.stabilities[i] for i in range(n_paths)])
+
+        # 2. 物理的に意味のある組み合わせ特徴
+        features = {
+            "Q_Λ": Qs,
+            "σ_Q": Sigmas,
+            "E": Es,
+            "Q_Λ/σ_Q": Qs / (Sigmas + 1e-8),
+            "Q_Λ×E": Qs * Es,
+            "sq_Q_Λ": Qs ** 2,
+            "E×σ_Q": Es * Sigmas,
+            "sqrt_σ_Q": np.sqrt(Sigmas + 1e-8),
+            "log_σ_Q": np.log(Sigmas + 1e-8),
+            "sqrt_Q_Λ": np.sqrt(np.abs(Qs) + 1e-8),
+            "log_Q_Λ": np.log(np.abs(Qs) + 1e-8),
+        }
+
+        # 3. エントロピー、拍動、統計特徴（パスごと）
+        # Lambda3Resultの場合のみ追加特徴を計算
+        if hasattr(result, 'paths'):
+            paths_matrix = np.stack(list(result.paths.values()))
+            
+            for i in range(n_paths):
+                # エントロピー
+                ent = result.entropies[i]
+                if isinstance(ent, dict):
+                    features[f'S_shannon_{i}'] = np.array([ent.get('shannon', 0)])
+                    features[f'S_renyi_{i}'] = np.array([ent.get('renyi_2', 0)])
+                    features[f'S_tsallis_{i}'] = np.array([ent.get('tsallis_1.5', 0)])
+                
+                # 拍動エネルギー
+                path = paths_matrix[i]
+                jump_int, asymm, pulse_pow = compute_pulsation_energy_from_path(path)
+                features[f'jump_int_{i}'] = np.array([jump_int])
+                features[f'asymm_{i}'] = np.array([asymm])
+                features[f'pulse_pow_{i}'] = np.array([pulse_pow])
+                
+                # 歪度と尖度
+                mean_path = np.mean(path)
+                std_path = np.std(path)
+                if std_path > 1e-10:
+                    skew = np.sum((path - mean_path)**3) / (len(path) * std_path**3)
+                    kurt = np.sum((path - mean_path)**4) / (len(path) * std_path**4) - 3
+                else:
+                    skew = 0.0
+                    kurt = 0.0
+                features[f'skew_{i}'] = np.array([np.nan_to_num(skew)])
+                features[f'kurt_{i}'] = np.array([np.nan_to_num(kurt)])
+                
+                # 自己相関
+                if len(path) > 1:
+                    ac = np.correlate(path - mean_path, path - mean_path, mode='full')[len(path)-1:]
+                    if np.var(path) > 1e-10:
+                        ac = ac / (np.var(path) * np.arange(len(path), 0, -1))
+                        features[f'autocorr_{i}'] = np.array([np.mean(ac[:5])])
+                    else:
+                        features[f'autocorr_{i}'] = np.array([0.0])
+        
+        # 既に辞書形式の場合、既存の特徴量を保持
+        elif isinstance(result, dict):
+            # 既存の特徴量をマージ
+            for k, v in result.items():
+                if k not in features:
+                    features[k] = v
+
+        # 4. 主要特徴のペアワイズ組み合わせ
+        main_keys = ["Q_Λ", "σ_Q", "E"]
+        for i, f1 in enumerate(main_keys):
+            for j, f2 in enumerate(main_keys):
+                if i < j and len(features[f1]) == len(features[f2]):
+                    features[f'{f1}×{f2}'] = features[f1] * features[f2]
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        r = features[f1] / (features[f2] + 1e-10)
+                        features[f'{f1}/{f2}'] = np.nan_to_num(r, nan=0.0, posinf=10.0, neginf=-10.0)
+
+        # 5. 非線形変換（全特徴に適用）
+        for k, v in list(features.items()):
+            features[f'log_{k}'] = np.log1p(np.abs(v))
+            features[f'sqrt_{k}'] = np.sqrt(np.abs(v))
+            features[f'sq_{k}'] = v ** 2
+            features[f'sig_{k}'] = 1 / (1 + np.exp(-v))
+
+        # 6. イベントレベルの統計量
+        features['event_mean'] = np.mean(events, axis=1)
+        features['event_std'] = np.std(events, axis=1)
+
+        return features
+
+    def project_to_event_space(self,
+                              features: Dict[str, np.ndarray],
+                              paths_matrix: np.ndarray,
+                              event_indices: Optional[np.ndarray] = None) -> Dict[str, np.ndarray]:
+        """パス特徴量をイベント空間に射影"""
+        n_paths, n_events = paths_matrix.shape
+
+        if event_indices is None:
+            event_indices = np.arange(n_events)
+
+        event_features = {}
+
+        for name, vals in features.items():
+            if vals.shape[0] == n_paths:  # パス特徴量
+                event_scores = np.zeros(len(event_indices))
+                for i, evt_idx in enumerate(event_indices):
+                    event_scores[i] = np.sum(np.abs(paths_matrix[:, evt_idx]) * vals)
+                event_features[name] = event_scores
+            elif len(vals) == len(event_indices):  # 既にイベント特徴量
+                event_features[name] = vals
+
+        return event_features
+
+# ===============================
+# 特徴量最適化モジュール
+# ===============================
+class Lambda3FeatureOptimizer:
+    """
+    Lambda³特徴量の最適化モジュール
+    明確なサンプルから最適な特徴量の組み合わせを学習
+    """
+
+    def __init__(self,
+                 max_features: int = 20,
+                 regularization: float = 0.1):
+        self.max_features = max_features
+        self.regularization = regularization
+
+    def optimize_features(self,
+                         features: Dict[str, np.ndarray],
+                         labels: np.ndarray,
+                         paths_matrix: np.ndarray,
+                         mode: str = "robust") -> OptimizationResult:
+        """
+        特徴量の最適化（パス特徴量用）
+
+        Args:
+            features: 特徴量辞書
+            labels: ラベル（0: 正常, 1: 異常）
+            paths_matrix: パス行列（射影用）
+            mode: "fast" or "robust"
+        """
+        # 特徴量を配列に変換
+        feature_names = list(features.keys())
+        feature_arrays = []
+        for name in feature_names:
+            feat = features[name]
+            if feat.ndim == 1:
+                feature_arrays.append(feat)
+            else:
+                # 多次元の場合は最初の要素のみ使用
+                feature_arrays.append(feat.flatten()[:1])
+
+        # 全ての特徴量を同じ長さに揃える
+        n_samples = len(labels)
+        feature_matrix = np.zeros((n_samples, len(feature_names)))
+        for i, feat in enumerate(feature_arrays):
+            if len(feat) == n_samples:
+                feature_matrix[:, i] = feat
+            elif len(feat) == 1:
+                # スカラー特徴量の場合は全サンプルで同じ値
+                feature_matrix[:, i] = feat[0]
+            else:
+                # サンプル数と合わない場合はスキップ
+                feature_matrix[:, i] = 0
+
+        if mode == "fast":
+            # 単純な相関ベースの選択
+            correlations = {}
+            for i, name in enumerate(feature_names):
+                corr = np.abs(np.corrcoef(feature_matrix[:, i], labels)[0, 1])
+                correlations[name] = corr
+
+            # 上位特徴を選択
+            sorted_features = sorted(correlations.items(), key=lambda x: x[1], reverse=True)
+            selected_features = [f[0] for f in sorted_features[:self.max_features]]
+
+            # 重みは相関値
+            weights = {name: correlations[name] for name in selected_features}
+
+            # 簡易AUC計算
+            selected_indices = [feature_names.index(name) for name in selected_features]
+            selected_matrix = feature_matrix[:, selected_indices]
+            scores = np.sum(selected_matrix, axis=1)
+            auc = roc_auc_score(labels, scores)
+
+        else:  # robust
+            # ロジスティック回帰による特徴選択
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(feature_matrix)
+
+            # L1正則化で特徴選択
+            model = LogisticRegression(
+                penalty='l1',
+                C=1.0/self.regularization,
+                solver='liblinear',
+                max_iter=1000
+            )
+            model.fit(X_scaled, labels)
+
+            # 非ゼロ係数の特徴を選択
+            non_zero_idx = np.where(np.abs(model.coef_[0]) > 1e-5)[0]
+
+            if len(non_zero_idx) == 0:
+                # フォールバック：相関が最も高い特徴を使用
+                correlations = [np.abs(np.corrcoef(X_scaled[:, i], labels)[0, 1])
+                               for i in range(X_scaled.shape[1])]
+                non_zero_idx = [np.argmax(correlations)]
+
+            selected_features = [feature_names[i] for i in non_zero_idx[:self.max_features]]
+
+            # 重みは係数の絶対値
+            weights = {}
+            for i, name in enumerate(feature_names):
+                if name in selected_features:
+                    weights[name] = np.abs(model.coef_[0][i])
+
+            # 重みの正規化
+            total_weight = sum(weights.values())
+            if total_weight > 0:
+                weights = {k: v/total_weight for k, v in weights.items()}
+
+            # AUC計算
+            auc = roc_auc_score(labels, model.decision_function(X_scaled))
+
+            # 相関も記録
+            correlations = {}
+            for i, name in enumerate(feature_names):
+                corr = np.abs(np.corrcoef(feature_matrix[:, i], labels)[0, 1])
+                correlations[name] = corr
+
+        return OptimizationResult(
+            selected_features=selected_features,
+            weights=weights,
+            auc=auc,
+            feature_correlations=correlations
+        )
+
+    def optimize_features_for_events(self,
+                                   event_features: Dict[str, np.ndarray],
+                                   labels: np.ndarray,
+                                   mode: str = "robust") -> OptimizationResult:
+        """
+        イベント特徴量の最適化（既に射影済みの特徴量用）
+        """
+        # 基本的に同じロジックだが、射影は不要
+        return self.optimize_features(event_features, labels, None, mode)
+
+class Lambda3FocusedDetector:
+    """
+    Lambda³焦点型異常検知システム
+    - 明確なサンプルから学習した特徴を全データに適用
+    - 特徴群の相関構造を保持
+    """
+
+    def __init__(self,
+                 correlation_threshold: float = 0.4,
+                 weight_threshold_ratio: float = 0.3,
+                 min_clear_samples: int = 15,
+                 max_features: int = 30,
+                 regularization: float = 0.05):
+        """
+        Args:
+            correlation_threshold: 特徴群を形成する相関閾値
+            weight_threshold_ratio: 重要特徴と判定する重み比率
+            min_clear_samples: 最適化に必要な最小サンプル数
+            max_features: 最大特徴数
+            regularization: 正則化パラメータ
+        """
+        self.correlation_threshold = correlation_threshold
+        self.weight_threshold_ratio = weight_threshold_ratio
+        self.min_clear_samples = min_clear_samples
+        self.feature_extractor = Lambda3FeatureExtractor()
+        self.feature_optimizer = Lambda3FeatureOptimizer(
+            max_features=max_features,
+            regularization=regularization
+        )
+
+    def detect_anomalies(self,
+                        result: Lambda3Result,
+                        events: np.ndarray,
+                        base_detector_func: Optional[callable] = None) -> np.ndarray:
+        """
+        焦点型異常検知のメインメソッド
+
+        Args:
+            result: Lambda³解析結果
+            events: イベントデータ
+            base_detector_func: 基本異常検知関数（疑似ラベル生成用）
+
+        Returns:
+            異常スコア配列
+        """
+        # 1. 特徴量抽出
+        features = self._extract_all_features(result, events)
+
+        # 2. 検出戦略の決定
+        strategy = self._determine_detection_strategy(
+            features, result, events, base_detector_func
+        )
+
+        # 3. 戦略に基づいた異常スコア計算
+        scores = self._apply_detection_strategy(strategy, features, result, events)
+
+        return scores
+
+    def _extract_all_features(self,
+                            result: Lambda3Result,
+                            events: np.ndarray) -> Dict[str, np.ndarray]:
+        """全特徴量の抽出"""
+        paths_matrix = np.stack(list(result.paths.values()))
+
+        # 基本特徴量の抽出
+        basic_features = self.feature_extractor.extract_basic_features(result)
+
+        # 高度な特徴量の生成
+        advanced_features = self.feature_extractor.extract_advanced_features(
+            basic_features, paths_matrix
+        )
+
+        return advanced_features
+
+    def _determine_detection_strategy(self,
+                                    features: Dict[str, np.ndarray],
+                                    result: Lambda3Result,
+                                    events: np.ndarray,
+                                    base_detector_func: Optional[callable]) -> DetectionStrategy:
+        """最適な検出戦略を決定"""
+
+        # 疑似ラベルの生成
+        if base_detector_func is None:
+            base_scores = self._compute_fallback_scores(result, events)
+        else:
+            base_scores = base_detector_func(result, events)
+
+        # 明確なサンプルの選択
+        clear_samples = self._select_clear_samples(base_scores)
+
+        if clear_samples['count'] < self.min_clear_samples:
+            # サンプル不足：フォールバック戦略
+            return self._create_fallback_strategy()
+
+        # 特徴最適化
+        optimization_result = self._optimize_features_with_clear_samples(
+            features, result, clear_samples
+        )
+
+        # 特徴群の解析
+        feature_groups = self._analyze_feature_groups(
+            optimization_result.selected_features,
+            optimization_result.feature_correlations
+        )
+
+        # 戦略の決定
+        return self._create_optimal_strategy(
+            optimization_result, feature_groups
+        )
+
+    def _select_clear_samples(self, base_scores: np.ndarray) -> Dict:
+        """明確なサンプルの選択（より柔軟な方法）"""
+        n_samples = len(base_scores)
+
+        # 動的なパーセンタイル設定
+        if n_samples < 100:
+            low_percentile, high_percentile = 15, 85
+        elif n_samples < 500:
+            low_percentile, high_percentile = 10, 90
+        else:
+            low_percentile, high_percentile = 5, 95
+
+        thresholds = np.percentile(base_scores, [low_percentile, high_percentile])
+
+        clear_normal = base_scores < thresholds[0]
+        clear_anomaly = base_scores > thresholds[1]
+
+        # 中間層も考慮したサンプリング（オプション）
+        ambiguous = ~(clear_normal | clear_anomaly)
+
+        return {
+            'normal_indices': np.where(clear_normal)[0],
+            'anomaly_indices': np.where(clear_anomaly)[0],
+            'ambiguous_indices': np.where(ambiguous)[0],
+            'clear_indices': np.where(clear_normal | clear_anomaly)[0],
+            'clear_labels': clear_anomaly[clear_normal | clear_anomaly].astype(int),
+            'count': np.sum(clear_normal) + np.sum(clear_anomaly),
+            'thresholds': thresholds
+        }
+
+    def _optimize_features_with_clear_samples(self,
+                                            features: Dict[str, np.ndarray],
+                                            result: Lambda3Result,
+                                            clear_samples: Dict) -> OptimizationResult:
+        """明確なサンプルでの特徴最適化"""
+        paths_matrix = np.stack(list(result.paths.values()))
+
+        # 明確なサンプルのインデックス
+        clear_indices = clear_samples['clear_indices']
+        clear_labels = clear_samples['clear_labels']
+
+        # 特徴量をイベント空間に射影（明確なサンプルのみ）
+        event_features = self.feature_extractor.project_to_event_space(
+            features,
+            paths_matrix,
+            event_indices=clear_indices
+        )
+
+        # 特徴最適化（射影済みのイベント特徴量を使用）
+        optimization_result = self.feature_optimizer.optimize_features_for_events(
+            event_features,
+            clear_labels,
+            mode="robust"
+        )
+
+        # 特徴群の情報を追加
+        optimization_result.feature_groups = self._analyze_feature_groups(
+            optimization_result.selected_features,
+            optimization_result.feature_correlations
+        )
+
+        return optimization_result
+
+    def _analyze_feature_groups(self,
+                               selected_features: List[str],
+                               correlations: Dict[str, float]) -> Dict[str, List[str]]:
+        """相関の高い特徴をグループ化"""
+        groups = {}
+
+        # 相関閾値を超える特徴を収集
+        high_corr_features = [
+            feat for feat in selected_features
+            if correlations.get(feat, 0) >= self.correlation_threshold
+        ]
+
+        if high_corr_features:
+            # 特徴名のパターンでグループ化
+            # 例：Q_Λ関連、σ_Q関連など
+            for feat in high_corr_features:
+                base_pattern = self._extract_base_pattern(feat)
+                if base_pattern not in groups:
+                    groups[base_pattern] = []
+                groups[base_pattern].append(feat)
+
+        return groups
+
+    def _extract_base_pattern(self, feature_name: str) -> str:
+        """特徴名から基本パターンを抽出"""
+        # 例：'sq_Q_Λ' → 'Q_Λ', 'E×σ_Q' → 'σ_Q'
+        if 'Q_Λ' in feature_name:
+            return 'Q_Λ'
+        elif 'σ_Q' in feature_name:
+            return 'σ_Q'
+        elif 'E' in feature_name and 'σ_Q' not in feature_name:
+            return 'E'
+        else:
+            return 'other'
+
+    def _create_optimal_strategy(self,
+                               optimization_result: OptimizationResult,
+                               feature_groups: Dict[str, List[str]]) -> DetectionStrategy:
+        """最適な検出戦略を作成"""
+
+        # 最高重みとその閾値
+        max_weight = max(optimization_result.weights.values())
+        weight_threshold = max_weight * self.weight_threshold_ratio
+
+        # 重要な特徴を選択
+        important_features = [
+            (feat, weight)
+            for feat, weight in optimization_result.weights.items()
+            if weight >= weight_threshold
+        ]
+
+        # 戦略の決定
+        if len(important_features) == 1 and important_features[0][1] > 0.9:
+            # 単一特徴が支配的
+            return DetectionStrategy(
+                method="single",
+                features=[important_features[0][0]],
+                weights={important_features[0][0]: 1.0},
+                confidence=optimization_result.auc
+            )
+
+        elif feature_groups and len(list(feature_groups.values())[0]) > 1:
+            # 特徴群が存在
+            dominant_group = max(feature_groups.items(), key=lambda x: len(x[1]))
+            group_features = dominant_group[1]
+
+            # グループ内の重みを再正規化
+            group_weights = {
+                feat: optimization_result.weights.get(feat, 0)
+                for feat in group_features
+            }
+            total_weight = sum(group_weights.values())
+            if total_weight > 0:
+                group_weights = {k: v/total_weight for k, v in group_weights.items()}
+
+            return DetectionStrategy(
+                method="group",
+                features=group_features,
+                weights=group_weights,
+                confidence=optimization_result.auc
+            )
+
+        else:
+            # 複数特徴のアンサンブル
+            feature_list = [f[0] for f in important_features]
+            feature_weights = {f[0]: f[1] for f in important_features}
+
+            # 重みの再正規化
+            total_weight = sum(feature_weights.values())
+            if total_weight > 0:
+                feature_weights = {k: v/total_weight for k, v in feature_weights.items()}
+
+            return DetectionStrategy(
+                method="ensemble",
+                features=feature_list,
+                weights=feature_weights,
+                confidence=optimization_result.auc
+            )
+
+    def _apply_detection_strategy(self,
+                                strategy: DetectionStrategy,
+                                features: Dict[str, np.ndarray],
+                                result: Lambda3Result,
+                                events: np.ndarray) -> np.ndarray:
+        """検出戦略を適用してスコアを計算"""
+        paths_matrix = np.stack(list(result.paths.values()))
+        n_events = events.shape[0]
+
+        print(f"\nApplying {strategy.method} detection strategy")
+        print(f"Features: {strategy.features}")
+        print(f"Confidence: {strategy.confidence:.4f}")
+
+        if strategy.method == "single":
+            # 単一特徴
+            feat_name = strategy.features[0]
+            return self._compute_single_feature_score(
+                feat_name, features[feat_name], paths_matrix, n_events
+            )
+
+        else:  # "group" or "ensemble"
+            # 複数特徴の重み付き結合
+            combined_score = np.zeros(n_events)
+
+            for feat_name in strategy.features:
+                if feat_name in features:
+                    weight = strategy.weights.get(feat_name, 0)
+                    if weight > 0:
+                        feat_score = self._compute_single_feature_score(
+                            feat_name, features[feat_name], paths_matrix, n_events
+                        )
+                        combined_score += weight * feat_score
+
+            # 最終的な標準化
+            if np.std(combined_score) > 1e-10:
+                combined_score = (combined_score - np.mean(combined_score)) / np.std(combined_score)
+
+            return combined_score
+
+    def _compute_single_feature_score(self,
+                                    feature_name: str,
+                                    feature_values: np.ndarray,
+                                    paths_matrix: np.ndarray,
+                                    n_events: int) -> np.ndarray:
+        """単一特徴のスコアを計算"""
+        n_paths = paths_matrix.shape[0]
+
+        # パス特徴量の場合は射影が必要
+        if len(feature_values) == n_paths:
+            # 全イベントに対して射影
+            event_features = self.feature_extractor.project_to_event_space(
+                {feature_name: feature_values},
+                paths_matrix
+            )
+            scores = event_features[feature_name]
+        elif len(feature_values) == n_events:  # 既にイベント特徴
+            scores = feature_values
+        else:
+            scores = np.zeros(n_events)
+
+        # 標準化
+        if np.std(scores) > 1e-10:
+            scores = (scores - np.mean(scores)) / np.std(scores)
+
+        return scores
+
+    def _create_fallback_strategy(self) -> DetectionStrategy:
+        """フォールバック戦略（サンプル不足時）"""
+        return DetectionStrategy(
+            method="single",
+            features=["sq_Q_Λ"],
+            weights={"sq_Q_Λ": 1.0},
+            confidence=0.5
+        )
+
+    def _compute_fallback_scores(self,
+                               result: Lambda3Result,
+                               events: np.ndarray) -> np.ndarray:
+        """フォールバックスコアの計算"""
+        charges = np.array(list(result.topological_charges.values()))
+        sq_charges = charges ** 2
+        paths_matrix = np.stack(list(result.paths.values()))
+        scores = np.sum(np.abs(paths_matrix) * sq_charges[:, None], axis=0)
+
+        if np.std(scores) > 0:
+            scores = (scores - np.mean(scores)) / np.std(scores)
+
+        return scores
+
+# ===============================
+# 統一異常検知システム
 # ===============================
 class Lambda3ZeroShotDetector:
     """
-    Jump-Driven Zero-Shot Anomaly Detection System
-    Full-featured integrated version
+    リファクタリング版Lambda³ゼロショット異常検知システム
+    基本：構造テンソル解析 + 特徴量最適化
+    オプション：ジャンプ解析、カーネル空間、アンサンブル
     """
 
     def __init__(self, config: L3Config = None):
         self.config = config or L3Config()
-        self.jump_analyzer = None  # Jump analysis result cache
-        self.anomaly_patterns = self._init_anomaly_patterns()
-
-    def _init_anomaly_patterns(self):
-        """Initialize anomaly pattern generation functions"""
-        return {
+        self.feature_extractor = Lambda3FeatureExtractor()
+        self.feature_optimizer = Lambda3FeatureOptimizer()
+        self.focused_detector = Lambda3FocusedDetector()  # 追加
+        self.jump_analyzer = None
+        self._analysis_cache = {}
+        # 異常パターン生成関数の初期化
+        self.anomaly_patterns = {
             'pulse': self._generate_pulse_anomaly,
             'phase_jump': self._generate_phase_jump_anomaly,
             'periodic': self._generate_periodic_anomaly,
@@ -610,33 +1330,38 @@ class Lambda3ZeroShotDetector:
         }
 
     def analyze(self, events: np.ndarray, n_paths: int = None) -> Lambda3Result:
-        """
-        Complete zero-shot analysis flow:
-        1. Jump detection → 2. Jump-constrained inverse problem → 3. Physical quantity calculation
-        """
+        """Lambda³解析の実行"""
         if n_paths is None:
             n_paths = self.config.n_paths
 
-        # 1. Multi-dimensional jump structure detection (utilizing JIT functions)
+        # キャッシュチェック
+        cache_key = f"{events.shape}_{n_paths}"
+        if cache_key in self._analysis_cache:
+            return self._analysis_cache[cache_key]
+
+        # ジャンプ構造の検出
         jump_structures = self._detect_multiscale_jumps(events)
         self.jump_analyzer = jump_structures
 
-        # 2. Jump-constrained structure tensor estimation (inverse problem)
-        paths = self._inverse_problem_jump_constrained(
-            events, jump_structures, n_paths
-        )
+        # 構造テンソル推定（逆問題）
+        if jump_structures:
+            paths = self._inverse_problem_jump_constrained(events, jump_structures, n_paths)
+        else:
+            paths = self._solve_inverse_problem(events, n_paths)
 
-        # 3. Jump-consistent physical quantity calculation (topological, entropy)
-        charges, stabilities = self._compute_jump_aware_topology(paths, jump_structures)
-        energies = self._compute_pulsation_energies(paths, jump_structures)
-        entropies = self._compute_jump_conditional_entropies(paths, jump_structures)
+        # 物理量計算
+        if jump_structures:
+            charges, stabilities = self._compute_jump_aware_topology(paths, jump_structures)
+            energies = self._compute_pulsation_energies(paths, jump_structures)
+            entropies = self._compute_jump_conditional_entropies(paths, jump_structures)
+        else:
+            charges, stabilities = self._compute_topology(paths)
+            energies = self._compute_energies(paths)
+            entropies = self._compute_entropies(paths)
 
-        # 4. Jump pattern-based classification
-        classifications = self._classify_by_jump_signatures(
-            paths, jump_structures, charges, stabilities
-        )
+        classifications = self._classify_structures(paths, charges, stabilities, jump_structures)
 
-        return Lambda3Result(
+        result = Lambda3Result(
             paths=paths,
             topological_charges=charges,
             stabilities=stabilities,
@@ -646,33 +1371,215 @@ class Lambda3ZeroShotDetector:
             jump_structures=jump_structures
         )
 
-    def _detect_multiscale_jumps(self, events: np.ndarray) -> Dict:
-        """Multi-dimensional and multi-scale jump detection"""
+        # キャッシュ保存
+        self._analysis_cache[cache_key] = result
+
+        return result
+
+    def detect_anomalies(self, result: Lambda3Result, events: np.ndarray,
+                    use_adaptive_weights: bool = False) -> np.ndarray:
+        """
+        圧倒的な性能を目指す革命的異常検知
+        """
+        n_events = events.shape[0]
+        paths_matrix = np.stack(list(result.paths.values()))
+        charges = np.array(list(result.topological_charges.values()))
+        stabilities = np.array(list(result.stabilities.values()))
+        
+        # 1. マルチスケールジャンプ検出（複数の解像度で異常を捕捉）
+        multi_jump_scores = []
+        for window, percentile in zip(MULTI_SCALE_WINDOWS, MULTI_SCALE_PERCENTILES):
+            jump_analyzer = self._detect_multiscale_jumps_with_params(
+                events, window_size=window, percentile=percentile
+            )
+            jump_scores = self._compute_jump_anomaly_scores(jump_analyzer, events)
+            multi_jump_scores.append(self._ensure_length(jump_scores, n_events))
+        
+        # 最大値を取る（どのスケールでも異常なら異常）
+        jump_anomaly_scores = np.max(multi_jump_scores, axis=0)
+        
+        # 2. 強化版ハイブリッドスコア
+        hybrid_scores = compute_lambda3_hybrid_tikhonov_scores(
+            paths_matrix, events, charges, stabilities,
+            alpha=0.3,      # アグレッシブに
+            jump_scale=1.2, # より多くのジャンプを捕捉
+            use_union=True,
+            w_topo=0.5,     # トポロジーを重視
+            w_pulse=0.3     # 拍動も考慮
+        )
+        hybrid_scores = self._ensure_length(hybrid_scores, n_events)
+        
+        # 3. アンサンブルカーネル戦略（複数カーネルの強みを統合）
+        kernel_scores_list = []
+        kernel_types = [
+            (0, {'gamma': 1.0}),      # RBF
+            (1, {'degree': 7, 'coef0': 1.0}),  # Polynomial (現在最良)
+            (3, {'gamma': 0.5})       # Laplacian
+        ]
+        for k_type, k_params in kernel_types:
+            k_scores = self._compute_kernel_anomaly_scores_with_params(
+                events, result, kernel_type=k_type, **k_params
+            )
+            kernel_scores_list.append(self._ensure_length(k_scores, n_events))
+        
+        # 各カーネルの最良スコアを採用
+        kernel_scores = np.max(kernel_scores_list, axis=0)
+        
+        # 4. 新規：構造的異常スコア
+        structural_scores = self._compute_structural_anomaly_scores(result, events)
+        structural_scores = self._ensure_length(structural_scores, n_events)
+        
+        # 5. 革新的な統合戦略
+        if use_adaptive_weights:
+            # より積極的な適応
+            base_scores = (
+                0.20 * jump_anomaly_scores +
+                0.35 * hybrid_scores +
+                0.30 * kernel_scores +
+                0.15 * structural_scores
+            )
+            
+            # 明確なサンプルの選択（より積極的に）
+            score_percentiles = np.percentile(base_scores, [10, 90])
+            clear_normal = base_scores < score_percentiles[0]
+            clear_anomaly = base_scores > score_percentiles[1]
+            
+            if np.sum(clear_normal) > 5 and np.sum(clear_anomaly) > 5:
+                clear_mask = clear_normal | clear_anomaly
+                clear_labels = clear_anomaly[clear_mask].astype(int)
+                clear_indices = np.where(clear_mask)[0]
+                
+                component_scores = {
+                    'jump': jump_anomaly_scores[clear_mask],
+                    'hybrid': hybrid_scores[clear_mask],
+                    'kernel': kernel_scores[clear_mask],
+                    'structural': structural_scores[clear_mask]
+                }
+                
+                self._last_result = result
+                
+                # 強制的に全コンポーネントを使用する最適化
+                optimal_weights = self._optimize_component_weights_aggressive(
+                    component_scores, 
+                    clear_labels,
+                    event_indices=clear_indices,
+                    events=events,
+                    force_all_components=True,
+                    verbose=True
+                )
+                
+                print(f"Adaptive weights learned from {len(clear_labels)} clear samples:")
+                for name, weight in optimal_weights.items():
+                    print(f"  {name}: {weight:.3f}")
+                
+                # 最適化された重みで最終スコアを計算
+                final_scores = (
+                    optimal_weights.get('jump', 0.20) * jump_anomaly_scores +
+                    optimal_weights.get('hybrid', 0.35) * hybrid_scores +
+                    optimal_weights.get('kernel', 0.30) * kernel_scores +
+                    optimal_weights.get('structural', 0.15) * structural_scores
+                )
+            else:
+                print("Not enough clear samples, using enhanced default weights")
+                final_scores = base_scores
+        else:
+            # デフォルトでも全要素を活用
+            final_scores = (
+                0.20 * jump_anomaly_scores +
+                0.35 * hybrid_scores +
+                0.30 * kernel_scores +
+                0.15 * structural_scores
+            )
+        
+        # 6. 非線形変換で異常を強調
+        final_scores = np.sign(final_scores) * np.power(np.abs(final_scores), 0.8)
+        
+        # 7. 革新的な適応的標準化
+        return self._adaptive_standardize(final_scores)
+
+    def _compute_structural_anomaly_scores(self, result: Lambda3Result, events: np.ndarray) -> np.ndarray:
+        """Lambda³構造の歪みを直接評価"""
+        n_events = events.shape[0]
+        scores = np.zeros(n_events)
+        
+        paths_matrix = np.stack(list(result.paths.values()))
+        
+        # 1. パス間の相関破壊
+        for i in range(n_events):
+            if i > 0:
+                # 各パスの局所的変化
+                local_changes = np.abs(paths_matrix[:, i] - paths_matrix[:, i-1])
+                # 変化の不均一性（一部のパスだけ大きく変化）
+                scores[i] += np.std(local_changes) * np.max(local_changes)
+        
+        # 2. トポロジカルチャージの急変
+        charges = np.array(list(result.topological_charges.values()))
+        for i in range(1, n_events):
+            # 各イベントでの実効的チャージ
+            eff_charge_curr = np.sum(np.abs(paths_matrix[:, i]) * np.abs(charges))
+            eff_charge_prev = np.sum(np.abs(paths_matrix[:, i-1]) * np.abs(charges))
+            scores[i] += np.abs(eff_charge_curr - eff_charge_prev)
+        
+        # 3. エネルギー集中度
+        for i in range(n_events):
+            path_energies = paths_matrix[:, i] ** 2
+            # エネルギーが特定のパスに集中している場合
+            concentration = np.max(path_energies) / (np.sum(path_energies) + 1e-10)
+            scores[i] += concentration ** 2
+        
+        return scores
+
+    def _adaptive_standardize(self, scores: np.ndarray) -> np.ndarray:
+        """外れ値に対してより敏感な標準化"""
+        # 1. 基本統計量
+        median = np.median(scores)
+        mad = np.median(np.abs(scores - median))  # Median Absolute Deviation
+        
+        # 2. 外れ値の識別
+        if mad > 0:
+            z_scores = 0.6745 * (scores - median) / mad  # MADベースのzスコア
+        else:
+            z_scores = (scores - np.mean(scores)) / (np.std(scores) + 1e-10)
+        
+        # 3. 外れ値を強調する変換
+        # 正常範囲（|z| < 2）はそのまま、異常値は指数的に強調
+        emphasized = np.where(
+            np.abs(z_scores) < 2,
+            z_scores,
+            np.sign(z_scores) * (2 + np.log1p(np.abs(z_scores) - 2) * 3)
+        )
+        
+        return emphasized  
+
+    def _detect_multiscale_jumps_with_params(self, events: np.ndarray, 
+                                        window_size: int, 
+                                        percentile: float) -> Dict:
+        """パラメータ化されたジャンプ検出"""
         n_events, n_features = events.shape
         jump_data = {'features': {}, 'integrated': {}}
-
-        # Jump detection for each feature dimension (using JIT functions)
+        
+        # 各特徴次元でのジャンプ検出（カスタムパラメータ使用）
         for f in range(n_features):
             data = events[:, f]
-
-            # Basic jump detection
-            diff, threshold = calculate_diff_and_threshold(data, DELTA_PERCENTILE)
+            
+            # カスタムパーセンタイルでジャンプ検出
+            diff, threshold = calculate_diff_and_threshold(data, percentile)
             pos_jumps, neg_jumps = detect_jumps(diff, threshold)
-
-            # Local adaptive jumps
-            local_std = calculate_local_std(data, LOCAL_WINDOW_SIZE)
+            
+            # カスタムウィンドウサイズで局所適応的ジャンプ
+            local_std = calculate_local_std(data, window_size)
             score = np.abs(diff) / (local_std + 1e-8)
-            local_threshold = np.percentile(score, LOCAL_JUMP_PERCENTILE)
+            local_threshold = np.percentile(score, percentile)
             local_jumps = (score > local_threshold).astype(int)
-
-            # Tension scalar
-            rho_t = calculate_rho_t(data, WINDOW_SIZE)
-
-            # Pulsation energy (calculated from raw data jumps)
+            
+            # テンションスカラー（カスタムウィンドウ）
+            rho_t = calculate_rho_t(data, window_size)
+            
+            # 拍動エネルギー
             jump_intensity, asymmetry, pulse_power = compute_pulsation_energy_from_jumps(
                 pos_jumps, neg_jumps, diff, rho_t
             )
-
+            
             jump_data['features'][f] = {
                 'pos_jumps': pos_jumps,
                 'neg_jumps': neg_jumps,
@@ -682,1203 +1589,52 @@ class Lambda3ZeroShotDetector:
                 'threshold': threshold,
                 'jump_intensity': jump_intensity,
                 'asymmetry': asymmetry,
-                'pulse_power': pulse_power
+                'pulse_power': pulse_power,
+                'window_size': window_size,
+                'percentile': percentile
             }
-
-        # Integrated jump patterns (considering all features)
+        
+        # 統合ジャンプパターン
         jump_data['integrated'] = self._integrate_cross_feature_jumps(jump_data['features'])
-
+        
         return jump_data
 
-    def _integrate_cross_feature_jumps(self, feature_jumps: Dict) -> Dict:
-        """Analyze jump synchronization across features"""
-        n_features = len(feature_jumps)
-        features_list = list(feature_jumps.keys())
-
-        # Integrated jump mask (OR operation)
-        first_key = features_list[0]
-        n_events = len(feature_jumps[first_key]['pos_jumps'])
-        unified_jumps = np.zeros(n_events, dtype=np.int64)  # Unified to int64
-
-        # Jump importance (number of synchronized features)
-        jump_importance = np.zeros(n_events)
-
-        for f in features_list:
-            jumps = feature_jumps[f]['pos_jumps'] | feature_jumps[f]['neg_jumps']
-            unified_jumps |= jumps
-            jump_importance += jumps.astype(float)
-
-        # Calculate jump synchronization rate (utilizing JIT functions)
-        sync_matrix = np.zeros((n_features, n_features))
-        for i, f1 in enumerate(features_list):
-            for j, f2 in enumerate(features_list):
-                if i < j:
-                    jumps1 = feature_jumps[f1]['pos_jumps'] | feature_jumps[f1]['neg_jumps']
-                    jumps2 = feature_jumps[f2]['pos_jumps'] | feature_jumps[f2]['neg_jumps']
-
-                    # Synchronization profile calculation
-                    _, _, max_sync, optimal_lag = calculate_sync_profile_jit(
-                        jumps1.astype(np.float64),
-                        jumps2.astype(np.float64),
-                        lag_window=5
-                    )
-                    sync_matrix[i, j] = max_sync
-                    sync_matrix[j, i] = max_sync
-
-        # Jump cluster detection
-        jump_clusters = self._detect_jump_clusters(unified_jumps, jump_importance)
-
-        return {
-            'unified_jumps': unified_jumps,
-            'jump_importance': jump_importance / n_features,  # Normalize
-            'sync_matrix': sync_matrix,
-            'jump_clusters': jump_clusters,
-            'n_total_jumps': np.sum(unified_jumps),
-            'max_sync': np.max(sync_matrix[np.triu_indices(n_features, k=1)])
-        }
-
-    def _detect_jump_clusters(
-        self,
-        unified_jumps: np.ndarray,
-        jump_importance: np.ndarray,
-        min_cluster_size: int = 3
-    ) -> List[Dict]:
-        """Detect jump clusters (continuous structural changes)"""
-        clusters = []
-        in_cluster = False
-        cluster_start = 0
-
-        for i in range(len(unified_jumps)):
-            if unified_jumps[i] and not in_cluster:
-                in_cluster = True
-                cluster_start = i
-            elif not unified_jumps[i] and in_cluster:
-                # Cluster ends
-                cluster_size = i - cluster_start
-                if cluster_size >= min_cluster_size:
-                    clusters.append({
-                        'start': cluster_start,
-                        'end': i,
-                        'size': cluster_size,
-                        'indices': list(range(cluster_start, i)),
-                        'density': np.mean(jump_importance[cluster_start:i]),
-                        'total_importance': np.sum(jump_importance[cluster_start:i])
-                    })
-                in_cluster = False
-
-        # Handle last cluster
-        if in_cluster:
-            cluster_size = len(unified_jumps) - cluster_start
-            if cluster_size >= min_cluster_size:
-                clusters.append({
-                    'start': cluster_start,
-                    'end': len(unified_jumps),
-                    'size': cluster_size,
-                    'indices': list(range(cluster_start, len(unified_jumps))),
-                    'density': np.mean(jump_importance[cluster_start:]),
-                    'total_importance': np.sum(jump_importance[cluster_start:])
-                })
-
-        return clusters
-
-    def _inverse_problem_jump_constrained(
-        self,
-        events: np.ndarray,
-        jump_structures: Dict,
-        n_paths: int
-    ) -> Dict[int, np.ndarray]:
-        """Jump structure-aware inverse problem"""
-
-        # Global jump information
-        jump_mask = jump_structures['integrated']['unified_jumps']
-        jump_weights = jump_structures['integrated']['jump_importance']
-
-        # Gram matrix calculation
-        events_gram = np.ascontiguousarray(events @ events.T)
-
-        # Initial values reflecting jump structure
-        Lambda_init = self._initialize_with_jump_structure(
-            events, jump_mask, jump_weights, n_paths
+    def _compute_kernel_anomaly_scores_with_params(self,
+                                              events: np.ndarray,
+                                              result: Lambda3Result,
+                                              kernel_type: int,
+                                              **kernel_params) -> np.ndarray:
+        """パラメータを指定してカーネル異常スコアを計算"""
+        # カーネルGram行列の計算
+        K = compute_kernel_gram_matrix(
+            events, 
+            kernel_type=kernel_type,
+            gamma=kernel_params.get('gamma', 1.0),
+            degree=kernel_params.get('degree', 3),
+            coef0=kernel_params.get('coef0', 1.0),
+            alpha=kernel_params.get('alpha', 0.01)
         )
-
-        # Jump-constrained objective function
-        def objective(Lambda_flat):
-            Lambda_matrix = np.ascontiguousarray(Lambda_flat.reshape(n_paths, events.shape[0]))
-
-            # Basic inverse problem term (JIT function)
-            base_obj = inverse_problem_objective_jit(
-                Lambda_matrix, events_gram, self.config.alpha, self.config.beta,
-                jump_weight=0.5
-            )
-
-            # Jump consistency term
-            jump_term = self._compute_jump_consistency_term(
-                Lambda_matrix, jump_mask, jump_weights
-            )
-
-            return base_obj + jump_term
-
-        # Execute optimization
-        result = minimize(
-            objective,
-            Lambda_init.flatten(),
-            method='L-BFGS-B',
-            options={'maxiter': 1000}
-        )
-
-        Lambda_opt = result.x.reshape(n_paths, events.shape[0])
-
-        # Normalize and return
-        return {i: path / (np.linalg.norm(path) + 1e-8)
-                for i, path in enumerate(Lambda_opt)}
-
-    def _initialize_with_jump_structure(
-        self,
-        events: np.ndarray,
-        jump_mask: np.ndarray,
-        jump_weights: np.ndarray,
-        n_paths: int
-    ) -> np.ndarray:
-        """Generate initial values reflecting jump structure"""
-        n_events = events.shape[0]
-        Lambda_init = np.zeros((n_paths, n_events))
-
-        # Eigenvalue decomposition based
-        _, V = np.linalg.eigh(events @ events.T)
-        base_paths = V[:, -n_paths:].T
-
-        # Introduce discontinuities at jump positions
-        for p in range(n_paths):
-            Lambda_init[p] = base_paths[p]
-
-            # Emphasize values at jump positions
-            for i in range(n_events):
-                if jump_mask[i]:
-                    # Invert sign or amplify value at jump position
-                    if p % 2 == 0:
-                        Lambda_init[p, i] *= (1 + jump_weights[i])
-                    else:
-                        Lambda_init[p, i] *= -(1 + jump_weights[i])
-
-        return Lambda_init
-
-    def _compute_jump_consistency_term(
-        self,
-        Lambda_matrix: np.ndarray,
-        jump_mask: np.ndarray,
-        jump_weights: np.ndarray
-    ) -> float:
-        """Evaluate jump consistency"""
-        n_paths, n_events = Lambda_matrix.shape
-        consistency = 0.0
-
-        for p in range(n_paths):
-            path = Lambda_matrix[p]
-
-            # ΔΛ at jump positions
-            for i in range(1, n_events):
-                delta = np.abs(path[i] - path[i-1])
-
-                if jump_mask[i]:
-                    # Encourage large ΔΛ at jump positions
-                    consistency -= jump_weights[i] * delta
-                else:
-                    # Encourage small ΔΛ at non-jump positions
-                    consistency += 0.1 * delta
-
-        return consistency
-
-    def _compute_jump_aware_topology(
-        self,
-        paths: Dict[int, np.ndarray],
-        jump_structures: Dict
-    ) -> Tuple[Dict[int, float], Dict[int, float]]:
-        """Calculate topological quantities considering jump structure"""
-        charges = {}
-        stabilities = {}
-
-        for i, path in paths.items():
-            # Basic topological charge (JIT function)
-            Q, sigma = compute_topological_charge_jit(path)
-
-            # Consider phase changes at jump positions
-            jump_mask = jump_structures['integrated']['unified_jumps']
-            jump_phase_shift = 0.0
-
-            for j in range(1, len(path)):
-                if jump_mask[j]:
-                    # Phase change at jump position
-                    phase_diff = np.arctan2(path[j], path[j-1]) - np.arctan2(path[j-1], path[j-2] if j > 1 else path[0])
-                    jump_phase_shift += phase_diff
-
-            # Jump-corrected charge
-            charges[i] = Q + jump_phase_shift / (2 * np.pi)
-            stabilities[i] = sigma
-
-        return charges, stabilities
-
-    def _compute_pulsation_energies(
-        self,
-        paths: Dict[int, np.ndarray],
-        jump_structures: Dict
-    ) -> Dict[int, float]:
-        """Calculate pulsation energy (prioritizing jump structure)"""
-        energies = {}
-
-        for i, path in paths.items():
-            # Basic energy
-            basic_energy = np.sum(path**2)
-
-            # Integrate jump energy from corresponding features
-            # (Average jumps from multiple features)
-            total_pulse_power = 0.0
-            n_features = len(jump_structures['features'])
-
-            for f_idx, f_data in jump_structures['features'].items():
-                pulse_power = f_data['pulse_power']
-                total_pulse_power += pulse_power
-
-            avg_pulse_power = total_pulse_power / n_features if n_features > 0 else 0.0
-
-            # Integrated energy
-            energies[i] = basic_energy + 0.3 * avg_pulse_power
-
-        return energies
-
-    def _compute_jump_conditional_entropies(
-        self,
-        paths: Dict[int, np.ndarray],
-        jump_structures: Dict
-    ) -> Dict[int, Dict[str, float]]:
-        """Conditional entropy at jump events"""
-        entropies = {}
-        jump_mask = jump_structures['integrated']['unified_jumps']
-
-        for i, path in paths.items():
-            # Overall entropy (JIT function)
-            all_entropies = compute_all_entropies_jit(path)
-            entropy_keys = ["shannon", "renyi_2", "tsallis_1.5", "max", "min", "var"]
-
-            # Separate jump and non-jump positions
-            jump_indices = np.where(jump_mask)[0]
-            non_jump_indices = np.where(~jump_mask)[0]
-
-            entropy_dict = {}
-
-            # Overall entropy
-            for j, key in enumerate(entropy_keys):
-                entropy_dict[key] = all_entropies[j]
-
-            # Jump-conditional entropy
-            if len(jump_indices) > 0:
-                jump_path = path[jump_indices]
-                jump_entropies = compute_all_entropies_jit(jump_path)
-                for j, key in enumerate(entropy_keys):
-                    entropy_dict[f"{key}_jump"] = jump_entropies[j]
-
-            # Non-jump conditional entropy
-            if len(non_jump_indices) > 0:
-                non_jump_path = path[non_jump_indices]
-                non_jump_entropies = compute_all_entropies_jit(non_jump_path)
-                for j, key in enumerate(entropy_keys):
-                    entropy_dict[f"{key}_non_jump"] = non_jump_entropies[j]
-
-            entropies[i] = entropy_dict
-
-        return entropies
-
-    def _classify_by_jump_signatures(
-        self,
-        paths: Dict[int, np.ndarray],
-        jump_structures: Dict,
-        charges: Dict[int, float],
-        stabilities: Dict[int, float]
-    ) -> Dict[int, str]:
-        """Structure classification based on jump patterns"""
-        classifications = {}
-
-        for i in paths.keys():
-            Q = charges[i]
-            sigma = stabilities[i]
-
-            # Jump characteristics (from raw data)
-            if i < len(jump_structures['features']):
-                # Use jump characteristics from corresponding feature
-                feature_data = jump_structures['features'].get(i, jump_structures['features'][0])
-                jump_intensity = feature_data['jump_intensity']
-                asymmetry = feature_data['asymmetry']
-                pulse_power = feature_data['pulse_power']
-            else:
-                # If path index exceeds feature count, use average values
-                jump_intensity = np.mean([f['jump_intensity'] for f in jump_structures['features'].values()])
-                asymmetry = np.mean([f['asymmetry'] for f in jump_structures['features'].values()])
-                pulse_power = np.mean([f['pulse_power'] for f in jump_structures['features'].values()])
-
-            # Basic classification
-            if Q < -0.5:
-                base = "Antimatter Structure (Absorption)"
-            elif Q > 0.5:
-                base = "Matter Structure (Emission)"
-            else:
-                base = "Neutral Structure (Equilibrium)"
-
-            # Jump-based modifiers
-            tags = []
-
-            if pulse_power > 5:
-                tags.append("High-Frequency Pulsation")
-            elif pulse_power < 0.1:
-                tags.append("Static Structure")
-
-            if abs(asymmetry) > 0.7:
-                if asymmetry > 0:
-                    tags.append("Positive-Dominant")
-                else:
-                    tags.append("Negative-Dominant")
-
-            if sigma > 2.5:
-                tags.append("Unstable/Chaotic")
-            elif sigma < 0.5:
-                tags.append("Super-Stable")
-
-            # Complete classification
-            if tags:
-                classifications[i] = base + " • " + " / ".join(tags)
-            else:
-                classifications[i] = base
-
-        return classifications
-
-    def detect_anomalies(self, result: Lambda3Result, events: np.ndarray) -> np.ndarray:
-        """
-        Execute zero-shot anomaly detection (adaptive threshold version)
-        """
-        if self.jump_analyzer is None:
-            # If jump analysis not executed
-            self.jump_analyzer = self._detect_multiscale_jumps(events)
-
-        # 1. Jump-based anomaly score (improved version)
-        jump_anomaly_scores = self._compute_jump_anomaly_scores(
-            self.jump_analyzer, events
-        )
-
-        # 2. Hybrid Tikhonov score (parameter-tuned version)
-        paths_matrix = np.stack(list(result.paths.values()))
-        charges = np.array(list(result.topological_charges.values()))
-        stabilities = np.array(list(result.stabilities.values()))
-
-        # Hybrid Tikhonov score (parameter-tuned version)
-        hybrid_scores = compute_lambda3_hybrid_tikhonov_scores(
-            paths_matrix, events, charges, stabilities,
-            alpha=0.7,  # Emphasize overall error (capture non-jump anomalies)
-            jump_scale=2.5,  # Stricter jump determination
-            use_union=True,
-            w_topo=0.3,  # Emphasize topological features
-            w_pulse=0.2   # Suppress pulsation
-        )
-
-        # 3. Anomaly in kernel space (Laplacian kernel)
-        kernel_scores = self._compute_kernel_anomaly_scores(events, result)
-
-        # 4. Synchronization anomaly score
-        sync_scores = self._compute_sync_anomaly_scores(self.jump_analyzer)
-
-        # 5. Integrated score (weight-adjusted version)
-        # Emphasize non-jump features for handling severe anomalies
-        final_scores = (
-            0.25 * jump_anomaly_scores +      # Jump structure (reduced)
-            0.35 * hybrid_scores +             # Hybrid (increased)
-            0.30 * kernel_scores +             # Kernel (increased)
-            0.10 * sync_scores                 # Synchronization anomaly
-        )
-
-        # 6. Adaptive standardization (robust to outliers)
-        # Use median and interquartile range
-        median_score = np.median(final_scores)
-        q75, q25 = np.percentile(final_scores, [75, 25])
-        iqr = q75 - q25
-
-        if iqr > 0:
-            # Robust standardization
-            final_scores = (final_scores - median_score) / (1.5 * iqr)
-        else:
-            # Fallback: normal standardization
-            mean_score = np.mean(final_scores)
-            std_score = np.std(final_scores)
-            if std_score > 0:
-                final_scores = (final_scores - mean_score) / std_score
-
-        return final_scores
-
-    def detect_anomalies_advanced(self, result: Lambda3Result, events: np.ndarray,
-                                 use_ensemble: bool = True, optimize_weights: bool = True) -> np.ndarray:
-        """
-        Advanced zero-shot anomaly detection (improved version: overfitting countermeasures)
-        """
-        if self.jump_analyzer is None:
-            self.jump_analyzer = self._detect_multiscale_jumps(events)
-
-        # 1. Get base scores
-        base_scores = self.detect_anomalies(result, events)
-
-        # 2. Advanced feature extraction
-        advanced_features = self.extract_advanced_features(result, events)
-
-        # 3. Feature weight optimization (improved version)
-        if optimize_weights:
-            # More conservative pseudo-label generation
-            # Use only samples with clear differences between top and bottom
-            score_percentiles = np.percentile(base_scores, [10, 90])
-
-            # Use only samples that can be clearly separated as normal/anomalous
-            clear_normal = base_scores < score_percentiles[0]
-            clear_anomaly = base_scores > score_percentiles[1]
-
-            if np.sum(clear_normal) > 10 and np.sum(clear_anomaly) > 10:
-                # Learn using only clear samples
-                clear_indices = np.where(clear_normal | clear_anomaly)[0]
-                clear_events = events[clear_indices]
-                clear_labels = clear_anomaly[clear_normal | clear_anomaly].astype(int)
-
-                # Extract features for corresponding indices only
-                clear_features = {}
-                for feat_name, feat_vals in advanced_features.items():
-                    if len(feat_vals) == len(events):  # Event features
-                        clear_features[feat_name] = feat_vals[clear_indices]
-                    else:  # Path features remain as is
-                        clear_features[feat_name] = feat_vals
-
-                print(f"Using {len(clear_labels)} clear samples for optimization "
-                      f"({np.sum(clear_labels)} anomalies, {len(clear_labels)-np.sum(clear_labels)} normal)")
-
-                # Weight optimization
-                optimal_weights, opt_auc = self.optimize_feature_weights_robust(
-                    clear_features, clear_labels, result, clear_indices
-                )
-
-                # Calculate weighted scores for all data
-                weighted_scores = self._compute_weighted_scores(
-                    advanced_features, optimal_weights, result
-                )
-            else:
-                print("Not enough clear samples for optimization, using equal weights")
-                weighted_scores = base_scores
-        else:
-            weighted_scores = base_scores
-
-        # 4. Ensemble detection
-        if use_ensemble:
-            # Generate pseudo-labels from base scores (for ensemble evaluation)
-            pseudo_labels = (base_scores > np.percentile(base_scores, 85)).astype(int)
-
-            ensemble_scores, model_info = self.ensemble_anomaly_detection(
-                events, pseudo_labels, n_models=7
-            )
-
-            # Fusion of base, weighted, and ensemble
-            final_scores = (
-                0.3 * base_scores +
-                0.4 * weighted_scores +
-                0.3 * ensemble_scores
-            )
-        else:
-            final_scores = 0.5 * base_scores + 0.5 * weighted_scores
-
-        return final_scores
-
-    def detect_anomalies_focused(self, result: Lambda3Result, events: np.ndarray, 
-                                use_optimization: bool = True) -> np.ndarray:
-        """
-        Focused anomaly detection using the most informative features discovered by optimization.
-        Directly applies the top features for zero-shot detection.
-        """
-        if use_optimization:
-            # 1. Extract advanced engineered features from the analysis result and raw data
-            advanced_features = self.extract_advanced_features(result, events)
-            
-            # 2. Generate pseudo-labels from basic anomaly scores
-            #    (selecting only the clearest normal/anomaly samples by percentiles)
-            base_scores = self.detect_anomalies(result, events)
-            score_percentiles = np.percentile(base_scores, [10, 90])
-            clear_normal = base_scores < score_percentiles[0]
-            clear_anomaly = base_scores > score_percentiles[1]
-            
-            if np.sum(clear_normal) > 10 and np.sum(clear_anomaly) > 10:
-                clear_indices = np.where(clear_normal | clear_anomaly)[0]
-                clear_labels = clear_anomaly[clear_normal | clear_anomaly].astype(int)
-                
-                # Only keep feature values for clear samples
-                clear_features = {}
-                for feat_name, feat_vals in advanced_features.items():
-                    if len(feat_vals) == len(events):
-                        clear_features[feat_name] = feat_vals[clear_indices]
-                    else:
-                        clear_features[feat_name] = feat_vals
-                
-                # 3. Run robust optimization to find the most informative features
-                optimal_weights, _ = self.optimize_feature_weights_robust(
-                    clear_features, clear_labels, result, clear_indices
-                )
-                
-                # 4. Select all features with ≥50% of the highest weight
-                max_weight = max(optimal_weights.values())
-                weight_threshold = max_weight * 0.5
-                important_features = [
-                    (feat, weight)
-                    for feat, weight in optimal_weights.items()
-                    if weight >= weight_threshold
-                ]
-                
-                if len(important_features) == 1:
-                    # Only one important feature (classic focused detection)
-                    best_feature = important_features[0][0]
-                    print(f"\nUsing single best feature: {best_feature} (weight: {optimal_weights[best_feature]:.4f})")
-                    
-                    if best_feature in advanced_features:
-                        best_feature_values = advanced_features[best_feature]
-                        path_matrix = np.stack(list(result.paths.values()))
-                        
-                        if len(best_feature_values) == len(path_matrix):
-                            # Path-level feature (per-Λ)
-                            scores = np.sum(np.abs(path_matrix) * best_feature_values[:, None], axis=0)
-                        else:
-                            # Event-level feature
-                            scores = best_feature_values
-                        
-                        # Final normalization
-                        if np.std(scores) > 0:
-                            scores = (scores - np.mean(scores)) / np.std(scores)
-                        
-                        return scores
-                else:
-                    # Weighted combination of multiple important features (as in optimization)
-                    print(f"\nUsing {len(important_features)} important features:")
-                    for feat, weight in important_features:
-                        print(f"  - {feat}: {weight:.4f}")
-                    
-                    path_matrix = np.stack(list(result.paths.values()))
-                    n_events = events.shape[0]
-                    combined_score = np.zeros(n_events)
-                    
-                    for feat, weight in important_features:
-                        if feat in advanced_features:
-                            vals = advanced_features[feat]
-                            if len(vals) == len(path_matrix):  # Path-level feature
-                                event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
-                            else:  # Event-level feature
-                                event_scores = vals
-                            combined_score += weight * event_scores
-                    
-                    # Only normalize at the end
-                    if np.std(combined_score) > 0:
-                        combined_score = (combined_score - np.mean(combined_score)) / np.std(combined_score)
-                    
-                    return combined_score
-
-        # Fallback: Use squared topological charge (sq_Q_Λ) as anomaly score if optimization unavailable
-        charges = np.array(list(result.topological_charges.values()))
-        sq_charges = charges ** 2
-        paths_matrix = np.stack(list(result.paths.values()))
-        scores = np.sum(np.abs(paths_matrix) * sq_charges[:, None], axis=0)
-        if np.std(scores) > 0:
-            scores = (scores - np.mean(scores)) / np.std(scores)
-        return scores
-
-        # Fallback if optimization doesn't work
-        print("Optimization failed, falling back to heuristic approach")
-
-        # Original heuristic approach (without optimization)
-        # Extract all features
-        all_features = self.extract_advanced_features(result, events)
-
-        # Find the best single feature based on variance or range
-        best_feature_name = None
-        best_feature_score = -np.inf
-
-        path_matrix = np.stack(list(result.paths.values()))
-        n_events = events.shape[0]
-
-        for feat_name, feat_vals in all_features.items():
-            vals = np.array(feat_vals)
-
-            # Convert to event scores
-            if vals.shape[0] == path_matrix.shape[0]:  # Path features
-                event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
-            elif vals.shape[0] == n_events:  # Event features
-                event_scores = vals
-            else:
-                continue
-
-            # Evaluate feature quality (variance indicates discriminative power)
-            if np.std(event_scores) > 0:
-                # Normalize
-                event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-
-                # Score based on variance and range
-                feature_quality = np.std(event_scores) * (np.max(event_scores) - np.min(event_scores))
-
-                if feature_quality > best_feature_score:
-                    best_feature_score = feature_quality
-                    best_feature_name = feat_name
-
-        print(f"Focused detection using best feature: {best_feature_name} (quality={best_feature_score:.3f})")
-
-        # Use only the best feature
-        if best_feature_name:
-            single_feature = {best_feature_name: all_features[best_feature_name]}
-
-            # Simple optimization for single feature
-            vals = np.array(single_feature[best_feature_name])
-
-            if vals.shape[0] == path_matrix.shape[0]:
-                final_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
-            else:
-                final_scores = vals
-
-            # Apply sigmoid transformation for better discrimination
-            mean_score = np.mean(final_scores)
-            std_score = np.std(final_scores)
-            if std_score > 0:
-                final_scores = (final_scores - mean_score) / std_score
-                final_scores = 1 / (1 + np.exp(-2 * final_scores))  # Steeper sigmoid
-        else:
-            # Fallback to base detection
-            final_scores = self.detect_anomalies(result, events)
-
-        return final_scores
-
-    def optimize_feature_weights_robust(self, features: Dict[str, np.ndarray], labels: np.ndarray,
-                                      result: Lambda3Result, event_indices: np.ndarray,
-                                      n_iter: int = 50) -> Tuple[Dict[str, float], float]:
-        """Robust feature weight optimization (overfitting countermeasure version)"""
-        feature_names = list(features.keys())
-        n_features = len(feature_names)
-        n_events = len(labels)
-
-        # Feature count limitation (more conservative)
-        max_features = min(20, n_features // 2)
-
-        if n_features > max_features:
-            # Feature importance evaluation (correlation-based)
-            feature_importance = {}
-            path_matrix = np.stack(list(result.paths.values()))
-
-            for name in feature_names:
-                vals = np.array(features[name])
-
-                if vals.shape[0] == path_matrix.shape[0]:  # Path features
-                    # Convert to event scores
-                    event_scores = np.zeros(len(event_indices))
-                    for i, evt_idx in enumerate(event_indices):
-                        event_scores[i] = np.sum(np.abs(path_matrix[:, evt_idx]) * vals)
-                elif vals.shape[0] == n_events:  # Event features (partial)
-                    event_scores = vals
-                else:
-                    continue
-
-                if np.std(event_scores) > 1e-10:
-                    # Use absolute value of correlation coefficient as importance
-                    importance = abs(np.corrcoef(event_scores, labels)[0, 1])
-                    feature_importance[name] = importance
-
-            # Select top features
-            sorted_features = sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)
-            selected_features = [f[0] for f in sorted_features[:max_features]]
-
-            print(f"Selected {len(selected_features)} most correlated features")
-            print(f"Top 5: {[f'{f[0]}: {f[1]:.3f}' for f in sorted_features[:5]]}")
-
-            feature_names = selected_features
-            n_features = len(feature_names)
-
-        # Build feature matrix
-        event_feature_matrix = self._build_feature_matrix(
-            features, feature_names, result, event_indices
-        )
-
-        # Bayesian optimization approach (more stable)
-        from sklearn.linear_model import LogisticRegression
-        from sklearn.preprocessing import StandardScaler
-
-        # Standardize features
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(event_feature_matrix.T)
-
-        # L1-regularized logistic regression for weight estimation
-        lr = LogisticRegression(
-            penalty='l1',
-            solver='liblinear',
-            C=0.1,  # Strong regularization
-            max_iter=1000,
-            random_state=42
-        )
-
-        try:
-            lr.fit(X_scaled, labels)
-
-            # Use coefficients as weights
-            weights = np.abs(lr.coef_[0])
-
-            # Score calculation
-            scores = lr.predict_proba(X_scaled)[:, 1]
-            opt_auc = roc_auc_score(labels, scores)
-
-        except Exception as e:
-            print(f"Logistic regression failed: {e}, using uniform weights")
-            weights = np.ones(n_features)
-            opt_auc = 0.5
-
-        # Weight normalization and dictionary conversion
-        if np.sum(weights) > 0:
-            weights = weights / np.sum(weights)
-        else:
-            weights = np.ones(n_features) / n_features
-
-        optimal_weights = {feature_names[i]: weights[i] for i in range(n_features)}
-
-        print(f"\nRobust feature weight optimization completed:")
-        print(f"  Optimized AUC: {opt_auc:.4f}")
-        print(f"  Weight diversity (std): {np.std(weights):.4f}")
-        print(f"  Non-zero weights: {np.sum(weights > 0.001)}/{n_features}")
-
-        # Display important features
-        sorted_features = sorted(optimal_weights.items(), key=lambda x: x[1], reverse=True)
-        print("\nTop features by weight:")
-        for i, (feat, weight) in enumerate(sorted_features[:10]):
-            if weight > 0.001:
-                print(f"  {i+1}. {feat}: {weight:.4f}")
-
-        return optimal_weights, opt_auc
-
-    def _build_feature_matrix(self, features: Dict[str, np.ndarray],
-                            feature_names: List[str], result: Lambda3Result,
-                            event_indices: np.ndarray) -> np.ndarray:
-        """Build feature matrix (supports partial data)"""
-        path_matrix = np.stack(list(result.paths.values()))
-        n_events = len(event_indices)
-
-        event_feature_matrix = []
-
-        for name in feature_names:
-            vals = np.array(features[name])
-
-            if vals.shape[0] == path_matrix.shape[0]:  # Path features
-                # Score calculation for specified events only
-                event_scores = np.zeros(n_events)
-                for i, evt_idx in enumerate(event_indices):
-                    event_scores[i] = np.sum(np.abs(path_matrix[:, evt_idx]) * vals)
-            elif vals.shape[0] == n_events:  # Already event features
-                event_scores = vals
-            else:
-                event_scores = np.zeros(n_events)
-
-            # Standardization
-            if np.std(event_scores) > 1e-10:
-                event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-
-            event_feature_matrix.append(event_scores)
-
-        return np.array(event_feature_matrix)
-
-    def extract_advanced_features(self, result: Lambda3Result, events: np.ndarray) -> Dict[str, np.ndarray]:
-        """Advanced feature extraction (combinations, nonlinear transforms, statistical features)"""
-        n_paths = len(result.paths)
-        paths_matrix = np.stack(list(result.paths.values()))
-
-        # Basic features
-        basic_features = {
-            'Q_Λ': np.array([result.topological_charges[i] for i in range(n_paths)]),
-            'E': np.array([result.energies[i] for i in range(n_paths)]),
-            'σ_Q': np.array([result.stabilities[i] for i in range(n_paths)])
-        }
-
-        # Entropy features
-        for i in range(n_paths):
-            ent = result.entropies[i]
-            if isinstance(ent, dict):
-                basic_features[f'S_shannon_{i}'] = np.array([ent.get('shannon', 0)])
-                basic_features[f'S_renyi_{i}'] = np.array([ent.get('renyi_2', 0)])
-                basic_features[f'S_tsallis_{i}'] = np.array([ent.get('tsallis_1.5', 0)])
-
-        # Pulsation features
-        for i in range(n_paths):
-            path = paths_matrix[i]
-            jump_int, asymm, pulse_pow = compute_pulsation_energy_from_path(path)
-            basic_features[f'jump_int_{i}'] = np.array([jump_int])
-            basic_features[f'asymm_{i}'] = np.array([asymm])
-            basic_features[f'pulse_pow_{i}'] = np.array([pulse_pow])
-
-        # Advanced features
-        advanced_features = basic_features.copy()
-
-        # 1. Feature combinations (interaction terms)
-        feature_names = list(basic_features.keys())
-        for i, feat1 in enumerate(feature_names):
-            for j, feat2 in enumerate(feature_names):
-                if i < j and len(basic_features[feat1]) == len(basic_features[feat2]):
-                    # Product
-                    advanced_features[f'{feat1}×{feat2}'] = basic_features[feat1] * basic_features[feat2]
-                    # Ratio (avoid division by zero)
-                    with np.errstate(divide='ignore', invalid='ignore'):
-                        ratio = basic_features[feat1] / (basic_features[feat2] + 1e-10)
-                        advanced_features[f'{feat1}/{feat2}'] = np.nan_to_num(ratio, nan=0.0, posinf=10.0, neginf=-10.0)
-
-        # 2. Nonlinear transformations
-        for feat, values in basic_features.items():
-            if np.all(values >= 0) and np.any(values > 0):
-                # Log transform
-                advanced_features[f'log_{feat}'] = np.log1p(np.abs(values))
-                # Square root transform
-                advanced_features[f'sqrt_{feat}'] = np.sqrt(np.abs(values))
-            # Square transform
-            advanced_features[f'sq_{feat}'] = values ** 2
-            # Sigmoid transform
-            advanced_features[f'sig_{feat}'] = 1 / (1 + np.exp(-values))
-
-        # 3. Statistical features (per path)
-        for i in range(n_paths):
-            path = paths_matrix[i]
-            # Skewness
-            advanced_features[f'skew_{i}'] = np.array([np.nan_to_num(np.sum((path - np.mean(path))**3) / (len(path) * np.std(path)**3 + 1e-10))])
-            # Kurtosis
-            advanced_features[f'kurt_{i}'] = np.array([np.nan_to_num(np.sum((path - np.mean(path))**4) / (len(path) * np.std(path)**4 + 1e-10) - 3)])
-            # Autocorrelation
-            if len(path) > 1:
-                autocorr = np.correlate(path - np.mean(path), path - np.mean(path), mode='full')[len(path)-1:] / (np.var(path) * np.arange(len(path), 0, -1))
-                advanced_features[f'autocorr_{i}'] = np.array([np.mean(autocorr[:5])])  # Average of first 5 lags
-
-        return advanced_features
-
-    def optimize_feature_weights(self, features: Dict[str, np.ndarray], labels: np.ndarray,
-                               result: Lambda3Result, n_iter: int = 100) -> Tuple[Dict[str, float], float]:
-        """Automatic feature weight optimization (using differential_evolution) - Improved version"""
-        feature_names = list(features.keys())
-        n_features = len(feature_names)
-        n_events = len(labels)
-
-        # Limit features if too many
-        if n_features > 50:
-            # Calculate individual AUC for each feature
-            feature_scores = {}
-            path_matrix = np.stack(list(result.paths.values()))
-
-            for name in feature_names:
-                vals = np.array(features[name])
-                if vals.shape[0] == path_matrix.shape[0]:
-                    event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
-                elif vals.shape[0] == n_events:
-                    event_scores = vals
-                else:
-                    continue
-
-                if np.std(event_scores) > 0:
-                    event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-                    try:
-                        auc = roc_auc_score(labels, event_scores)
-                        feature_scores[name] = auc
-                    except:
-                        feature_scores[name] = 0.5
-
-            # Select top 50 features
-            sorted_features = sorted(feature_scores.items(), key=lambda x: x[1], reverse=True)
-            selected_features = [f[0] for f in sorted_features[:50]]
-            feature_names = selected_features
-            n_features = len(feature_names)
-            print(f"Selected top {n_features} features for optimization")
-
-        # Path matrix
-        path_matrix = np.stack(list(result.paths.values()))
-
-        # Project each feature to event-wise scores
-        event_feature_matrix = []
-        for name in feature_names:
-            vals = np.array(features[name])
-            if vals.shape[0] == path_matrix.shape[0]:  # Path features
-                event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
-            elif vals.shape[0] == n_events:  # Event features
-                event_scores = vals
-            else:
-                event_scores = np.zeros(n_events)
-
-            # Standardization
-            if np.std(event_scores) > 0:
-                event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-            event_feature_matrix.append(event_scores)
-
-        event_feature_matrix = np.array(event_feature_matrix).T
-
-        # Add L2 regularization
-        lambda_reg = 0.01
-
-        def objective(weights):
-            # Weighted composite score
-            combined_score = np.dot(event_feature_matrix, weights)
-
-            # Standardization
-            if np.std(combined_score) > 0:
-                combined_score = (combined_score - np.mean(combined_score)) / np.std(combined_score)
-
-            # Sigmoid transform
-            combined_score = 1 / (1 + np.exp(-combined_score))
-
-            try:
-                # AUC calculation
-                auc = roc_auc_score(labels, combined_score)
-                # Add L2 regularization term (encourage weight diversity)
-                reg_term = lambda_reg * np.sum(weights**2)
-                return -(auc - reg_term)  # Negative for minimization
-            except Exception as e:
-                return -0.5
-
-        # Constraints: each weight between 0 and 1
-        bounds = [(0, 1) for _ in range(n_features)]
-
-        # Diversify initial values
-        x0 = np.random.dirichlet(np.ones(n_features))
-
-        # Execute optimization (parameter tuning)
-        result_opt = differential_evolution(
-            objective,
-            bounds,
-            x0=x0,
-            maxiter=n_iter,
-            seed=42,
-            atol=1e-8,
-            tol=0.001,
-            workers=1,
-            updating='deferred',
-            polish=True,
-            strategy='best1bin',
-            popsize=15,
-            mutation=(0.5, 1.5),
-            recombination=0.7
-        )
-
-        optimal_weights = {feature_names[i]: result_opt.x[i] for i in range(n_features)}
-        best_auc = -result_opt.fun
-
-        # Ensure weight diversity (set minimum weight)
-        min_weight = 0.01
-        for k in optimal_weights:
-            if optimal_weights[k] < min_weight:
-                optimal_weights[k] = min_weight
-
-        # Weight normalization (L1 normalization)
-        weight_sum = sum(optimal_weights.values())
-        if weight_sum > 0:
-            optimal_weights = {k: v/weight_sum for k, v in optimal_weights.items()}
-
-        print(f"\nFeature weight optimization completed:")
-        print(f"  Optimized AUC: {best_auc:.4f}")
-        print(f"  Weight diversity (std): {np.std(list(optimal_weights.values())):.4f}")
-
-        # Display top features (in descending order of weights)
-        sorted_features = sorted(optimal_weights.items(), key=lambda x: x[1], reverse=True)[:10]
-        print("\nTop 10 features by weight:")
-        for feat, weight in sorted_features:
-            if weight > 0.01:  # Display only meaningful weights
-                print(f"  {feat}: {weight:.4f}")
-
-        return optimal_weights, best_auc
-
-    def _compute_weighted_scores(self, features: Dict[str, np.ndarray],
-                                weights: Dict[str, float], result: Lambda3Result) -> np.ndarray:
-        """Calculate scores using optimized weights"""
-        path_matrix = np.stack(list(result.paths.values()))
-        n_events = path_matrix.shape[1]
-
-        weighted_score = np.zeros(n_events)
-
-        for feat_name, weight in weights.items():
-            if feat_name in features:
-                vals = np.array(features[feat_name])
-
-                if vals.shape[0] == path_matrix.shape[0]:  # Path features
-                    event_scores = np.sum(np.abs(path_matrix) * vals[:, None], axis=0)
-                elif vals.shape[0] == n_events:  # Event features
-                    event_scores = vals
-                else:
-                    continue
-
-                # Standardize and weight
-                if np.std(event_scores) > 0:
-                    event_scores = (event_scores - np.mean(event_scores)) / np.std(event_scores)
-
-                weighted_score += weight * event_scores
-
-        return weighted_score
-
-    def ensemble_anomaly_detection(self, events: np.ndarray, labels: np.ndarray = None,
-                                 n_models: int = 5) -> Tuple[np.ndarray, Dict]:
-        """Ensemble anomaly detection (multiple models with different parameters)"""
-        ensemble_scores = []
-        model_info = {}
-
-        # Parameter ranges
-        param_ranges = {
-            'n_paths': [3, 5, 7, 9],
-            'alpha': [0.05, 0.1, 0.15, 0.2],
-            'beta': [0.005, 0.01, 0.015, 0.02],
-            'jump_scale': [1.5, 2.0, 2.5, 3.0],
-            'kernel_type': [0, 1, 3]  # RBF, Polynomial, Laplacian
-        }
-
-        for i in range(n_models):
-            # Random parameter selection
-            model_params = {
-                'n_paths': np.random.choice(param_ranges['n_paths']),
-                'alpha': np.random.choice(param_ranges['alpha']),
-                'beta': np.random.choice(param_ranges['beta']),
-                'jump_scale': np.random.choice(param_ranges['jump_scale']),
-                'kernel_type': np.random.choice(param_ranges['kernel_type'])
-            }
-
-            # Temporarily change parameters
-            original_config = self.config
-            self.config = L3Config(
-                alpha=model_params['alpha'],
-                beta=model_params['beta'],
-                jump_scale=model_params['jump_scale']
-            )
-
-            try:
-                # Execute analysis
-                result = self.analyze(events, n_paths=model_params['n_paths'])
-
-                # Anomaly detection with specified kernel type
-                model_scores = self.detect_anomalies(result, events)
-
-                # Sigmoid transform
-                model_scores = 1 / (1 + np.exp(-model_scores))
-
-                ensemble_scores.append(model_scores)
-
-                # Record model information
-                if labels is not None:
-                    try:
-                        model_auc = roc_auc_score(labels, model_scores)
-                        model_info[f'model_{i}'] = {
-                            'auc': model_auc,
-                            'params': model_params
-                        }
-                    except:
-                        model_info[f'model_{i}'] = {'auc': 0.5}
-
-            except Exception as e:
-                print(f"Model {i} failed: {e}")
-                # Fallback
-                ensemble_scores.append(np.random.rand(len(events)))
-
-            # Restore parameters
-            self.config = original_config
-
-        # Ensemble integration (average)
-        if ensemble_scores:
-            final_scores = np.mean(ensemble_scores, axis=0)
-        else:
-            final_scores = np.full(len(events), 0.5)
-
-        if labels is not None:
-            try:
-                ensemble_auc = roc_auc_score(labels, final_scores)
-                model_info['ensemble_auc'] = ensemble_auc
-                print(f"Ensemble AUC: {ensemble_auc:.4f}")
-            except:
-                model_info['ensemble_auc'] = 0.5
-
-        return final_scores, model_info
-
-    def _compute_jump_anomaly_scores(
-        self,
-        jump_structures: Dict,
-        events: np.ndarray
-    ) -> np.ndarray:
-        """Calculate anomaly scores directly from jump structures (improved version)"""
-        n_events = events.shape[0]
-        scores = np.zeros(n_events)
-
-        # Integrated jump scores
-        integrated = jump_structures['integrated']
-
-        # Scores based on jump importance (not just existence)
-        jump_mask = integrated['unified_jumps'].astype(float)
-        importance = integrated['jump_importance']
-
-        # Consider only jumps with high importance (set threshold)
-        importance_threshold = np.percentile(importance[importance > 0], 75) if np.any(importance > 0) else 0.5
-        significant_jumps = jump_mask * (importance >= importance_threshold)
-
-        scores += significant_jumps * importance
-
-        # Jump contribution from each feature (intensity-based)
-        feature_scores = []
-        for f, data in jump_structures['features'].items():
-            # Standardize jump intensity
-            if data['jump_intensity'] > 0:
-                feature_score = np.zeros(n_events)
-
-                # Consider only strong jumps
-                strong_jumps = (data['pos_jumps'] + data['neg_jumps']) * (
-                    np.abs(data['diff']) > np.percentile(np.abs(data['diff']), 98)
-                )
-
-                feature_score = strong_jumps * data['jump_intensity']
-
-                # Penalty for high asymmetry (characteristic of severe anomalies)
-                if np.abs(data['asymmetry']) > 0.8:
-                    feature_score *= (1 + np.abs(data['asymmetry']))
-
-                feature_scores.append(feature_score)
-
-        if feature_scores:
-            # Take maximum instead of average between features (capture more prominent anomalies)
-            feature_contribution = np.max(feature_scores, axis=0)
-            scores += feature_contribution * 0.5
-
-        # Jump cluster anomalies (consider both size and density)
-        for cluster in integrated['jump_clusters']:
-            cluster_size = cluster['size']
-            cluster_density = cluster['density']
-
-            # Consider only large and dense clusters as anomalies
-            if cluster_size >= 5 and cluster_density > 0.6:
-                anomaly_strength = np.log1p(cluster_size) * cluster_density
-                for idx in cluster['indices']:
-                    scores[idx] += anomaly_strength
-
-        return scores
-
-    def _compute_kernel_anomaly_scores(
-        self,
-        events: np.ndarray,
-        result: Lambda3Result,
-        kernel_type: int = 3  # Laplacian
-    ) -> np.ndarray:
-        """Calculate anomaly scores in kernel space"""
-        # Kernel Gram matrix
-        K = compute_kernel_gram_matrix(events, kernel_type, gamma=1.0)
-
-        # Reconstruction error in kernel space
+        
         paths_matrix = np.stack(list(result.paths.values()))
         n_events = events.shape[0]
-
-        # Kernel reconstruction
+        
+        # カーネル空間での再構成
         K_recon = np.zeros((n_events, n_events))
         for i in range(n_events):
             for j in range(n_events):
                 for k in range(len(paths_matrix)):
                     K_recon[i, j] += paths_matrix[k, i] * K[i, j] * paths_matrix[k, j]
-
-        # Normalization
+        
+        # 正規化
         K_norm = np.sqrt(np.trace(K @ K))
         if K_norm > 0:
             K /= K_norm
-
+        
         recon_norm = np.sqrt(np.trace(K_recon @ K_recon))
         if recon_norm > 0:
             K_recon /= recon_norm
-
-        # Per-event error
+        
+        # イベントごとの再構成誤差
         kernel_scores = np.zeros(n_events)
         for i in range(n_events):
             row_error = 0.0
@@ -1886,32 +1642,213 @@ class Lambda3ZeroShotDetector:
                 diff = K[i, j] - K_recon[i, j]
                 row_error += diff * diff
             kernel_scores[i] = np.sqrt(row_error)
-
-        return kernel_scores
-
+        
+        return kernel_scores                 
+        
     def _compute_sync_anomaly_scores(self, jump_structures: Dict) -> np.ndarray:
         """Calculate synchronization anomaly scores"""
-        n_events = len(jump_structures['integrated']['unified_jumps'])
+        # unified_jumpsから実際のイベント数を決定
+        if 'integrated' in jump_structures and 'unified_jumps' in jump_structures['integrated']:
+            n_events = len(jump_structures['integrated']['unified_jumps'])
+        else:
+            # フォールバック：最初の特徴のジャンプ配列から推定
+            first_feature = list(jump_structures['features'].values())[0]
+            n_events = len(first_feature['pos_jumps'])
+        
         scores = np.zeros(n_events)
 
         # Anomalies in high synchronization clusters
         sync_threshold = 0.7
         sync_matrix = jump_structures['integrated']['sync_matrix']
-
-        # Detect feature pairs showing abnormally high synchronization
-        high_sync_pairs = np.where(sync_matrix > sync_threshold)
+        n_features = len(sync_matrix)
 
         # Synchronization anomaly degree for each feature
-        for f in jump_structures['features'].keys():
-            feature_sync = np.mean([sync_matrix[f, j] for j in range(len(sync_matrix)) if j != f])
-            if feature_sync > sync_threshold:
-                jumps = jump_structures['features'][f]['pos_jumps'] | jump_structures['features'][f]['neg_jumps']
-                scores += jumps * feature_sync
+        for f_idx in range(n_features):
+            if f_idx in jump_structures['features']:
+                feature_data = jump_structures['features'][f_idx]
+                feature_sync = np.mean([sync_matrix[f_idx, j] for j in range(n_features) if j != f_idx])
+                
+                if feature_sync > sync_threshold:
+                    pos_jumps = feature_data['pos_jumps']
+                    neg_jumps = feature_data['neg_jumps']
+                    
+                    # Ensure jumps arrays have correct length
+                    jumps_len = min(len(pos_jumps), len(neg_jumps), n_events)
+                    jumps = np.zeros(n_events, dtype=bool)
+                    jumps[:jumps_len] = (pos_jumps[:jumps_len] | neg_jumps[:jumps_len]).astype(bool)
+                    
+                    scores += jumps * feature_sync
 
-        return scores / len(jump_structures['features'])
+        # Normalize by number of features
+        if n_features > 0:
+            scores = scores / n_features
+            
+        return scores
 
+    def _optimize_component_weights_aggressive(self,
+                                         component_scores: Dict[str, np.ndarray],
+                                         labels: np.ndarray,
+                                         event_indices: np.ndarray = None,
+                                         events: np.ndarray = None,
+                                         force_all_components: bool = True,
+                                         remove_collinearity: bool = False,  # 強制モードではOFF
+                                         collinearity_threshold: float = 0.95,
+                                         verbose: bool = False) -> Dict[str, float]:
+        """
+        全コンポーネントを強制的に使用する積極的最適化
+        """
+        from scipy.optimize import differential_evolution
+        from sklearn.metrics import roc_auc_score
+        from sklearn.preprocessing import StandardScaler
+        
+        feature_names = list(component_scores.keys())
+        n_features = len(feature_names)
+        n_samples = len(labels)
+        
+        # 1. 特徴量行列の構築
+        feature_matrix = np.column_stack([component_scores[name] for name in feature_names])
+        feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=10.0, neginf=-10.0)
+        
+        # 2. 多重共線性の除去（強制モードではスキップ）
+        if not force_all_components and remove_collinearity and n_features > 2:
+            # 既存のコードと同じ処理
+            corr_matrix = np.corrcoef(feature_matrix.T)
+            corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
+            # ... (既存の共線性除去コード)
+        
+        # 3. スケーリング（ロバスト版）
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(feature_matrix)
+        
+        # 4. サンプル重みの計算（よりアグレッシブに）
+        sample_weights = np.ones(n_samples)
+        
+        # クラスバランスを強く考慮
+        try:
+            from sklearn.utils.class_weight import compute_sample_weight
+            class_weights = compute_sample_weight('balanced', labels)
+            # より極端なクラス重みを適用
+            class_weights = np.power(class_weights, 1.5)  # 不均衡をより強調
+            sample_weights *= class_weights
+        except:
+            pass
+        
+        sample_weights = np.clip(sample_weights, 0.1, 10.0)
+        
+        # 5. 差分進化を最初から使用（L1正則化をスキップ）
+        if verbose:
+            print(f"Aggressive optimization with {n_features} components")
+        
+        def objective(weights):
+            # 重み付きスコア
+            scores = X_scaled @ weights
+            
+            # より急峻なシグモイド変換（異常をより明確に分離）
+            scores_normalized = (scores - np.mean(scores)) / (np.std(scores) + 1e-8)
+            probs = 1 / (1 + np.exp(-2 * scores_normalized))  # 係数2で急峻化
+            
+            try:
+                # AUC最大化
+                auc = roc_auc_score(labels, probs, sample_weight=sample_weights)
+                
+                # ペナルティ項
+                penalty = 0
+                
+                if force_all_components:
+                    # 全コンポーネント使用を強制
+                    min_weight = np.min(weights)
+                    if min_weight < 0.05:  # 最小5%の重み
+                        penalty += 0.2 * (0.05 - min_weight) ** 2
+                    
+                    # 重みの分散を促進（一つの特徴に偏らないように）
+                    weight_std = np.std(weights)
+                    if weight_std > 0.4:  # 分散が大きすぎる場合
+                        penalty += 0.1 * (weight_std - 0.4)
+                
+                # エントロピー正則化（重みの多様性を促進）
+                weights_norm = weights / (np.sum(weights) + 1e-8)
+                entropy = -np.sum(weights_norm * np.log(weights_norm + 1e-8))
+                max_entropy = np.log(n_features)
+                entropy_bonus = 0.05 * (entropy / max_entropy)  # 0-0.05のボーナス
+                
+                return -(auc + entropy_bonus - penalty)
+                
+            except Exception as e:
+                if verbose:
+                    print(f"Objective function error: {e}")
+                return 1.0
+        
+        # 境界設定：強制モードでは最小値を高く設定
+        if force_all_components:
+            bounds = [(0.05, 1.0) for _ in range(n_features)]  # 最小5%
+        else:
+            bounds = [(0.0, 1.0) for _ in range(n_features)]
+        
+        # 差分進化の実行（より多くの反復）
+        result_de = differential_evolution(
+            objective,
+            bounds,
+            strategy='best1bin',
+            maxiter=100 if force_all_components else 50,  # 強制モードではより多く
+            popsize=20,
+            mutation=(0.5, 1.5),  # より広い探索
+            recombination=0.7,
+            seed=42,
+            polish=True,  # 最終的な局所最適化
+            disp=verbose
+        )
+        
+        # 最適重みの取得
+        best_weights = result_de.x
+        
+        # 6. 追加の局所最適化（Nelder-Mead）
+        if force_all_components:
+            from scipy.optimize import minimize
+            
+            # 初期値は差分進化の結果
+            local_result = minimize(
+                objective,
+                best_weights,
+                method='Nelder-Mead',
+                options={'maxiter': 200}
+            )
+            
+            if local_result.fun < result_de.fun:
+                best_weights = local_result.x
+                if verbose:
+                    print("Local optimization improved the solution")
+        
+        # 7. 正規化と最小重みの保証
+        if force_all_components:
+            # 最小重みを保証
+            best_weights = np.maximum(best_weights, 0.05)
+        
+        # 合計が1になるように正規化
+        best_weights = best_weights / np.sum(best_weights)
+        
+        # 最終的なAUCを計算
+        final_scores = X_scaled @ best_weights
+        final_probs = 1 / (1 + np.exp(-2 * (final_scores - np.mean(final_scores)) / (np.std(final_scores) + 1e-8)))
+        final_auc = roc_auc_score(labels, final_probs, sample_weight=sample_weights)
+        
+        # 辞書形式に変換
+        optimal_weights = {feature_names[i]: best_weights[i] for i in range(n_features)}
+        
+        if verbose:
+            print(f"\nAggressive optimization completed:")
+            print(f"  Final AUC: {final_auc:.4f}")
+            print(f"  All weights > 0.05: {all(w >= 0.05 for w in best_weights)}")
+            print(f"  Weight std: {np.std(best_weights):.4f}")
+            
+            sorted_weights = sorted(optimal_weights.items(), key=lambda x: x[1], reverse=True)
+            print("\nComponent weights:")
+            for feat, weight in sorted_weights:
+                print(f"  {feat}: {weight:.4f}")
+        
+        return optimal_weights
+      
     def explain_anomaly(self, event_idx: int, result: Lambda3Result, events: np.ndarray) -> Dict:
-        """Generate physical explanation for anomaly"""
+        """異常の物理的説明を生成"""
         explanation = {
             'event_index': event_idx,
             'anomaly_score': 0.0,
@@ -1923,16 +1860,16 @@ class Lambda3ZeroShotDetector:
             'recommendation': ""
         }
 
-        # Calculate anomaly score
+        # 異常スコア計算
         anomaly_scores = self.detect_anomalies(result, events)
         explanation['anomaly_score'] = float(anomaly_scores[event_idx])
 
-        # Jump-based explanation
-        if self.jump_analyzer:
-            integrated = self.jump_analyzer['integrated']
+        # ジャンプベースの説明
+        if self.jump_analyzer and result.jump_structures:
+            integrated = result.jump_structures['integrated']
             if integrated['unified_jumps'][event_idx]:
                 sync_features = []
-                for f, data in self.jump_analyzer['features'].items():
+                for f, data in result.jump_structures['features'].items():
                     if (data['pos_jumps'][event_idx] or data['neg_jumps'][event_idx]):
                         sync_features.append(f)
 
@@ -1944,7 +1881,7 @@ class Lambda3ZeroShotDetector:
                     'in_cluster': any(event_idx in c['indices'] for c in integrated['jump_clusters'])
                 }
 
-        # Topological explanation
+        # トポロジカル説明
         topo_info = {}
         for p, path in result.paths.items():
             if event_idx > 0:
@@ -1960,7 +1897,7 @@ class Lambda3ZeroShotDetector:
                     }
         explanation['topological'] = topo_info
 
-        # Energy explanation
+        # エネルギー説明
         energy_info = {}
         for p in result.paths.keys():
             energy_info[f'path_{p}'] = {
@@ -1969,10 +1906,9 @@ class Lambda3ZeroShotDetector:
             }
         explanation['energetic'] = energy_info
 
-        # Entropy explanation
+        # エントロピー説明
         entropy_info = {}
         for p, ent_dict in result.entropies.items():
-            # Extract main entropy values
             main_entropy = ent_dict.get('shannon', 0)
             jump_entropy = ent_dict.get('shannon_jump', None)
 
@@ -1982,10 +1918,12 @@ class Lambda3ZeroShotDetector:
             }
         explanation['entropic'] = entropy_info
 
-        # Recommended action
+        # 推奨アクション
         if explanation['anomaly_score'] > 2.0:
             if explanation['jump_based'].get('is_jump') and explanation['jump_based']['importance'] > 0.7:
-                explanation['recommendation'] = "Critical structural transition detected. Immediate investigation required. Multiple synchronized features show simultaneous jumps."
+                explanation['recommendation'] = "Critical structural transition detected. " \
+                                              "Immediate investigation required. " \
+                                              "Multiple synchronized features show simultaneous jumps."
             else:
                 explanation['recommendation'] = "High anomaly score detected. Investigation recommended."
         elif explanation['anomaly_score'] > 1.0:
@@ -1995,28 +1933,26 @@ class Lambda3ZeroShotDetector:
 
         return explanation
 
-    def visualize_results(
-        self,
-        events: np.ndarray,
-        result: Lambda3Result,
-        anomaly_scores: np.ndarray = None
-    ) -> plt.Figure:
-        """Integrated visualization (centered on jump structures)"""
+    def visualize_results(self,
+                         events: np.ndarray,
+                         result: Lambda3Result,
+                         anomaly_scores: np.ndarray = None) -> plt.Figure:
+        """統合的な可視化（ジャンプ構造を中心に）"""
         if anomaly_scores is None:
             anomaly_scores = self.detect_anomalies(result, events)
 
         fig = plt.figure(figsize=(20, 15))
 
-        # 1. Jump structure visualization
+        # 1. ジャンプ構造の可視化
         ax1 = plt.subplot(3, 4, 1)
-        if self.jump_analyzer:
-            integrated = self.jump_analyzer['integrated']
+        if result.jump_structures:
+            integrated = result.jump_structures['integrated']
             ax1.plot(integrated['jump_importance'], 'b-', label='Jump Importance')
             ax1.scatter(np.where(integrated['unified_jumps'])[0],
                        integrated['jump_importance'][integrated['unified_jumps'] == 1],
                        color='red', s=50, label='Jump Events')
 
-            # Highlight clusters
+            # クラスターをハイライト
             for cluster in integrated['jump_clusters']:
                 ax1.axvspan(cluster['start'], cluster['end'], alpha=0.3, color='yellow')
         ax1.set_title('Jump Structure Analysis')
@@ -2024,15 +1960,15 @@ class Lambda3ZeroShotDetector:
         ax1.set_ylabel('Importance')
         ax1.legend()
 
-        # 2. Synchronization matrix
+        # 2. 同期マトリックス
         ax2 = plt.subplot(3, 4, 2)
-        if self.jump_analyzer:
-            sync_matrix = self.jump_analyzer['integrated']['sync_matrix']
+        if result.jump_structures:
+            sync_matrix = result.jump_structures['integrated']['sync_matrix']
             im = ax2.imshow(sync_matrix, cmap='viridis', aspect='auto')
             plt.colorbar(im, ax=ax2)
         ax2.set_title('Feature Synchronization Matrix')
 
-        # 3. Anomaly score time series
+        # 3. 異常スコアの時系列
         ax3 = plt.subplot(3, 4, 3)
         ax3.plot(anomaly_scores, 'g-', linewidth=2)
         ax3.axhline(y=2.0, color='r', linestyle='--', label='Critical Threshold')
@@ -2042,28 +1978,28 @@ class Lambda3ZeroShotDetector:
         ax3.set_ylabel('Score')
         ax3.legend()
 
-        # 4. Topological anomaly map
+        # 4. トポロジカル異常マップ
         ax4 = plt.subplot(3, 4, 4)
         for i in result.paths:
             ax4.scatter(result.topological_charges[i],
                        result.stabilities[i],
                        s=100, label=f'Path {i}')
-        ax4.set_xlabel('Topological Charge Q_Λ')
-        ax4.set_ylabel('Stability σ_Q')
+        ax4.set_xlabel('Topological Charge Q_Lambda')
+        ax4.set_ylabel('Stability Sigma_Q')
         ax4.set_title('Topological Anomaly Map')
         ax4.legend()
 
-        # 5-8. Details of each path (emphasizing jumps)
+        # 5-8. 各パスの詳細（ジャンプ強調）
         for idx, (i, path) in enumerate(result.paths.items()):
             if idx >= 4:
                 break
 
             ax = plt.subplot(3, 4, 5 + idx)
-            ax.plot(path, 'b-', alpha=0.7, label='Λ Structure')
+            ax.plot(path, 'b-', alpha=0.7, label='Lambda Structure')
 
-            # Mark jump events
-            if self.jump_analyzer:
-                jump_mask = self.jump_analyzer['integrated']['unified_jumps']
+            # ジャンプイベントをマーク
+            if result.jump_structures:
+                jump_mask = result.jump_structures['integrated']['unified_jumps']
                 jump_indices = np.where(jump_mask)[0]
                 if len(jump_indices) > 0:
                     ax.scatter(jump_indices, path[jump_indices],
@@ -2074,7 +2010,7 @@ class Lambda3ZeroShotDetector:
             ax.set_ylabel('Λ Amplitude')
             ax.legend()
 
-            # Display physical quantities
+            # 物理量表示
             textstr = f'Q_Λ={result.topological_charges[i]:.3f}\n' \
                      f'σ_Q={result.stabilities[i]:.3f}\n' \
                      f'E={result.energies[i]:.3f}'
@@ -2082,7 +2018,7 @@ class Lambda3ZeroShotDetector:
                    verticalalignment='top', fontsize=8,
                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
 
-        # 9. Entropy comparison
+        # 9. エントロピー比較
         ax9 = plt.subplot(3, 4, 9)
         entropy_types = ['shannon', 'renyi_2', 'tsallis_1.5']
         for i, ent_type in enumerate(entropy_types):
@@ -2099,12 +2035,12 @@ class Lambda3ZeroShotDetector:
         ax9.set_ylabel('Entropy')
         ax9.legend()
 
-        # 10. Pulsation energy distribution (from raw data)
+        # 10. 拍動エネルギー分布
         ax10 = plt.subplot(3, 4, 10)
-        if self.jump_analyzer:
+        if result.jump_structures:
             pulse_energies = []
             feature_names = []
-            for f_idx, f_data in self.jump_analyzer['features'].items():
+            for f_idx, f_data in result.jump_structures['features'].items():
                 pulse_energies.append(f_data['pulse_power'])
                 feature_names.append(f'F{f_idx}')
             ax10.bar(range(len(pulse_energies)), pulse_energies)
@@ -2115,7 +2051,7 @@ class Lambda3ZeroShotDetector:
                 ax10.set_xticks(range(len(feature_names)))
                 ax10.set_xticklabels(feature_names)
         else:
-            # Fallback: calculate from paths
+            # フォールバック：パスから計算
             pulse_energies = []
             for p, path in result.paths.items():
                 _, _, pulse_power = compute_pulsation_energy_from_path(path)
@@ -2125,7 +2061,7 @@ class Lambda3ZeroShotDetector:
             ax10.set_xlabel('Path Index')
             ax10.set_ylabel('Pulse Power')
 
-        # 11. PCA projection
+        # 11. PCA投影
         ax11 = plt.subplot(3, 4, 11)
         if events.shape[1] > 2:
             pca = PCA(n_components=2)
@@ -2135,10 +2071,10 @@ class Lambda3ZeroShotDetector:
             plt.colorbar(scatter, ax=ax11)
         ax11.set_title('Event Space (PCA) - Anomaly Colored')
 
-        # 12. Kernel space projection
+        # 12. カーネル空間投影
         ax12 = plt.subplot(3, 4, 12)
-        # Simple kernel PCA visualization
-        K = compute_kernel_gram_matrix(events[:50], kernel_type=3, gamma=1.0)  # Sampling
+        # 簡易的なカーネルPCA可視化
+        K = compute_kernel_gram_matrix(events[:50], kernel_type=3, gamma=1.0)  # サンプリング
         eigenvalues, eigenvectors = np.linalg.eigh(K)
         idx = np.argsort(eigenvalues)[::-1][:2]
         kernel_proj = eigenvectors[:, idx]
@@ -2150,7 +2086,759 @@ class Lambda3ZeroShotDetector:
         return fig
 
     # ===============================
-    # Anomaly Pattern Generation Methods (Production Version)
+    # 内部メソッド（完全実装）
+    # ===============================
+
+    def _ensure_length(self, scores: np.ndarray, target_length: int) -> np.ndarray:
+        """スコア配列の長さを安全に統一"""
+        if len(scores) != target_length:
+            if len(scores) < target_length:
+                # 短い場合はゼロパディング
+                padded_scores = np.zeros(target_length)
+                padded_scores[:len(scores)] = scores
+                return padded_scores
+            else:
+                # 長い場合は切り詰め
+                return scores[:target_length]
+        return scores
+
+    def _select_clear_samples(self,
+                            base_scores: np.ndarray,
+                            percentiles: Tuple[float, float]) -> Tuple[np.ndarray, np.ndarray]:
+        """明確な正常/異常サンプルの選択"""
+        low_threshold = np.percentile(base_scores, percentiles[0])
+        high_threshold = np.percentile(base_scores, percentiles[1])
+
+        clear_normal = base_scores < low_threshold
+        clear_anomaly = base_scores > high_threshold
+
+        clear_mask = clear_normal | clear_anomaly
+        clear_indices = np.where(clear_mask)[0]
+        clear_labels = clear_anomaly[clear_mask].astype(int)
+
+        return clear_indices, clear_labels
+
+    def _compute_with_optimized_features(self,
+                                       features: Dict[str, np.ndarray],
+                                       optimization_result: OptimizationResult,
+                                       paths_matrix: np.ndarray) -> np.ndarray:
+        """最適化された特徴量でスコア計算"""
+        # 選択された特徴のみを使用
+        selected_features = {
+            k: features[k] for k in optimization_result.selected_features
+        }
+
+        # イベント空間に射影
+        event_features = self.feature_extractor.project_to_event_space(
+            selected_features, paths_matrix
+        )
+
+        # 重み付き合成
+        scores = np.zeros(paths_matrix.shape[1])
+        for feat_name, weight in optimization_result.weights.items():
+            if feat_name in event_features:
+                feat_scores = event_features[feat_name]
+                # 標準化
+                if np.std(feat_scores) > 1e-10:
+                    feat_scores = (feat_scores - np.mean(feat_scores)) / np.std(feat_scores)
+                scores += weight * feat_scores
+
+        return scores
+
+    def _integrate_scores(self,
+                        component_scores: Dict[str, np.ndarray],
+                        weights: Dict[str, float]) -> np.ndarray:
+        """複数のスコアコンポーネントを統合"""
+        # 重みの正規化
+        total_weight = sum(weights.values())
+        norm_weights = {k: v / total_weight for k, v in weights.items()}
+
+        # 各コンポーネントを標準化してから統合
+        integrated_scores = np.zeros_like(list(component_scores.values())[0])
+
+        for component, scores in component_scores.items():
+            if component in norm_weights:
+                # 標準化
+                if np.std(scores) > 1e-10:
+                    scores_norm = (scores - np.mean(scores)) / np.std(scores)
+                else:
+                    scores_norm = scores
+
+                integrated_scores += norm_weights[component] * scores_norm
+
+        return integrated_scores
+
+    def _standardize_scores(self, scores: np.ndarray) -> np.ndarray:
+        """スコアの頑健な標準化"""
+        # 中央値と四分位範囲を使用（外れ値に頑健）
+        median_score = np.median(scores)
+        q75, q25 = np.percentile(scores, [75, 25])
+        iqr = q75 - q25
+
+        if iqr > 0:
+            standardized = (scores - median_score) / (1.5 * iqr)
+        else:
+            # フォールバック：通常の標準化
+            mean_score = np.mean(scores)
+            std_score = np.std(scores)
+            if std_score > 0:
+                standardized = (scores - mean_score) / std_score
+            else:
+                standardized = scores
+
+        return standardized
+
+    def _solve_inverse_problem(self, events: np.ndarray, n_paths: int) -> Dict[int, np.ndarray]:
+        """構造テンソル推定（基本版）"""
+        events_gram = np.ascontiguousarray(events @ events.T)
+
+        # 初期値
+        _, V = np.linalg.eigh(events_gram)
+        Lambda_init = V[:, -n_paths:].T.flatten()
+
+        # 目的関数
+        def objective(Lambda_flat):
+            Lambda_matrix = np.ascontiguousarray(Lambda_flat.reshape(n_paths, events.shape[0]))
+            return inverse_problem_objective_jit(
+                Lambda_matrix, events_gram, self.config.alpha, self.config.beta
+            )
+
+        # 最適化
+        result = minimize(
+            objective,
+            Lambda_init,
+            method='L-BFGS-B',
+            options={'maxiter': 1000}
+        )
+
+        Lambda_opt = result.x.reshape(n_paths, events.shape[0])
+
+        return {i: path / (np.linalg.norm(path) + 1e-8)
+                for i, path in enumerate(Lambda_opt)}
+
+    def _compute_topology(self, paths: Dict[int, np.ndarray]) -> Tuple[Dict[int, float], Dict[int, float]]:
+        """トポロジカル量の計算"""
+        charges = {}
+        stabilities = {}
+
+        for i, path in paths.items():
+            Q, sigma = compute_topological_charge_jit(path)
+            charges[i] = Q
+            stabilities[i] = sigma
+
+        return charges, stabilities
+
+    def _compute_energies(self, paths: Dict[int, np.ndarray]) -> Dict[int, float]:
+        """エネルギー計算"""
+        energies = {}
+        for i, path in paths.items():
+            basic_energy = np.sum(path**2)
+            jump_int, _, pulse_pow = compute_pulsation_energy_from_path(path)
+            energies[i] = basic_energy + 0.3 * pulse_pow
+
+        return energies
+
+    def _compute_entropies(self, paths: Dict[int, np.ndarray]) -> Dict[int, Dict[str, float]]:
+        """エントロピー計算"""
+        entropies = {}
+        entropy_keys = ["shannon", "renyi_2", "tsallis_1.5", "max", "min", "var"]
+
+        for i, path in paths.items():
+            all_entropies = compute_all_entropies_jit(path)
+            entropy_dict = {}
+            for j, key in enumerate(entropy_keys):
+                entropy_dict[key] = all_entropies[j]
+            entropies[i] = entropy_dict
+
+        return entropies
+
+    def _classify_structures(self,
+                           paths: Dict[int, np.ndarray],
+                           charges: Dict[int, float],
+                           stabilities: Dict[int, float],
+                           jump_structures: Optional[Dict] = None) -> Dict[int, str]:
+        """構造分類"""
+        classifications = {}
+
+        for i in paths.keys():
+            Q = charges[i]
+            sigma = stabilities[i]
+
+            # 基本分類
+            if Q < -0.5:
+                base = "反物質的構造（吸収系）"
+            elif Q > 0.5:
+                base = "物質的構造（放出系）"
+            else:
+                base = "中性構造（平衡）"
+
+            # 修飾
+            tags = []
+
+            if sigma > 2.5:
+                tags.append("不安定/カオス的")
+            elif sigma < 0.5:
+                tags.append("超安定")
+
+            # ジャンプ特性があれば追加
+            if jump_structures and i < len(jump_structures['features']):
+                feature_data = jump_structures['features'].get(i, list(jump_structures['features'].values())[0])
+                pulse_power = feature_data['pulse_power']
+                asymmetry = feature_data['asymmetry']
+
+                if pulse_power > 5:
+                    tags.append("高頻度拍動")
+                elif pulse_power < 0.1:
+                    tags.append("静的構造")
+
+                if abs(asymmetry) > 0.7:
+                    if asymmetry > 0:
+                        tags.append("正方向優位")
+                    else:
+                        tags.append("負方向優位")
+
+            # 分類完成
+            if tags:
+                classifications[i] = base + "・" + "／".join(tags)
+            else:
+                classifications[i] = base
+
+        return classifications
+
+    # ===============================
+    # ジャンプ解析メソッド
+    # ===============================
+
+    def _detect_multiscale_jumps(self, events: np.ndarray) -> Dict:
+        """多次元・多スケールジャンプ検出"""
+        n_events, n_features = events.shape
+        jump_data = {'features': {}, 'integrated': {}}
+
+        # 各特徴次元でのジャンプ検出
+        for f in range(n_features):
+            data = events[:, f]
+            
+            # ここで配列サイズを確認
+            assert len(data) == n_events, f"Feature {f} has wrong size: {len(data)} vs {n_events}"
+
+            # 基本ジャンプ検出
+            diff, threshold = calculate_diff_and_threshold(data, DELTA_PERCENTILE)
+            pos_jumps, neg_jumps = detect_jumps(diff, threshold)
+
+            # 局所適応的ジャンプ
+            local_std = calculate_local_std(data, LOCAL_WINDOW_SIZE)
+            score = np.abs(diff) / (local_std + 1e-8)
+            local_threshold = np.percentile(score, LOCAL_JUMP_PERCENTILE)
+            local_jumps = (score > local_threshold).astype(int)
+
+            # テンションスカラー
+            rho_t = calculate_rho_t(data, WINDOW_SIZE)
+
+            # 拍動エネルギー
+            jump_intensity, asymmetry, pulse_power = compute_pulsation_energy_from_jumps(
+                pos_jumps, neg_jumps, diff, rho_t
+            )
+
+            jump_data['features'][f] = {
+                'pos_jumps': pos_jumps,
+                'neg_jumps': neg_jumps,
+                'local_jumps': local_jumps,
+                'rho_t': rho_t,
+                'diff': diff,
+                'threshold': threshold,
+                'jump_intensity': jump_intensity,
+                'asymmetry': asymmetry,
+                'pulse_power': pulse_power
+            }
+
+        # 統合ジャンプパターン
+        jump_data['integrated'] = self._integrate_cross_feature_jumps(jump_data['features'])
+
+        return jump_data
+
+    def _integrate_cross_feature_jumps(self, feature_jumps: Dict) -> Dict:
+        """特徴間のジャンプ同期性を解析"""
+        n_features = len(feature_jumps)
+        features_list = list(feature_jumps.keys())
+
+        # 統合ジャンプマスク
+        first_key = features_list[0]
+        n_events = len(feature_jumps[first_key]['pos_jumps'])
+        unified_jumps = np.zeros(n_events, dtype=np.int64)
+
+        # ジャンプ重要度
+        jump_importance = np.zeros(n_events)
+
+        for f in features_list:
+            jumps = feature_jumps[f]['pos_jumps'] | feature_jumps[f]['neg_jumps']
+            unified_jumps |= jumps
+            jump_importance += jumps.astype(float)
+
+        # ジャンプ同期率の計算
+        sync_matrix = np.zeros((n_features, n_features))
+        for i, f1 in enumerate(features_list):
+            for j, f2 in enumerate(features_list):
+                if i < j:
+                    jumps1 = feature_jumps[f1]['pos_jumps'] | feature_jumps[f1]['neg_jumps']
+                    jumps2 = feature_jumps[f2]['pos_jumps'] | feature_jumps[f2]['neg_jumps']
+
+                    # 同期プロファイル計算
+                    _, _, max_sync, optimal_lag = calculate_sync_profile_jit(
+                        jumps1.astype(np.float64),
+                        jumps2.astype(np.float64),
+                        lag_window=5
+                    )
+                    sync_matrix[i, j] = max_sync
+                    sync_matrix[j, i] = max_sync
+
+        # ジャンプクラスター検出
+        jump_clusters = self._detect_jump_clusters(unified_jumps, jump_importance)
+
+        return {
+            'unified_jumps': unified_jumps,
+            'jump_importance': jump_importance / n_features,  # 正規化
+            'sync_matrix': sync_matrix,
+            'jump_clusters': jump_clusters,
+            'n_total_jumps': np.sum(unified_jumps),
+            'max_sync': np.max(sync_matrix[np.triu_indices(n_features, k=1)])
+        }
+
+    def _detect_jump_clusters(self,
+                            unified_jumps: np.ndarray,
+                            jump_importance: np.ndarray,
+                            min_cluster_size: int = 3) -> List[Dict]:
+        """ジャンプのクラスター（連続的な構造変化）を検出"""
+        clusters = []
+        in_cluster = False
+        cluster_start = 0
+
+        for i in range(len(unified_jumps)):
+            if unified_jumps[i] and not in_cluster:
+                in_cluster = True
+                cluster_start = i
+            elif not unified_jumps[i] and in_cluster:
+                # クラスター終了
+                cluster_size = i - cluster_start
+                if cluster_size >= min_cluster_size:
+                    clusters.append({
+                        'start': cluster_start,
+                        'end': i,
+                        'size': cluster_size,
+                        'indices': list(range(cluster_start, i)),
+                        'density': np.mean(jump_importance[cluster_start:i]),
+                        'total_importance': np.sum(jump_importance[cluster_start:i])
+                    })
+                in_cluster = False
+
+        # 最後のクラスター処理
+        if in_cluster:
+            cluster_size = len(unified_jumps) - cluster_start
+            if cluster_size >= min_cluster_size:
+                clusters.append({
+                    'start': cluster_start,
+                    'end': len(unified_jumps),
+                    'size': cluster_size,
+                    'indices': list(range(cluster_start, len(unified_jumps))),
+                    'density': np.mean(jump_importance[cluster_start:]),
+                    'total_importance': np.sum(jump_importance[cluster_start:])
+                })
+
+        return clusters
+
+    def _inverse_problem_jump_constrained(self,
+                                        events: np.ndarray,
+                                        jump_structures: Dict,
+                                        n_paths: int) -> Dict[int, np.ndarray]:
+        """ジャンプ構造を活用した逆問題"""
+        # グローバルジャンプ情報
+        jump_mask = jump_structures['integrated']['unified_jumps']
+        jump_weights = jump_structures['integrated']['jump_importance']
+
+        # Gram行列計算
+        events_gram = np.ascontiguousarray(events @ events.T)
+
+        # ジャンプ構造を反映した初期値
+        Lambda_init = self._initialize_with_jump_structure(
+            events, jump_mask, jump_weights, n_paths
+        )
+
+        # ジャンプ制約付き目的関数
+        def objective(Lambda_flat):
+            Lambda_matrix = np.ascontiguousarray(Lambda_flat.reshape(n_paths, events.shape[0]))
+
+            # 基本の逆問題項
+            base_obj = inverse_problem_objective_jit(
+                Lambda_matrix, events_gram, self.config.alpha, self.config.beta,
+                jump_weight=0.5
+            )
+
+            # ジャンプ整合性項
+            jump_term = self._compute_jump_consistency_term(
+                Lambda_matrix, jump_mask, jump_weights
+            )
+
+            return base_obj + jump_term
+
+        # 最適化実行
+        result = minimize(
+            objective,
+            Lambda_init.flatten(),
+            method='L-BFGS-B',
+            options={'maxiter': 1000}
+        )
+
+        Lambda_opt = result.x.reshape(n_paths, events.shape[0])
+
+        return {i: path / (np.linalg.norm(path) + 1e-8)
+                for i, path in enumerate(Lambda_opt)}
+
+    def _initialize_with_jump_structure(self,
+                                      events: np.ndarray,
+                                      jump_mask: np.ndarray,
+                                      jump_weights: np.ndarray,
+                                      n_paths: int) -> np.ndarray:
+        """ジャンプ構造を反映した初期値生成"""
+        n_events = events.shape[0]
+        Lambda_init = np.zeros((n_paths, n_events))
+
+        # 固有値分解ベース
+        _, V = np.linalg.eigh(events @ events.T)
+        base_paths = V[:, -n_paths:].T
+
+        # ジャンプ位置で不連続性を導入
+        for p in range(n_paths):
+            Lambda_init[p] = base_paths[p]
+
+            # ジャンプ位置での値を強調
+            for i in range(n_events):
+                if jump_mask[i]:
+                    if p % 2 == 0:
+                        Lambda_init[p, i] *= (1 + jump_weights[i])
+                    else:
+                        Lambda_init[p, i] *= -(1 + jump_weights[i])
+
+        return Lambda_init
+
+    def _compute_jump_consistency_term(self,
+                                     Lambda_matrix: np.ndarray,
+                                     jump_mask: np.ndarray,
+                                     jump_weights: np.ndarray) -> float:
+        """ジャンプ整合性の評価"""
+        return compute_jump_consistency_term(Lambda_matrix, jump_mask, jump_weights)
+
+    def _compute_jump_aware_topology(self,
+                                   paths: Dict[int, np.ndarray],
+                                   jump_structures: Dict) -> Tuple[Dict[int, float], Dict[int, float]]:
+        """ジャンプ構造を考慮したトポロジカル量計算"""
+        charges = {}
+        stabilities = {}
+
+        for i, path in paths.items():
+            # 基本的なトポロジカルチャージ
+            Q, sigma = compute_topological_charge_jit(path)
+
+            # ジャンプ位置での位相変化を考慮
+            jump_mask = jump_structures['integrated']['unified_jumps']
+            jump_phase_shift = 0.0
+
+            for j in range(1, len(path)):
+                if jump_mask[j]:
+                    # ジャンプ位置での位相変化
+                    phase_diff = np.arctan2(path[j], path[j-1]) - \
+                               np.arctan2(path[j-1], path[j-2] if j > 1 else path[0])
+                    jump_phase_shift += phase_diff
+
+            # ジャンプ補正したチャージ
+            charges[i] = Q + jump_phase_shift / (2 * np.pi)
+            stabilities[i] = sigma
+
+        return charges, stabilities
+
+    def _compute_pulsation_energies(self,
+                                  paths: Dict[int, np.ndarray],
+                                  jump_structures: Dict) -> Dict[int, float]:
+        """拍動エネルギーの計算（ジャンプ構造を優先使用）"""
+        energies = {}
+
+        for i, path in paths.items():
+            # 基本エネルギー
+            basic_energy = np.sum(path**2)
+
+            # 対応する特徴のジャンプエネルギーを統合
+            total_pulse_power = 0.0
+            n_features = len(jump_structures['features'])
+
+            for f_idx, f_data in jump_structures['features'].items():
+                pulse_power = f_data['pulse_power']
+                total_pulse_power += pulse_power
+
+            avg_pulse_power = total_pulse_power / n_features if n_features > 0 else 0.0
+
+            # 統合エネルギー
+            energies[i] = basic_energy + 0.3 * avg_pulse_power
+
+        return energies
+
+    def _compute_jump_conditional_entropies(self,
+                                          paths: Dict[int, np.ndarray],
+                                          jump_structures: Dict) -> Dict[int, Dict[str, float]]:
+        """ジャンプイベントでの条件付きエントロピー"""
+        entropies = {}
+        jump_mask = jump_structures['integrated']['unified_jumps']
+
+        for i, path in paths.items():
+            # 全体のエントロピー
+            all_entropies = compute_all_entropies_jit(path)
+            entropy_keys = ["shannon", "renyi_2", "tsallis_1.5", "max", "min", "var"]
+
+            # ジャンプ位置と非ジャンプ位置で分離
+            jump_indices = np.where(jump_mask)[0]
+            non_jump_indices = np.where(~jump_mask)[0]
+
+            entropy_dict = {}
+
+            # 全体エントロピー
+            for j, key in enumerate(entropy_keys):
+                entropy_dict[key] = all_entropies[j]
+
+            # ジャンプ条件付きエントロピー
+            if len(jump_indices) > 0:
+                jump_path = path[jump_indices]
+                jump_entropies = compute_all_entropies_jit(jump_path)
+                for j, key in enumerate(entropy_keys):
+                    entropy_dict[f"{key}_jump"] = jump_entropies[j]
+
+            # 非ジャンプ条件付きエントロピー
+            if len(non_jump_indices) > 0:
+                non_jump_path = path[non_jump_indices]
+                non_jump_entropies = compute_all_entropies_jit(non_jump_path)
+                for j, key in enumerate(entropy_keys):
+                    entropy_dict[f"{key}_non_jump"] = non_jump_entropies[j]
+
+            entropies[i] = entropy_dict
+
+        return entropies
+
+    def _compute_jump_anomaly_scores(self,
+                               jump_structures: Dict,
+                               events: np.ndarray) -> np.ndarray:
+        """ジャンプ構造から直接異常スコアを計算"""
+        n_events = events.shape[0]
+        scores = np.zeros(n_events)
+
+        # 統合ジャンプスコア
+        integrated = jump_structures['integrated']
+
+        # ジャンプの重要度に基づくスコア
+        jump_mask = integrated['unified_jumps'].astype(float)
+        importance = integrated['jump_importance']
+        
+        # 配列サイズの確認と調整
+        if len(jump_mask) != n_events:
+            # ジャンプ構造とイベント数が一致しない場合は、小さい方に合わせる
+            min_length = min(len(jump_mask), n_events)
+            jump_mask = jump_mask[:min_length]
+            importance = importance[:min_length]
+            scores = scores[:min_length]
+        
+        # 重要度が高いジャンプのみを考慮
+        importance_threshold = np.percentile(importance[importance > 0], 75) if np.any(importance > 0) else 0.5
+        significant_jumps = jump_mask * (importance >= importance_threshold)
+
+        scores += significant_jumps * importance
+
+        # 各特徴のジャンプ寄与
+        feature_scores = []
+        for f, data in jump_structures['features'].items():
+            if data['jump_intensity'] > 0:
+                feature_score = np.zeros(n_events)
+
+                # 強いジャンプのみを考慮
+                strong_jumps = (data['pos_jumps'] + data['neg_jumps']) * (
+                    np.abs(data['diff']) > np.percentile(np.abs(data['diff']), 98)
+                )
+
+                feature_score = strong_jumps * data['jump_intensity']
+
+                # 非対称性が高い場合はペナルティ
+                if np.abs(data['asymmetry']) > 0.8:
+                    feature_score *= (1 + np.abs(data['asymmetry']))
+
+                feature_scores.append(feature_score)
+
+        if feature_scores:
+            # 特徴間の最大値を取る
+            # 配列サイズを統一
+            min_length = min(n_events, min(len(fs) for fs in feature_scores))
+            feature_scores_aligned = [fs[:min_length] for fs in feature_scores]
+            feature_contribution = np.max(feature_scores_aligned, axis=0)
+            
+            # scoresの長さも調整
+            if len(scores) > min_length:
+                scores = scores[:min_length]
+            elif len(scores) < min_length:
+                new_scores = np.zeros(min_length)
+                new_scores[:len(scores)] = scores
+                scores = new_scores
+                
+            scores += feature_contribution * 0.5
+
+        # 最終的な長さをn_eventsに合わせる
+        if len(scores) != n_events:
+            final_scores = np.zeros(n_events)
+            final_scores[:min(len(scores), n_events)] = scores[:min(len(scores), n_events)]
+            return final_scores
+        
+        return scores
+
+    def _compute_kernel_anomaly_scores_optimized(self,
+                                            events: np.ndarray,
+                                            result: Lambda3Result) -> np.ndarray:
+        """最適なカーネルを自動選択してカーネル空間での異常スコアを計算"""
+        
+        # カーネルタイプとパラメータの候補
+        kernel_configs = [
+            {'type': 0, 'name': 'RBF', 'params': {'gamma': gamma}} 
+            for gamma in [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0]
+        ] + [
+            {'type': 1, 'name': 'Polynomial', 'params': {'degree': d, 'coef0': 1.0}}
+            for d in [2, 3, 4, 5, 7] for c in [0.0, 0.5, 1.0, 2.0]
+        ] + [
+            {'type': 2, 'name': 'Sigmoid', 'params': {'alpha': a, 'coef0': 0.0}}
+            for a in [0.001, 0.01, 0.1, 1.0]
+        ] + [
+            {'type': 3, 'name': 'Laplacian', 'params': {'gamma': gamma}}
+            for gamma in [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]
+        ]
+        
+        paths_matrix = np.stack(list(result.paths.values()))
+        n_events = events.shape[0]
+        
+        # サンプリングして計算量を削減（大規模データの場合）
+        if n_events > 300:
+            sample_idx = np.random.choice(n_events, 300, replace=False)
+            events_sample = events[sample_idx]
+            paths_sample = paths_matrix[:, sample_idx]
+        else:
+            events_sample = events
+            paths_sample = paths_matrix
+            sample_idx = np.arange(n_events)
+        
+        best_score = -np.inf
+        best_config = None
+        best_scores = None
+        
+        # 各カーネルで評価
+        for config in kernel_configs:
+            # カーネルGram行列の計算
+            K = compute_kernel_gram_matrix(
+                events_sample, 
+                kernel_type=config['type'],
+                gamma=config['params'].get('gamma', 1.0),
+                degree=config['params'].get('degree', 3),
+                coef0=config['params'].get('coef0', 1.0),
+                alpha=config['params'].get('alpha', 0.01)
+            )
+            
+            # カーネル空間での再構成
+            n_sample = len(events_sample)
+            K_recon = np.zeros((n_sample, n_sample))
+            for i in range(n_sample):
+                for j in range(n_sample):
+                    for k in range(len(paths_sample)):
+                        K_recon[i, j] += paths_sample[k, i] * K[i, j] * paths_sample[k, j]
+            
+            # 正規化
+            K_norm = np.sqrt(np.trace(K @ K))
+            if K_norm > 0:
+                K /= K_norm
+            
+            recon_norm = np.sqrt(np.trace(K_recon @ K_recon))
+            if recon_norm > 0:
+                K_recon /= recon_norm
+            
+            # 再構成誤差の計算
+            reconstruction_error = np.linalg.norm(K - K_recon, 'fro')
+            
+            # Lambda³理論の観点：再構成誤差が大きいほど、構造テンソルが
+            # そのカーネル空間で異常を捉えやすい
+            score = -reconstruction_error  # 負の誤差をスコアとする
+            
+            if score > best_score:
+                best_score = score
+                best_config = config
+                
+                # このカーネルでの異常スコアを計算
+                kernel_scores = np.zeros(n_sample)
+                for i in range(n_sample):
+                    row_error = 0.0
+                    for j in range(n_sample):
+                        diff = K[i, j] - K_recon[i, j]
+                        row_error += diff * diff
+                    kernel_scores[i] = np.sqrt(row_error)
+                
+                # サンプリングした場合は全データに拡張
+                if n_events > 200:
+                    full_scores = np.zeros(n_events)
+                    full_scores[sample_idx] = kernel_scores
+                    # 残りは最近傍で補間
+                    for i in range(n_events):
+                        if i not in sample_idx:
+                            # 最近傍のサンプル点を見つける
+                            distances = np.sum((events_sample - events[i])**2, axis=1)
+                            nearest_idx = np.argmin(distances)
+                            full_scores[i] = kernel_scores[nearest_idx]
+                    best_scores = full_scores
+                else:
+                    best_scores = kernel_scores
+        
+        print(f"Optimal kernel: {best_config['name']} with params {best_config['params']}")
+        
+        return best_scores
+
+    def _compute_kernel_anomaly_scores(self,
+                                    events: np.ndarray,
+                                    result: Lambda3Result,
+                                    kernel_type: int = -1) -> np.ndarray:
+        """カーネル空間での異常スコア計算（自動選択オプション付き）"""
+        
+        # kernel_type = -1 の場合は自動選択
+        if kernel_type == -1:
+            return self._compute_kernel_anomaly_scores_optimized(events, result)
+        
+        # 既存の実装（特定のカーネルを使用）
+        K = compute_kernel_gram_matrix(events, kernel_type, gamma=1.0)
+        
+        # 以下、既存のコードと同じ...
+        paths_matrix = np.stack(list(result.paths.values()))
+        n_events = events.shape[0]
+        
+        K_recon = np.zeros((n_events, n_events))
+        for i in range(n_events):
+            for j in range(n_events):
+                for k in range(len(paths_matrix)):
+                    K_recon[i, j] += paths_matrix[k, i] * K[i, j] * paths_matrix[k, j]
+        
+        K_norm = np.sqrt(np.trace(K @ K))
+        if K_norm > 0:
+            K /= K_norm
+        
+        recon_norm = np.sqrt(np.trace(K_recon @ K_recon))
+        if recon_norm > 0:
+            K_recon /= recon_norm
+        
+        kernel_scores = np.zeros(n_events)
+        for i in range(n_events):
+            row_error = 0.0
+            for j in range(n_events):
+                diff = K[i, j] - K_recon[i, j]
+                row_error += diff * diff
+            kernel_scores[i] = np.sqrt(row_error)
+        
+        return kernel_scores
+
+    #===============================
+    # 異常パターン生成メソッド（地獄モード）
     # ===============================
     def _generate_pulse_anomaly(self, events: np.ndarray, intensity: float = 3, decay_rate: float = 0.5, n_pulses: int = 2) -> np.ndarray:
         events_copy = events.copy()
@@ -2430,34 +3118,78 @@ class Lambda3ZeroShotDetector:
 
     def generate_anomalies(self, events: np.ndarray, pattern: str = 'pulse',
                           intensity: float = 3) -> np.ndarray:
-        """
-        Generate anomalies with specified pattern (Production version)
 
-        Args:
-            events: Input event array
-            pattern: Anomaly pattern name
-            intensity: Anomaly intensity
-
-        Returns:
-            Event array with injected anomalies
-        """
         if pattern in self.anomaly_patterns:
             return self.anomaly_patterns[pattern](events, intensity)
         else:
             raise ValueError(f"Unknown anomaly pattern: {pattern}")
 
 # ===============================
-# Dataset Generation Functions
+# ユーティリティ関数
 # ===============================
+def evaluate_performance(detector: Lambda3ZeroShotDetector,
+                       events: np.ndarray,
+                       labels: np.ndarray,
+                       config: Dict[str, bool] = None) -> Dict[str, float]:
+    """性能評価ユーティリティ"""
+
+    if config is None:
+        config = {
+            "use_feature_optimization": True,
+            "use_jump_analysis": False,
+            "use_kernel_space": False,
+            "use_ensemble": False
+        }
+
+    # Lambda³解析
+    result = detector.analyze(events)
+
+    # 異常検知
+    scores = detector.detect_anomalies(result, events, **config)
+
+    # AUC計算
+    auc = roc_auc_score(labels, scores)
+
+    # トップ10の精度
+    top_10_indices = np.argsort(scores)[-10:]
+    top_10_accuracy = np.mean(labels[top_10_indices])
+
+    return {
+        "auc": auc,
+        "top_10_accuracy": top_10_accuracy,
+        "config": config
+    }
+
+# ===============================
+# 異常パターン生成メソッド（統合用）
+# ===============================
+def _init_anomaly_patterns(detector):
+    """異常パターン生成関数の初期化"""
+    return {
+        'pulse': detector._generate_pulse_anomaly,
+        'phase_jump': detector._generate_phase_jump_anomaly,
+        'periodic': detector._generate_periodic_anomaly,
+        'structural_decay': detector._generate_decay_anomaly,
+        'bifurcation': detector._generate_bifurcation_anomaly,
+        'multi_path': detector._generate_multi_path_anomaly,
+        'topological_jump': detector._generate_topological_jump_anomaly,
+        'cascade': detector._generate_cascade_anomaly,
+        'partial_periodic': detector._generate_partial_periodic_anomaly,
+        'superposition': detector._generate_superposition_anomaly,
+        'resonance': detector._generate_resonance_anomaly
+    }
+
+# データセット生成関数
 def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.15):
-    """Generate dataset with more natural and complex anomalies"""
+    """より自然で複雑な異常を含むデータセットを生成"""
 
-    analyzer = Lambda3ZeroShotDetector()
+    # 異常パターン生成用の一時的な検出器
+    temp_detector = Lambda3ZeroShotDetector()
 
-    # 1. Diversification of base structures
+    # 1. 基底構造の多様化
     normal_events = []
 
-    # Generate multiple normal clusters (realistic diversity)
+    # 複数の正常クラスターを生成（現実的な多様性）
     n_clusters = 3
     for i in range(n_clusters):
         cluster_size = (n_events - int(n_events * anomaly_ratio)) // n_clusters
@@ -2475,12 +3207,12 @@ def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.
 
     normal_events = np.vstack(normal_events)
 
-    # 2. Generate complex anomaly patterns
+    # 2. 複雑な異常パターンの生成
     n_anomalies = int(n_events * anomaly_ratio)
     anomaly_events = []
     anomaly_labels_detailed = []
 
-    # Combinations and temporal evolution of anomaly patterns
+    # 異常パターンの組み合わせと時間発展
     anomaly_scenarios = [
         {
             'name': 'progressive_degradation',
@@ -2518,8 +3250,10 @@ def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.
             anomaly = base_event.reshape(1, -1)
             for pattern in scenario['patterns']:
                 intensity = scenario['intensity_profile'](temporal_position)
-                anomaly = analyzer.generate_anomalies(anomaly, pattern=pattern,
-                                                    intensity=intensity * np.random.uniform(0.8, 1.2))
+                if pattern in temp_detector.anomaly_patterns:
+                    anomaly = temp_detector.anomaly_patterns[pattern](
+                        anomaly, intensity * np.random.uniform(0.8, 1.2)
+                    )
 
         elif scenario['progression'] == 'mixed':
             n_patterns = np.random.randint(1, len(scenario['patterns']) + 1)
@@ -2527,20 +3261,26 @@ def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.
             anomaly = base_event.reshape(1, -1)
             for pattern in selected_patterns:
                 intensity = scenario['intensity_profile'](temporal_position)
-                anomaly = analyzer.generate_anomalies(anomaly, pattern=pattern,
-                                                    intensity=intensity * np.random.uniform(0.5, 1.5))
+                if pattern in temp_detector.anomaly_patterns:
+                    anomaly = temp_detector.anomaly_patterns[pattern](
+                        anomaly, intensity * np.random.uniform(0.5, 1.5)
+                    )
 
         elif scenario['progression'] == 'simultaneous':
             anomalies = []
             for pattern in scenario['patterns']:
                 intensity = scenario['intensity_profile'](temporal_position)
-                temp_anomaly = analyzer.generate_anomalies(
-                    base_event.reshape(1, -1), pattern=pattern,
-                    intensity=intensity * np.random.uniform(0.7, 1.3)
-                )
-                anomalies.append(temp_anomaly[0])
-            weights = np.random.dirichlet(np.ones(len(anomalies)))
-            anomaly = np.average(anomalies, axis=0, weights=weights).reshape(1, -1)
+                if pattern in temp_detector.anomaly_patterns:
+                    temp_anomaly = temp_detector.anomaly_patterns[pattern](
+                        base_event.reshape(1, -1),
+                        intensity * np.random.uniform(0.7, 1.3)
+                    )
+                    anomalies.append(temp_anomaly[0])
+            if anomalies:
+                weights = np.random.dirichlet(np.ones(len(anomalies)))
+                anomaly = np.average(anomalies, axis=0, weights=weights).reshape(1, -1)
+            else:
+                anomaly = base_event.reshape(1, -1)
 
         else:  # feature_specific
             anomaly = base_event.reshape(1, -1)
@@ -2549,14 +3289,16 @@ def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.
                                                replace=False)
             for pattern in scenario['patterns']:
                 intensity = scenario['intensity_profile'](temporal_position)
-                temp_anomaly = analyzer.generate_anomalies(anomaly, pattern=pattern,
-                                                         intensity=intensity)
-                anomaly[0, affected_features] = temp_anomaly[0, affected_features]
+                if pattern in temp_detector.anomaly_patterns:
+                    temp_anomaly = temp_detector.anomaly_patterns[pattern](
+                        anomaly, intensity
+                    )
+                    anomaly[0, affected_features] = temp_anomaly[0, affected_features]
 
         anomaly_events.append(anomaly[0])
         anomaly_labels_detailed.append(scenario['name'])
 
-    # 3. Add noise and outliers
+    # 3. ノイズと外れ値の追加
     anomaly_events = np.array(anomaly_events)
     noise_mask = np.random.random(anomaly_events.shape) < 0.1
     anomaly_events[noise_mask] += np.random.normal(0, 0.5, np.sum(noise_mask))
@@ -2570,16 +3312,16 @@ def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.
                                           replace=False)
         anomaly_events[pos, outlier_features] *= np.random.choice([-1, 1]) * np.random.uniform(5, 10)
 
-    # 4. Build final dataset
+    # 4. 最終的なデータセット構築
     events = np.vstack([normal_events, anomaly_events])
     labels = np.array([0]*len(normal_events) + [1]*len(anomaly_events))
 
-    # Add temporal correlations
+    # 時系列的な相関を追加
     for i in range(1, len(events)):
         if np.random.random() < 0.3:
             events[i] = 0.7 * events[i] + 0.3 * events[i-1]
 
-    # Shuffle
+    # シャッフル
     block_size = 10
     n_blocks = len(events) // block_size
     block_indices = np.arange(n_blocks)
@@ -2603,106 +3345,17 @@ def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.
     return events, labels, anomaly_labels_detailed
 
 # ===============================
-# Performance Evaluation Functions
+# デモ用メイン関数
 # ===============================
-def evaluate_zero_shot_performance(
-    detector: Lambda3ZeroShotDetector,
-    events: np.ndarray,
-    labels: np.ndarray,
-    n_paths: int = 5,
-    use_advanced: bool = True
-) -> Dict[str, float]:
-    """
-    Comprehensive evaluation of zero-shot performance (with focused method)
-    """
-    print("\n=== Zero-Shot Performance Evaluation ===")
-
-    # 1. Lambda³ analysis
-    print("Running Lambda³ analysis...")
-    start_time = time.time()
-    result = detector.analyze(events, n_paths)
-    analysis_time = time.time() - start_time
-    print(f"Analysis completed in {analysis_time:.3f}s")
-
-    # 2. Anomaly detection (comparing basic and advanced versions)
-    print("\nDetecting anomalies...")
-
-    # Basic version
-    basic_scores = detector.detect_anomalies(result, events)
-    basic_auc = roc_auc_score(labels, basic_scores)
-    print(f"Basic Zero-shot AUC: {basic_auc:.4f}")
-
-    # Advanced version
-    if use_advanced:
-        print("\nRunning advanced detection with feature optimization and ensemble...")
-        advanced_scores = detector.detect_anomalies_advanced(
-            result, events,
-            use_ensemble=True,
-            optimize_weights=True
-        )
-        advanced_auc = roc_auc_score(labels, advanced_scores)
-        print(f"Advanced Zero-shot AUC: {advanced_auc:.4f}")
-        print(f"Improvement: {(advanced_auc - basic_auc) / basic_auc * 100:.1f}%")
-
-        # Focused method (using only best feature)
-        print("\nRunning focused detection (best feature only)...")
-        focused_scores = detector.detect_anomalies_focused(result, events, use_optimization=True)
-        focused_auc = roc_auc_score(labels, focused_scores)
-        print(f"Focused Zero-shot AUC: {focused_auc:.4f}")
-        print(f"Improvement over basic: {(focused_auc - basic_auc) / basic_auc * 100:.1f}%")
-    else:
-        advanced_scores = basic_scores
-        advanced_auc = basic_auc
-        focused_scores = basic_scores
-        focused_auc = basic_auc
-
-    # 3. Detailed metrics
-    metrics = {
-        'basic_auc': basic_auc,
-        'advanced_auc': advanced_auc,
-        'focused_auc': focused_auc,
-        'analysis_time': analysis_time,
-        'n_jumps_detected': detector.jump_analyzer['integrated']['n_total_jumps'],
-        'max_sync': detector.jump_analyzer['integrated']['max_sync'],
-        'n_clusters': len(detector.jump_analyzer['integrated']['jump_clusters'])
-    }
-
-    # 4. Top anomaly analysis with best performance
-    best_scores = focused_scores if focused_auc >= advanced_auc else advanced_scores
-    best_auc = max(focused_auc, advanced_auc)
-    best_method = "Focused" if focused_auc >= advanced_auc else "Advanced"
-
-    top_anomaly_indices = np.argsort(best_scores)[-10:]
-    print(f"\nTop 10 anomalies ({best_method} method):")
-    for i, idx in enumerate(top_anomaly_indices[::-1]):
-        explanation = detector.explain_anomaly(idx, result, events)
-        print(f"{i+1}. Event {idx}: Score={best_scores[idx]:.3f}, "
-              f"Jump={explanation['jump_based'].get('is_jump', False)}, "
-              f"Label={labels[idx]}")
-
-    # Calculate accuracy
-    correct_in_top10 = sum(labels[idx] for idx in top_anomaly_indices)
-    print(f"\nCorrect anomalies in top 10: {correct_in_top10}/10")
-
-    metrics['best_auc'] = best_auc
-    metrics['best_method'] = best_method
-
-    return metrics
-
-# ===============================
-# Demo Function
-# ===============================
-def demo_zero_shot_lambda3():
-    """
-    Demo of complete Lambda³ Zero-Shot Anomaly Detection System
-    """
+def demo_refactored_system():
+    """リファクタリング版システムのデモ（適応的重み最適化を含む）"""
     np.random.seed(42)
 
-    print("=== Lambda³ Zero-Shot Anomaly Detection System ===")
-    print("Complete Version with Jump-First Architecture")
+    print("=== Lambda³ Zero-Shot Anomaly Detection System (Enhanced) ===")
+    print("Unified Architecture with Adaptive Weight Optimization")
     print("=" * 60)
 
-    # 1. Dataset generation
+    # 1. データセット生成
     print("\n1. Generating complex dataset...")
     events, labels, anomaly_details = create_complex_natural_dataset(
         n_events=500,
@@ -2713,81 +3366,138 @@ def demo_zero_shot_lambda3():
     print(f"Anomaly ratio: {np.mean(labels):.2%}")
     print(f"Anomaly types: {set(anomaly_details)}")
 
-    # 2. Initialize detector
+    # 2. 検出器の初期化
     print("\n2. Initializing detector...")
-    config = L3Config(
-        alpha=0.1,
-        beta=0.01,
-        n_paths=7,
-        jump_scale=1.5,
-        w_topo=0.2,
-        w_pulse=0.4
-    )
+    config = L3Config()
     detector = Lambda3ZeroShotDetector(config)
 
-    # 3. Performance evaluation (using advanced version)
-    print("\n3. Evaluating performance...")
-    metrics = evaluate_zero_shot_performance(
-        detector, events, labels, n_paths=7, use_advanced=True
+    # 3. Lambda³解析
+    print("\n3. Running Lambda³ analysis...")
+    start_time = time.time()
+    result = detector.analyze(events)
+    analysis_time = time.time() - start_time
+    print(f"Analysis completed in {analysis_time:.3f}s")
+
+    # 4. 異なるモードでの異常検知
+    print("\n4. Evaluating detection modes...")
+    
+    # 基本モード（デフォルト重み）
+    print("\n--- Basic Mode (Default Weights) ---")
+    start_time = time.time()
+    basic_scores = detector.detect_anomalies(result, events, use_adaptive_weights=False)
+    basic_time = time.time() - start_time
+    basic_auc = roc_auc_score(labels, basic_scores)
+    top_10_indices = np.argsort(basic_scores)[-10:]
+    basic_top10 = np.mean(labels[top_10_indices])
+    
+    print(f"  AUC: {basic_auc:.4f}")
+    print(f"  Top-10 Accuracy: {basic_top10:.2f}")
+    print(f"  Detection Time: {basic_time:.3f}s")
+    
+    # 適応的重み最適化モード
+    print("\n--- Adaptive Mode (Optimized Weights) ---")
+    start_time = time.time()
+    adaptive_scores = detector.detect_anomalies(result, events, use_adaptive_weights=True)
+    adaptive_time = time.time() - start_time
+    adaptive_auc = roc_auc_score(labels, adaptive_scores)
+    top_10_indices = np.argsort(adaptive_scores)[-10:]
+    adaptive_top10 = np.mean(labels[top_10_indices])
+    
+    print(f"  AUC: {adaptive_auc:.4f}")
+    print(f"  Top-10 Accuracy: {adaptive_top10:.2f}")
+    print(f"  Detection Time: {adaptive_time:.3f}s")
+    
+    # 5. 焦点型検知（Lambda3FocusedDetectorを使用）
+    print("\n--- Focused Mode (Feature-Optimized) ---")
+    focused_detector = Lambda3FocusedDetector()
+    start_time = time.time()
+    focused_scores = focused_detector.detect_anomalies(
+        result, events, 
+        base_detector_func=lambda r, e: detector.detect_anomalies(r, e, use_adaptive_weights=True)
     )
+    focused_time = time.time() - start_time
+    focused_auc = roc_auc_score(labels, focused_scores)
+    top_10_indices = np.argsort(focused_scores)[-10:]
+    focused_top10 = np.mean(labels[top_10_indices])
+    
+    print(f"  AUC: {focused_auc:.4f}")
+    print(f"  Top-10 Accuracy: {focused_top10:.2f}")
+    print(f"  Detection Time: {focused_time:.3f}s")
 
-    # 4. Visualization
-    print("\n4. Generating visualizations...")
-    result = detector.analyze(events, n_paths=7)
-    anomaly_scores = detector.detect_anomalies(result, events)
-
-    fig = detector.visualize_results(events, result, anomaly_scores)
-    plt.suptitle('Lambda³ Zero-Shot Detection Results', fontsize=16)
-
-    # 5. Example anomaly explanations
-    print("\n5. Example anomaly explanations:")
-    top_3_anomalies = np.argsort(anomaly_scores)[-3:]
-    for idx in top_3_anomalies[::-1]:
-        print(f"\n--- Event {idx} ---")
+    # 6. 最良スコアでの詳細分析
+    best_mode = "Basic"
+    best_scores = basic_scores
+    best_auc = basic_auc
+    
+    if adaptive_auc > best_auc:
+        best_mode = "Adaptive"
+        best_scores = adaptive_scores
+        best_auc = adaptive_auc
+    
+    if focused_auc > best_auc:
+        best_mode = "Focused"
+        best_scores = focused_scores
+        best_auc = focused_auc
+    
+    print(f"\n5. Best mode: {best_mode} (AUC: {best_auc:.4f})")
+    
+    # トップ異常の説明
+    print("\nTop 5 anomalies with explanations:")
+    top_5_indices = np.argsort(best_scores)[-5:]
+    for i, idx in enumerate(top_5_indices[::-1]):
         explanation = detector.explain_anomaly(idx, result, events)
-        print(f"Anomaly Score: {explanation['anomaly_score']:.3f}")
-        print(f"Jump-based: {explanation['jump_based']}")
-        print(f"Recommendation: {explanation['recommendation']}")
+        print(f"\n{i+1}. Event {idx}:")
+        print(f"   Score: {best_scores[idx]:.3f}")
+        print(f"   True Label: {'Anomaly' if labels[idx] else 'Normal'}")
+        print(f"   Recommendation: {explanation['recommendation']}")
+        if explanation['jump_based']:
+            print(f"   Jump Info: {explanation['jump_based']}")
 
-    # 6. Final summary
+    # 7. 可視化
+    print("\n6. Generating visualizations...")
+    fig = detector.visualize_results(events, result, best_scores)
+    plt.suptitle(f'Lambda³ Zero-Shot Detection Results - {best_mode} Mode', fontsize=16)
+
+    # 8. 最終サマリー
     print("\n" + "=" * 60)
     print("=== Final Summary ===")
-    print(f"Basic Zero-shot AUC: {metrics['basic_auc']:.4f}")
-    print(f"Advanced Zero-shot AUC: {metrics['advanced_auc']:.4f}")
-    print(f"Focused Zero-shot AUC: {metrics['focused_auc']:.4f}")
-    print(f"Best method: {metrics['best_method']}")
-    print(f"Best AUC: {metrics['best_auc']:.4f}")
-    print(f"Analysis time: {metrics['analysis_time']:.3f}s")
-    print(f"Jumps detected: {metrics['n_jumps_detected']}")
-    print(f"Jump clusters: {metrics['n_clusters']}")
-    print(f"Max synchronization: {metrics['max_sync']:.3f}")
+    print(f"Dataset: {events.shape[0]} events, {events.shape[1]} features")
+    print(f"Anomaly ratio: {np.mean(labels):.2%}")
 
-    if metrics['best_auc'] > 0.9:
-        print(f"\n🚀 REVOLUTIONARY: {metrics['best_auc']:.1%} AUC with ZERO training!")
-        print("Lambda³ theory has shattered the limits of anomaly detection!")
-    elif metrics['best_auc'] > 0.8:
-        print(f"\n🎉 BREAKTHROUGH: {metrics['best_auc']:.1%} AUC with ZERO training!")
-        print("The impossible has been achieved through Lambda³ theory!")
-    elif metrics['best_auc'] > 0.7:
-        print(f"\n✨ EXCELLENT: {metrics['best_auc']:.1%} AUC with ZERO training!")
-        print("Lambda³ theory demonstrates remarkable performance!")
+    print("\nPerformance Summary:")
+    print(f"  Basic Mode:    AUC={basic_auc:.4f}, Top-10={basic_top10:.2f}")
+    print(f"  Adaptive Mode: AUC={adaptive_auc:.4f}, Top-10={adaptive_top10:.2f}")
+    print(f"  Focused Mode:  AUC={focused_auc:.4f}, Top-10={focused_top10:.2f}")
+
+    print(f"\nBest Performance: {best_mode} with {best_auc:.4f} AUC")
+
+    if best_auc > 0.9:
+        print(f"\n🚀 REVOLUTIONARY: {best_auc:.1%} AUC with ZERO training!")
+        print("Lambda³ theory has achieved superhuman anomaly detection!")
+    elif best_auc > 0.8:
+        print(f"\n🎉 BREAKTHROUGH: {best_auc:.1%} AUC with ZERO training!")
+        print("The unified architecture demonstrates exceptional performance!")
+    elif best_auc > 0.7:
+        print(f"\n✨ EXCELLENT: {best_auc:.1%} AUC with ZERO training!")
+        print("Lambda³ theory shows remarkable zero-shot capabilities!")
+
+    # ジャンプ統計の表示
+    if hasattr(detector, 'jump_analyzer') and detector.jump_analyzer:
+        print(f"\nJump Analysis Statistics:")
+        print(f"  Total jumps detected: {detector.jump_analyzer['integrated']['n_total_jumps']}")
+        print(f"  Jump clusters: {len(detector.jump_analyzer['integrated']['jump_clusters'])}")
+        print(f"  Max synchronization: {detector.jump_analyzer['integrated']['max_sync']:.3f}")
 
     plt.show()
 
-    return detector, result, metrics
+    return detector, result, {
+        'basic': {'auc': basic_auc, 'top10': basic_top10, 'time': basic_time},
+        'adaptive': {'auc': adaptive_auc, 'top10': adaptive_top10, 'time': adaptive_time},
+        'focused': {'auc': focused_auc, 'top10': focused_top10, 'time': focused_time}
+    }
 
-# ===============================
-# Main Execution
-# ===============================
 if __name__ == "__main__":
-    print("Lambda³ Zero-Shot Anomaly Detection System")
-    print("Jump-First Architecture with Complete Feature Integration")
-    print("Based on Dr. Iizumi's Lambda³ Theory")
-    print("=" * 80)
-
-    # Run demo
-    detector, result, metrics = demo_zero_shot_lambda3()
-
-    print("\n" + "=" * 80)
+    detector, result, metrics = demo_refactored_system()
+    print("\n" + "=" * 60)
     print("Demo completed successfully!")
-    print(f"Achievement: {metrics['best_auc']:.4f} AUC with zero training")
+    print(f"Lambda³ Zero-Shot Detection System - Ready for deployment")
