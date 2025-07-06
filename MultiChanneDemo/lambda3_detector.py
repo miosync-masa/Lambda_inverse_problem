@@ -18,7 +18,6 @@ import numba
 from numba import cuda, jit, njit, prange
 from numba.typed import Dict as NumbaDict
 import numpy as np
-from scipy.decomposition import PCA
 from scipy.manifold import TSNE
 from scipy.optimize import differential_evolution, minimize
 from scipy.signal import hilbert
