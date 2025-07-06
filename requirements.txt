@@ -1,24 +1,28 @@
+# ===============================
 # Core dependencies
+# ===============================
 numpy>=1.21.0
 numba>=0.56.0
 scikit-learn>=1.0.0
 scipy>=1.7.0
 matplotlib>=3.4.0
+networkx>=2.6.0
 
-# Data processing
+# Data processing & I/O
 pandas>=1.3.0
 
-# Type hints and dataclasses (for older Python versions)
+# Type hints and dataclasses (for Python < 3.7)
 typing-extensions>=4.0.0
 dataclasses>=0.6; python_version < '3.7'
 
-# Optional dependencies for enhanced performance
-# Uncomment if needed:
-# cupy>=10.0.0  # For GPU acceleration
-# joblib>=1.1.0  # For parallel processing
+# Optional: GPU acceleration (only if using Numba/CUDA)
+cupy>=10.0.0        # Uncomment if using GPU acceleration via CuPy
 
-# Development dependencies (optional)
-# pytest>=6.2.0
-# pytest-cov>=3.0.0
-# black>=22.0.0
-# flake8>=4.0.0
+# Optional: Parallel processing
+joblib>=1.1.0       # Uncomment if batch parallelization outside Numba is required
+
+# Optional: Development/testing (recommended for contributors)
+pytest>=6.2.0
+pytest-cov>=3.0.0
+black>=22.0.0
+flake8>=4.0.0
