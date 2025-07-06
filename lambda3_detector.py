@@ -9,6 +9,7 @@ import pickle
 import time
 import warnings
 from dataclasses import dataclass
+from dataclasses import asdict
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
