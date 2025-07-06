@@ -1321,9 +1321,7 @@ class Lambda3FocusedDetector:
 # ===============================
 class Lambda3ZeroShotDetector:
     """
-    リファクタリング版Lambda³ゼロショット異常検知システム
-    基本：構造テンソル解析 + 特徴量最適化
-    オプション：ジャンプ解析、カーネル空間、アンサンブル
+    Lambda³ゼロショット異常検知システム
     """
 
     def __init__(self, config: L3Config = None):
@@ -1398,7 +1396,7 @@ class Lambda3ZeroShotDetector:
     def detect_anomalies(self, result: Lambda3Result, events: np.ndarray,
                     use_adaptive_weights: bool = False) -> np.ndarray:
         """
-        圧倒的な性能を目指す革命的異常検知
+        異常検知
         """
         n_events = events.shape[0]
         paths_matrix = np.stack(list(result.paths.values()))
@@ -1865,6 +1863,113 @@ class Lambda3ZeroShotDetector:
                 print(f"  {feat}: {weight:.4f}")
         
         return optimal_weights
+
+    
+    def save_results(self, 
+                    result: Lambda3Result,
+                    anomaly_scores: np.ndarray,
+                    events: np.ndarray,
+                    channel_name: str,
+                    save_dir: str = "./lambda3_results",
+                    save_full_result: bool = False,
+                    compress: bool = True) -> Dict[str, str]:
+        """
+        Lambda³解析結果をファイルに保存
+    
+        Args:
+            result: Lambda3Result オブジェクト
+            anomaly_scores: 異常スコア配列
+            events: 元のイベントデータ
+            channel_name: チャンネル名
+            save_dir: 保存ディレクトリ
+            save_full_result: 完全な結果を保存するか（大きくなる可能性）
+            compress: npzで圧縮保存するか
+        
+        Returns:
+                保存したファイルパスの辞書
+        """    
+        # ディレクトリ作成
+        channel_dir = os.path.join(save_dir, channel_name)
+        os.makedirs(channel_dir, exist_ok=True)
+        
+        saved_files = {}
+    
+        # 1. 異常スコアの保存（必須）
+        scores_path = os.path.join(channel_dir, "anomaly_scores.npy")
+        np.save(scores_path, anomaly_scores)
+        saved_files['anomaly_scores'] = scores_path
+    
+        # 2. ジャンプイベントの保存
+        if result.jump_structures:
+            jump_events = result.jump_structures['integrated']['unified_jumps']
+            jump_path = os.path.join(channel_dir, "jump_events.npy")
+            np.save(jump_path, jump_events)
+            saved_files['jump_events'] = jump_path
+        
+        # ジャンプ重要度も保存
+        jump_importance = result.jump_structures['integrated']['jump_importance']
+        importance_path = os.path.join(channel_dir, "jump_importance.npy")
+        np.save(importance_path, jump_importance)
+        saved_files['jump_importance'] = importance_path
+    
+        # 3. 主要な物理量のみ保存（軽量化）
+        physics_data = {
+            'topological_charges': list(result.topological_charges.values()),
+            'stabilities': list(result.stabilities.values()),
+            'energies': list(result.energies.values()),
+            'classifications': result.classifications
+        }
+        physics_path = os.path.join(channel_dir, "physics_quantities.json")
+        with open(physics_path, 'w') as f:
+            json.dump(physics_data, f, indent=2)
+        saved_files['physics_quantities'] = physics_path
+        
+        # 4. メタデータ
+        metadata = {
+            'channel_name': channel_name,
+            'n_events': events.shape[0],
+            'n_features': events.shape[1],
+            'n_paths': len(result.paths),
+            'anomaly_score_stats': {
+                'mean': float(np.mean(anomaly_scores)),
+                'std': float(np.std(anomaly_scores)),
+                'max': float(np.max(anomaly_scores)),
+                'min': float(np.min(anomaly_scores)),
+                'percentile_95': float(np.percentile(anomaly_scores, 95))
+            },
+            'n_jumps': int(np.sum(result.jump_structures['integrated']['unified_jumps'])) 
+                       if result.jump_structures else 0,
+            'config': asdict(self.config)
+        }
+        metadata_path = os.path.join(channel_dir, "metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        saved_files['metadata'] = metadata_path
+        
+        # 5. 完全な結果オブジェクト（オプション、デバッグ用）
+        if save_full_result:
+            # 構造テンソル（パス）も含める
+            paths_dict = {}
+            for i, path in result.paths.items():
+                paths_dict[f'path_{i}'] = path
+            paths_path = os.path.join(channel_dir, "lambda_paths.npz")
+            if compress:
+                np.savez_compressed(paths_path, **paths_dict)
+            else:
+                np.savez(paths_path, **paths_dict)
+            saved_files['lambda_paths'] = paths_path
+            
+            # Pickleで完全保存
+            full_result_path = os.path.join(channel_dir, "full_result.pkl")
+            with open(full_result_path, 'wb') as f:
+                pickle.dump(result, f)
+            saved_files['full_result'] = full_result_path
+        
+        print(f"Saved Lambda³ results for {channel_name} to {channel_dir}")
+        print(f"  - Anomaly scores: shape={anomaly_scores.shape}, mean={metadata['anomaly_score_stats']['mean']:.3f}")
+        print(f"  - Detected jumps: {metadata['n_jumps']}")
+        
+        return saved_files
       
     def explain_anomaly(self, event_idx: int, result: Lambda3Result, events: np.ndarray) -> Dict:
         """異常の物理的説明を生成"""
