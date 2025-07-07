@@ -79,8 +79,20 @@ class MultiChannelDetector:
         """
         print(f"Integrating {len(lambda3_results)} channels using {self.integration_method}")
         
+        # 入力データの確認
+        print("\nInput data check:")
+        for ch, data in lambda3_results.items():
+            if 'scores' in data:
+                scores = data['scores']
+                print(f"  {ch}: shape={scores.shape}, mean={np.mean(scores):.3f}, std={np.std(scores):.3f}")
+            else:
+                print(f"  {ch}: No 'scores' found in data!")
+        
         # 1. データ準備
         anomaly_scores_dict, jump_events_dict = prepare_sync_data(lambda3_results)
+        
+        if not anomaly_scores_dict:
+            raise ValueError("No anomaly scores found in lambda3_results!")
         
         # 2. 同期解析
         print("\nPhase 2: Pairwise synchronization analysis")
@@ -193,12 +205,19 @@ class MultiChannelDetector:
         channels = list(anomaly_scores_dict.keys())
         n_samples = len(next(iter(anomaly_scores_dict.values())))
         
+        print(f"\nWeighted sync integration:")
+        print(f"  Channels: {channels}")
+        print(f"  Samples: {n_samples}")
+        
         # ネットワーク中心性に基づく重み
         centrality = nx.degree_centrality(sync_network)
+        print(f"  Centrality: {centrality}")
         
         # 各チャンネルの寄与度
         channel_contributions = {}
         integrated_scores = np.zeros(n_samples)
+        
+        total_weight_sum = 0.0
         
         for ch_idx, channel in enumerate(channels):
             # 基本重み：中心性
@@ -206,21 +225,37 @@ class MultiChannelDetector:
             
             # 同期強度による調整
             sync_strengths = sync_result.sync_matrix[ch_idx]
-            sync_weight = np.mean(sync_strengths[sync_strengths < 1.0])  # Exclude self
+            # 自己相関（対角成分）を除外
+            non_self_sync = np.concatenate([sync_strengths[:ch_idx], sync_strengths[ch_idx+1:]])
+            
+            if len(non_self_sync) > 0:
+                sync_weight = np.mean(non_self_sync)
+            else:
+                sync_weight = 0.5  # デフォルト値
             
             # 最終重み
             weight = base_weight * (1 + sync_weight)
+            total_weight_sum += weight
             
             # 寄与度計算
-            contribution = anomaly_scores_dict[channel] * weight
+            scores = anomaly_scores_dict[channel]
+            print(f"  {channel}: base_weight={base_weight:.3f}, sync_weight={sync_weight:.3f}, final_weight={weight:.3f}")
+            print(f"    Score stats: mean={np.mean(scores):.3f}, std={np.std(scores):.3f}")
+            
+            contribution = scores * weight
             channel_contributions[channel] = contribution
             integrated_scores += contribution
         
         # 正規化
-        total_weight = sum(centrality.get(ch, 1.0 / len(channels)) * 
-                          (1 + np.mean(sync_result.sync_matrix[i][sync_result.sync_matrix[i] < 1.0]))
-                          for i, ch in enumerate(channels))
-        integrated_scores /= total_weight
+        if total_weight_sum > 0:
+            integrated_scores /= total_weight_sum
+            print(f"  Total weight sum: {total_weight_sum:.3f}")
+        else:
+            print(f"  WARNING: Total weight sum is zero!")
+            # フォールバック：単純平均
+            integrated_scores = np.mean(list(anomaly_scores_dict.values()), axis=0)
+        
+        print(f"  Integrated score stats: mean={np.mean(integrated_scores):.3f}, std={np.std(integrated_scores):.3f}")
         
         return integrated_scores, channel_contributions
     
