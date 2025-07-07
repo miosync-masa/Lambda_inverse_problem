@@ -1,15 +1,16 @@
 """
-Lambda³ Zero-Shot Anomaly Detection System - Fixed Version
-ジャンプ駆動型ゼロショット異常検知システム（修正版）
-Author: Based on Dr. Iizumi's Lambda³ Theory
+Lambda³ Zero-Shot Anomaly Detection System - Stable/Fix Version
+Jump-Driven Zero-Shot Anomaly Detection System (Revised Edition)
+Author: Based on Mr. Iizumi's Lambda³ Theory
 """
+
 import json
 import os
 import pickle
 import time
+import pywt
 import warnings
 from dataclasses import dataclass
-from dataclasses import asdict
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
@@ -21,10 +22,12 @@ from numba.typed import Dict as NumbaDict
 import numpy as np
 from scipy.optimize import differential_evolution, minimize
 from scipy.signal import hilbert
+from scipy.stats import entropy as scipy_entropy
+from scipy import stats
 
-from sklearn.decomposition import PCA  
+from sklearn.decomposition import PCA
 from sklearn.linear_model import LogisticRegression
-from sklearn.manifold import TSNE 
+from sklearn.manifold import TSNE
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
@@ -40,8 +43,8 @@ LOCAL_JUMP_PERCENTILE = 91.0     # Percentile threshold for local jumps
 WINDOW_SIZE = 30                 # General-purpose window size (e.g., for rolling std/mean)
 
 # Multi-scale jump detection parameters
-MULTI_SCALE_WINDOWS = [5, 10, 20, 40]      # Detect jumps at multiple temporal resolutions
-MULTI_SCALE_PERCENTILES = [85.0, 90.0, 93.0, 95.0]  # Adaptive thresholds for each scale
+MULTI_SCALE_WINDOWS = [3, 5, 10, 20, 40]      # Detect jumps at multiple temporal resolutions
+MULTI_SCALE_PERCENTILES = [75.0, 80.0, 85.0, 90.0, 93.0, 95.0]  # Adaptive thresholds for each scale
 
 # ===============================
 # Global Constants (for KERNEL optimization) - Tuned Version
@@ -103,6 +106,257 @@ class DetectionStrategy:
     features: List[str]                        # Features/components used for detection
     weights: Dict[str, float]                  # Weights for each feature/component
     confidence: float                          # Confidence score of current detection logic
+
+
+# ===============================
+# adaptive　Parameter
+# ===============================
+def compute_adaptive_window_size(events: np.ndarray, 
+                               base_window: int = 30,  # 15から30に増加
+                               min_window: int = 10,   # 5から10に増加
+                               max_window: int = 100) -> Dict[str, int]:  # 50から100に増加
+    """
+    データのボラティリティに基づいて適応的なウィンドウサイズを計算
+    
+    Args:
+        events: イベントデータ (n_events, n_features)
+        base_window: 基準ウィンドウサイズ
+        min_window: 最小ウィンドウサイズ
+        max_window: 最大ウィンドウサイズ
+    
+    Returns:
+        各用途別の最適ウィンドウサイズ辞書
+    """
+    n_events, n_features = events.shape
+    
+    # データサイズに基づく基準調整
+    if n_events > 300:
+        size_adjusted_base = base_window
+    elif n_events > 100:
+        size_adjusted_base = int(base_window * 0.8)
+    else:
+        size_adjusted_base = int(base_window * 0.6)
+    
+    # 最小でもn_events/20は確保
+    size_adjusted_base = max(size_adjusted_base, n_events // 20)
+    
+    # 1. グローバルボラティリティの計算
+    global_std = np.std(events)
+    global_mean = np.mean(np.abs(events))
+    volatility_ratio = global_std / (global_mean + 1e-10)
+    
+    # 2. 時系列的な変動性（隣接イベント間の変化率）
+    temporal_changes = np.diff(events, axis=0)
+    temporal_volatility = np.mean(np.std(temporal_changes, axis=0))
+    
+    # 3. 特徴量間の相関構造の複雑さ
+    correlation_matrix = np.corrcoef(events.T)
+    correlation_complexity = 1.0 - np.mean(np.abs(correlation_matrix[np.triu_indices(n_features, k=1)]))
+    
+    # 4. 局所的な変動パターンの検出
+    local_volatilities = []
+    for i in range(0, n_events - base_window, base_window // 2):
+        window_data = events[i:i + base_window]
+        local_volatilities.append(np.std(window_data))
+    
+    volatility_variation = np.std(local_volatilities) / (np.mean(local_volatilities) + 1e-10)
+    
+    # 5. スペクトル解析による支配的周期の推定
+    fft_magnitudes = np.abs(np.fft.fft(events, axis=0))
+    # 低周波成分の割合
+    low_freq_ratio = np.sum(fft_magnitudes[:n_events//10]) / np.sum(fft_magnitudes[:n_events//2])
+    
+    # === ウィンドウサイズの計算 ===
+    
+    # 基本スケーリング係数
+    scale_factor = 1.0
+    
+    # ボラティリティが高い場合は小さいウィンドウ
+    if volatility_ratio > 2.0:  # 1.5から2.0に緩和
+        scale_factor *= 0.8     # 0.7から0.8に緩和
+    elif volatility_ratio < 0.3:  # 0.5から0.3に変更
+        scale_factor *= 1.5     # 1.3から1.5に増加
+    
+    # 時間的変動が大きい場合は小さいウィンドウ
+    if temporal_volatility > global_std * 2.0:  # 1.5から2.0に緩和
+        scale_factor *= 0.9     # 0.8から0.9に緩和
+    elif temporal_volatility < global_std * 0.3:  # 0.5から0.3に変更
+        scale_factor *= 1.4     # 1.2から1.4に増加
+    
+    # 相関構造が複雑な場合は大きいウィンドウ
+    if correlation_complexity > 0.7:
+        scale_factor *= 1.2
+    elif correlation_complexity < 0.3:
+        scale_factor *= 0.9
+    
+    # 局所的変動が大きい場合は適応的に
+    if volatility_variation > 1.0:
+        scale_factor *= 0.85
+    
+    # 低周波成分が支配的な場合は大きいウィンドウ
+    if low_freq_ratio > 0.8:
+        scale_factor *= 1.4
+    elif low_freq_ratio < 0.3:
+        scale_factor *= 0.8
+    
+    # === 用途別のウィンドウサイズ ===
+    
+    # 局所統計量用（標準偏差など）
+    local_window = int(size_adjusted_base * scale_factor)
+    local_window = np.clip(local_window, min_window, max_window)
+    
+    # ジャンプ検出用（より敏感に、小さめ）
+    jump_window = int(local_window * 0.5)  # 0.7から0.5に変更
+    jump_window = np.clip(jump_window, min_window // 2, max_window // 3)  # 上限も調整
+    
+    # エントロピー計算用（より安定に）
+    entropy_window = int(local_window * 1.3)
+    entropy_window = np.clip(entropy_window, min_window * 2, max_window)
+    
+    # マルチスケール解析用（より広いレンジ）
+    multiscale_windows = []
+    for scale in [0.5, 1.0, 2.0, 4.0, 8.0]:  # 8.0を追加
+        window = int(local_window * scale)
+        window = np.clip(window, min_window, max_window)
+        multiscale_windows.append(window)
+    
+    # テンション計算用（ρT）- より大きなウィンドウで安定的に
+    tension_window = int(local_window * 1.5)  # 1.5倍で大きく
+    tension_window = np.clip(tension_window, min_window, max_window)
+    
+    return {
+        'local': local_window,
+        'jump': jump_window,
+        'entropy': entropy_window,
+        'tension': tension_window,
+        'multiscale': multiscale_windows,
+        'volatility_metrics': {
+            'global_volatility': volatility_ratio,
+            'temporal_volatility': temporal_volatility,
+            'correlation_complexity': correlation_complexity,
+            'local_variation': volatility_variation,
+            'low_freq_ratio': low_freq_ratio,
+            'scale_factor': scale_factor
+        }
+    }
+
+def update_global_constants(window_sizes: Dict[str, int]):
+    """グローバル定数を動的に更新"""
+    global LOCAL_WINDOW_SIZE, WINDOW_SIZE, MULTI_SCALE_WINDOWS
+    
+    LOCAL_WINDOW_SIZE = window_sizes['local']
+    WINDOW_SIZE = window_sizes['tension']
+    MULTI_SCALE_WINDOWS = window_sizes['multiscale']
+    
+    print(f"Window sizes updated:")
+    print(f"  LOCAL_WINDOW_SIZE: {LOCAL_WINDOW_SIZE}")
+    print(f"  WINDOW_SIZE: {WINDOW_SIZE}")
+    print(f"  MULTI_SCALE_WINDOWS: {MULTI_SCALE_WINDOWS}")
+
+# 拡張版：Lambda³構造を考慮した動的調整
+def compute_lambda3_adaptive_parameters(events: np.ndarray,
+                                      result: Optional['Lambda3Result'] = None) -> Dict[str, any]:
+    """
+    Lambda³解析結果も考慮した完全な適応的パラメータ設定
+    """
+    # 基本的なウィンドウサイズ計算
+    window_sizes = compute_adaptive_window_size(events)
+    
+    # Lambda³構造による調整
+    if result is not None:
+        # トポロジカルチャージの分布
+        charges = np.array(list(result.topological_charges.values()))
+        charge_volatility = np.std(charges) / (np.mean(np.abs(charges)) + 1e-10)
+        
+        # 安定性の分布
+        stabilities = np.array(list(result.stabilities.values()))
+        mean_stability = np.mean(stabilities)
+        
+        # 構造が不安定な場合は小さいウィンドウ
+        if mean_stability > 2.0:
+            window_sizes['local'] = int(window_sizes['local'] * 0.8)
+            window_sizes['jump'] = int(window_sizes['jump'] * 0.7)
+        
+        # ジャンプ頻度による調整
+        if result.jump_structures:
+            jump_density = result.jump_structures['integrated']['n_total_jumps'] / len(events)
+            if jump_density > 0.2:  # ジャンプが多い
+                window_sizes['jump'] = max(5, int(window_sizes['jump'] * 0.6))
+                # マルチスケールも調整
+                window_sizes['multiscale'] = [max(5, int(w * 0.7)) for w in window_sizes['multiscale']]
+    
+    # パーセンタイルの動的調整
+    volatility_metrics = window_sizes['volatility_metrics']
+    
+    # デルタパーセンタイル（ジャンプ検出閾値）
+    if volatility_metrics['global_volatility'] > 1.5:
+        delta_percentile = 92.0  # より厳しく
+    elif volatility_metrics['global_volatility'] < 0.5:
+        delta_percentile = 96.0  # より緩く
+    else:
+        delta_percentile = 94.0
+    
+    # 局所ジャンプパーセンタイル
+    if volatility_metrics['temporal_volatility'] > volatility_metrics['global_volatility']:
+        local_jump_percentile = 89.0  # より敏感に
+    else:
+        local_jump_percentile = 91.0
+    
+    # マルチスケール用のパーセンタイル
+    multiscale_percentiles = []
+    for i, window in enumerate(window_sizes['multiscale']):
+        # 小さいウィンドウほど低いパーセンタイル（敏感）
+        base_percentile = 85.0 + (i * 3.0)
+        # ボラティリティで調整
+        adjusted = base_percentile - (volatility_metrics['global_volatility'] - 1.0) * 5.0
+        multiscale_percentiles.append(np.clip(adjusted, 80.0, 98.0))
+    
+    return {
+        'window_sizes': window_sizes,
+        'delta_percentile': delta_percentile,
+        'local_jump_percentile': local_jump_percentile,
+        'multiscale_percentiles': multiscale_percentiles,
+        'adaptive_config': {
+            'jump_scale': 1.5 / volatility_metrics['scale_factor'],  # 逆相関
+            'alpha': 0.05 * volatility_metrics['scale_factor'],      # 正則化も調整
+            'beta': 0.005 * volatility_metrics['scale_factor'],
+            'use_union': volatility_metrics['local_variation'] > 0.8,  # 変動が大きければunion
+            'w_topo': 0.3 + 0.2 * volatility_metrics['correlation_complexity'],  # 相関が複雑ならトポロジー重視
+            'w_pulse': 0.2 + 0.1 * volatility_metrics['temporal_volatility']     # 時間変動が大きければ拍動重視
+        }
+    }
+
+def apply_adaptive_parameters(detector: 'Lambda3ZeroShotDetector', 
+                            events: np.ndarray,
+                            result: Optional['Lambda3Result'] = None):
+    """検出器に適応的パラメータを適用"""
+    
+    # パラメータ計算
+    params = compute_lambda3_adaptive_parameters(events, result)
+    
+    # グローバル定数の更新
+    update_global_constants(params['window_sizes'])
+    
+    # 検出器の設定更新
+    detector.config.jump_scale = params['adaptive_config']['jump_scale']
+    detector.config.alpha = params['adaptive_config']['alpha']
+    detector.config.beta = params['adaptive_config']['beta']
+    detector.config.use_union = params['adaptive_config']['use_union']
+    detector.config.w_topo = params['adaptive_config']['w_topo']
+    detector.config.w_pulse = params['adaptive_config']['w_pulse']
+    
+    # マルチスケールパラメータの更新
+    global DELTA_PERCENTILE, LOCAL_JUMP_PERCENTILE, MULTI_SCALE_PERCENTILES
+    DELTA_PERCENTILE = params['delta_percentile']
+    LOCAL_JUMP_PERCENTILE = params['local_jump_percentile']
+    MULTI_SCALE_PERCENTILES = params['multiscale_percentiles']
+    
+    print(f"\nAdaptive parameters applied:")
+    print(f"  Jump scale: {detector.config.jump_scale:.3f}")
+    print(f"  Delta percentile: {DELTA_PERCENTILE:.1f}")
+    print(f"  Multiscale percentiles: {MULTI_SCALE_PERCENTILES}")
+    
+    return params
 
 # ===============================
 # JIT最適化コア関数（ジャンプ検出）
@@ -228,6 +482,16 @@ def calculate_sync_profile_jit(series_a: np.ndarray, series_b: np.ndarray,
 # カーネル関数
 # ===============================
 @njit
+def periodic_kernel(x: np.ndarray, y: np.ndarray, 
+                   period: float = 1.0, 
+                   length_scale: float = 1.0) -> float:
+    """周期カーネル（周期的パターン検出用）"""
+    diff = x - y
+    # 周期的距離
+    periodic_dist = np.sin(np.pi * np.abs(diff) / period)
+    return np.exp(-2 * np.sum(periodic_dist ** 2) / (length_scale ** 2))
+
+@njit
 def rbf_kernel(x: np.ndarray, y: np.ndarray, gamma: float = 1.0) -> float:
     """RBFカーネル（ガウシアンカーネル）"""
     diff = x - y
@@ -250,13 +514,16 @@ def laplacian_kernel(x: np.ndarray, y: np.ndarray, gamma: float = 1.0) -> float:
     return np.exp(-gamma * np.sum(diff))
 
 @njit(parallel=True)
-def compute_kernel_gram_matrix(data: np.ndarray, 
+def compute_kernel_gram_matrix(data: np.ndarray,
                                kernel_type: int = DEFAULT_KERNEL_TYPE,
-                               gamma: float = DEFAULT_GAMMA, 
+                               gamma: float = DEFAULT_GAMMA,
                                degree: int = DEFAULT_DEGREE,
-                               coef0: float = DEFAULT_COEF0, 
-                               alpha: float = DEFAULT_ALPHA) -> np.ndarray:
-    """カーネルGram行列の計算"""
+                               coef0: float = DEFAULT_COEF0,
+                               alpha: float = DEFAULT_ALPHA,
+                               period: float = 10.0,      # 周期カーネル用
+                               length_scale: float = 1.0  # 周期カーネル用
+                               ) -> np.ndarray:
+    """カーネルGram行列の計算（拡張版）"""
     n = data.shape[0]
     K = np.zeros((n, n))
     
@@ -268,7 +535,11 @@ def compute_kernel_gram_matrix(data: np.ndarray,
                 K[i, j] = polynomial_kernel(data[i], data[j], degree, coef0)
             elif kernel_type == 2:  # Sigmoid
                 K[i, j] = sigmoid_kernel(data[i], data[j], alpha, coef0)
-            else:  # Laplacian
+            elif kernel_type == 3:  # Laplacian
+                K[i, j] = laplacian_kernel(data[i], data[j], gamma)
+            elif kernel_type == 4:  # Periodic
+                K[i, j] = periodic_kernel(data[i], data[j], period, length_scale)
+            else:  # デフォルト: Laplacian
                 K[i, j] = laplacian_kernel(data[i], data[j], gamma)
             
             K[j, i] = K[i, j]  # 対称性
@@ -640,10 +911,216 @@ def compute_lambda3_hybrid_tikhonov_scores(
     return event_scores
 
 # ===============================
+# 拡張特徴量計算関数
+# ===============================
+def compute_frequency_features(events: np.ndarray) -> Dict[str, np.ndarray]:
+    """周波数ベースの特徴量計算"""
+    features = {}
+    
+    # FFTで周波数スペクトル
+    fft_vals = np.abs(np.fft.fft(events, axis=0))
+    features["fft_peak"] = np.max(fft_vals, axis=0)
+    
+    # 周波数スペクトルのエントロピー
+    fft_norm = fft_vals / (np.sum(fft_vals, axis=0) + 1e-10)
+    features["freq_entropy"] = scipy_entropy(fft_norm, axis=0)
+    
+    # 支配的周波数
+    dominant_freq_idx = np.argmax(fft_vals[1:len(fft_vals)//2], axis=0) + 1
+    features["dominant_freq"] = dominant_freq_idx.astype(float)
+    
+    # スペクトル重心
+    freq_bins = np.fft.fftfreq(events.shape[0])[:len(fft_vals)//2]
+    spectral_centroid = np.sum(freq_bins[:, np.newaxis] * fft_vals[:len(freq_bins)], axis=0) / (np.sum(fft_vals[:len(freq_bins)], axis=0) + 1e-10)
+    features["spectral_centroid"] = spectral_centroid
+    
+    return features
+
+def compute_wavelet_features(events: np.ndarray, wavelet: str = 'db4') -> Dict[str, np.ndarray]:
+    """ウェーブレット変換ベースの特徴量 - イベント空間で計算"""
+    features = {}
+    n_events = events.shape[0]
+    
+    # 各イベント次元に対してウェーブレット変換
+    wavelet_energies = []
+    wavelet_skews = []
+    wavelet_entropies = []
+    
+    for i in range(events.shape[1]):
+        try:
+            coeffs = pywt.wavedec(events[:, i], wavelet, level=min(3, pywt.dwt_max_level(len(events[:, i]), wavelet)))
+            # 全係数を結合
+            all_coeffs = np.concatenate([c.flatten() for c in coeffs])
+            
+            # エネルギー
+            wavelet_energies.append(np.sum(all_coeffs ** 2))
+            
+            # 歪度
+            if len(all_coeffs) > 2:
+                wavelet_skews.append(stats.skew(all_coeffs, nan_policy='omit'))
+            else:
+                wavelet_skews.append(0.0)
+            
+            # ウェーブレットエントロピー
+            abs_coeffs = np.abs(all_coeffs) + 1e-10
+            norm_coeffs = abs_coeffs / np.sum(abs_coeffs)
+            wavelet_entropies.append(-np.sum(norm_coeffs * np.log(norm_coeffs)))
+            
+        except Exception as e:
+            # エラー時はゼロで埋める
+            wavelet_energies.append(0.0)
+            wavelet_skews.append(0.0)
+            wavelet_entropies.append(0.0)
+    
+    # イベント全体での統計量
+    features["wavelet_energy"] = np.full(n_events, np.mean(wavelet_energies))
+    features["wavelet_skew"] = np.full(n_events, np.mean(wavelet_skews))
+    features["wavelet_entropy"] = np.full(n_events, np.mean(wavelet_entropies))
+    
+    return features
+
+def compute_missing_features(events: np.ndarray) -> Dict[str, np.ndarray]:
+    """欠損パターンの特徴量"""
+    features = {}
+    n_events = events.shape[0]
+    
+    # 欠損割合
+    missing_ratio = np.isnan(events).mean(axis=1)
+    features["missing_ratio"] = missing_ratio
+    
+    # 連続欠損パターン
+    missing_runs = []
+    missing_max_runs = []
+    
+    for i in range(events.shape[1]):
+        is_missing = np.isnan(events[:, i])
+        if np.any(is_missing):
+            # 連続する欠損の長さを計算
+            diff = np.diff(np.concatenate(([0], is_missing.astype(int), [0])))
+            start_indices = np.where(diff == 1)[0]
+            end_indices = np.where(diff == -1)[0]
+            
+            if len(start_indices) > 0 and len(end_indices) > 0:
+                runs = end_indices - start_indices
+                missing_runs.append(np.mean(runs))
+                missing_max_runs.append(np.max(runs))
+            else:
+                missing_runs.append(0)
+                missing_max_runs.append(0)
+        else:
+            missing_runs.append(0)
+            missing_max_runs.append(0)
+    
+    features["missing_pattern"] = np.full(n_events, np.mean(missing_runs))
+    features["missing_max_run"] = np.full(n_events, np.mean(missing_max_runs))
+    
+    return features
+
+def compute_sync_features(events: np.ndarray) -> Dict[str, np.ndarray]:
+    """マルチチャンネル同期特徴量"""
+    features = {}
+    n_events, n_features = events.shape
+    
+    if n_features < 2:
+        # 単一チャンネルの場合はダミー値
+        features["cross_correlation_max"] = np.ones(n_events)
+        features["cross_correlation_mean"] = np.ones(n_events)
+        features["phase_coherence"] = np.ones(n_events)
+        return features
+    
+    # ペアワイズクロス相関
+    cross_corrs = []
+    phase_coherences = []
+    
+    for i in range(n_features):
+        for j in range(i + 1, n_features):
+            # クロス相関
+            corr = np.correlate(events[:, i] - np.mean(events[:, i]), 
+                              events[:, j] - np.mean(events[:, j]), mode='full')
+            corr = corr / (np.std(events[:, i]) * np.std(events[:, j]) * len(events) + 1e-10)
+            cross_corrs.append(np.max(np.abs(corr)))
+            
+            # 位相コヒーレンス（ヒルベルト変換）
+            try:
+                from scipy.signal import hilbert
+                phase_i = np.angle(hilbert(events[:, i]))
+                phase_j = np.angle(hilbert(events[:, j]))
+                phase_diff = phase_i - phase_j
+                phase_coherence = np.abs(np.mean(np.exp(1j * phase_diff)))
+                phase_coherences.append(phase_coherence)
+            except:
+                phase_coherences.append(0.0)
+    
+    # イベント空間での値を設定
+    features["cross_correlation_max"] = np.full(n_events, np.max(cross_corrs) if cross_corrs else 0)
+    features["cross_correlation_mean"] = np.full(n_events, np.mean(cross_corrs) if cross_corrs else 0)
+    features["phase_coherence"] = np.full(n_events, np.mean(phase_coherences) if phase_coherences else 0)
+    
+    # 全体的な同期エントロピー
+    sync_norm = np.abs(events) / (np.sum(np.abs(events), axis=1, keepdims=True) + 1e-10)
+    features["sync_entropy"] = scipy_entropy(sync_norm, axis=1)
+    
+    return features
+
+def compute_domain_features(events: np.ndarray, domain: Optional[str] = None) -> Dict[str, np.ndarray]:
+    """Domain-specific feature extraction for anomaly detection"""
+    features = {}
+
+    if domain == "medical":
+        # Simulated heart rate variability (HRV) features
+        # Simple peak detection for each signal channel
+        for i in range(events.shape[1]):
+            signal = events[:, i]
+            # Detect local maxima (simple peak detection)
+            peaks = []
+            for j in range(1, len(signal) - 1):
+                if signal[j] > signal[j-1] and signal[j] > signal[j+1]:
+                    peaks.append(j)
+            if len(peaks) > 1:
+                rr_intervals = np.diff(peaks)
+                features[f"hrv_mean_{i}"] = np.mean(rr_intervals)
+                features[f"hrv_std_{i}"] = np.std(rr_intervals)
+                features[f"hrv_rmssd_{i}"] = np.sqrt(np.mean(np.diff(rr_intervals)**2))
+            else:
+                features[f"hrv_mean_{i}"] = 0
+                features[f"hrv_std_{i}"] = 0
+                features[f"hrv_rmssd_{i}"] = 0
+
+    elif domain == "financial":
+        # Financial indicators for time series
+        # Returns (log-returns would also be possible)
+        returns = np.diff(events, axis=0) / (np.abs(events[:-1]) + 1e-10)
+
+        # Volatility (standard deviation of returns)
+        features["volatility"] = np.std(returns, axis=0)
+
+        # Sharpe ratio (simple version: mean / std of returns)
+        features["sharpe_ratio"] = np.mean(returns, axis=0) / (np.std(returns, axis=0) + 1e-10)
+
+        # Maximum drawdown (worst peak-to-trough drop)
+        cumulative = np.cumprod(1 + returns, axis=0)
+        running_max = np.maximum.accumulate(cumulative, axis=0)
+        drawdown = (cumulative - running_max) / (running_max + 1e-10)
+        features["max_drawdown"] = np.min(drawdown, axis=0)
+
+    elif domain == "industrial":
+        # Industrial equipment features
+        # RMS vibration
+        features["vibration_rms"] = np.sqrt(np.mean(events**2, axis=0))
+
+        # Crest factor (peak amplitude / RMS) for fault detection
+        features["crest_factor"] = np.max(np.abs(events), axis=0) / (features["vibration_rms"] + 1e-10)
+
+        # Kurtosis (peakedness, used in vibration anomaly detection)
+        features["kurtosis"] = stats.kurtosis(events, axis=0, nan_policy='omit')
+
+    return features
+
+# ===============================
 # 特徴量抽出モジュール
 # ===============================
 class Lambda3FeatureExtractor:
-    """Lambda³特徴量抽出の統一インターフェース"""
+    """Lambda³特徴量抽出の統一インターフェース（周波数特徴強化版）"""
 
     def extract_basic_features(self, result: Lambda3Result, events: np.ndarray = None) -> Dict[str, np.ndarray]:
         """基本特徴量の抽出（更新版）"""
@@ -673,39 +1150,36 @@ class Lambda3FeatureExtractor:
             basic_features[f'asymm_{i}'] = np.array([asymm])
             basic_features[f'pulse_pow_{i}'] = np.array([pulse_pow])
 
+        # === 新規：パス空間での周波数特徴 ===
+        for i in range(n_paths):
+            path = paths_matrix[i]
+            freq_features = self._extract_frequency_features_from_path(path)
+            for fname, fval in freq_features.items():
+                basic_features[f'{fname}_{i}'] = np.array([fval])
+
         return basic_features
 
     def extract_advanced_features(self, result: Lambda3Result, events: np.ndarray) -> Dict[str, np.ndarray]:
-        """
-        高度な特徴量の生成
-        """
+        """高度な特徴量の生成（周波数特徴強化版）"""
         # resultが辞書の場合はそのまま使用、Lambda3Resultの場合は属性にアクセス
         if isinstance(result, dict):
-            # 辞書形式（extract_basic_featuresから呼ばれた場合）
             features = result.copy()
-            # 基本特徴量から必要な情報を抽出
-            n_paths = max(int(k.split('_')[-1]) for k in features.keys() 
+            n_paths = max(int(k.split('_')[-1]) for k in features.keys()
                         if any(k.startswith(prefix) for prefix in ['S_shannon_', 'S_renyi_', 'S_tsallis_'])) + 1
             n_events = events.shape[0]
-            
-            # Lambda3コア物理量を配列として取得（存在する場合）
+
             if 'Q_Λ' in features:
                 Qs = features['Q_Λ']
                 Es = features.get('E', np.zeros(n_paths))
                 Sigmas = features.get('σ_Q', np.ones(n_paths))
             else:
-                # フォールバック：デフォルト値を使用
                 Qs = np.zeros(n_paths)
                 Es = np.zeros(n_paths)
                 Sigmas = np.ones(n_paths)
-                
         else:
-            # Lambda3Result形式
             n_paths = len(result.paths)
             n_events = events.shape[0]
             paths_matrix = np.stack(list(result.paths.values()))
-            
-            # 1. Lambda³コア物理量
             Qs = np.array([result.topological_charges[i] for i in range(n_paths)])
             Es = np.array([result.energies[i] for i in range(n_paths)])
             Sigmas = np.array([result.stabilities[i] for i in range(n_paths)])
@@ -725,26 +1199,47 @@ class Lambda3FeatureExtractor:
             "log_Q_Λ": np.log(np.abs(Qs) + 1e-8),
         }
 
+        # === 新規：イベント空間での周波数特徴 ===
+        # 各イベント特徴量のFFT解析
+        event_fft_features = self._extract_event_frequency_features(events)
+        for fname, fvals in event_fft_features.items():
+            features[f'event_{fname}'] = fvals
+
         # 3. エントロピー、拍動、統計特徴（パスごと）
-        # Lambda3Resultの場合のみ追加特徴を計算
         if hasattr(result, 'paths'):
             paths_matrix = np.stack(list(result.paths.values()))
-            
+
+            # === 新規：パスごとの周波数特徴 ===
+            path_freq_features = {}
             for i in range(n_paths):
-                # エントロピー
+                path = paths_matrix[i]
+                freq_feats = self._extract_frequency_features_from_path(path)
+                for fname, fval in freq_feats.items():
+                    if fname not in path_freq_features:
+                        path_freq_features[fname] = []
+                    path_freq_features[fname].append(fval)
+            
+            # パス周波数特徴の統計量
+            for fname, fvals in path_freq_features.items():
+                features[f'path_{fname}_mean'] = np.array([np.mean(fvals)])
+                features[f'path_{fname}_std'] = np.array([np.std(fvals)])
+                features[f'path_{fname}_max'] = np.array([np.max(fvals)])
+
+            for i in range(n_paths):
+                # 既存のエントロピー特徴
                 ent = result.entropies[i]
                 if isinstance(ent, dict):
                     features[f'S_shannon_{i}'] = np.array([ent.get('shannon', 0)])
                     features[f'S_renyi_{i}'] = np.array([ent.get('renyi_2', 0)])
                     features[f'S_tsallis_{i}'] = np.array([ent.get('tsallis_1.5', 0)])
-                
-                # 拍動エネルギー
+
+                # 既存の拍動エネルギー
                 path = paths_matrix[i]
                 jump_int, asymm, pulse_pow = compute_pulsation_energy_from_path(path)
                 features[f'jump_int_{i}'] = np.array([jump_int])
                 features[f'asymm_{i}'] = np.array([asymm])
                 features[f'pulse_pow_{i}'] = np.array([pulse_pow])
-                
+
                 # 歪度と尖度
                 mean_path = np.mean(path)
                 std_path = np.std(path)
@@ -756,7 +1251,7 @@ class Lambda3FeatureExtractor:
                     kurt = 0.0
                 features[f'skew_{i}'] = np.array([np.nan_to_num(skew)])
                 features[f'kurt_{i}'] = np.array([np.nan_to_num(kurt)])
-                
+
                 # 自己相関
                 if len(path) > 1:
                     ac = np.correlate(path - mean_path, path - mean_path, mode='full')[len(path)-1:]
@@ -765,10 +1260,8 @@ class Lambda3FeatureExtractor:
                         features[f'autocorr_{i}'] = np.array([np.mean(ac[:5])])
                     else:
                         features[f'autocorr_{i}'] = np.array([0.0])
-        
-        # 既に辞書形式の場合、既存の特徴量を保持
+
         elif isinstance(result, dict):
-            # 既存の特徴量をマージ
             for k, v in result.items():
                 if k not in features:
                     features[k] = v
@@ -783,17 +1276,144 @@ class Lambda3FeatureExtractor:
                         r = features[f1] / (features[f2] + 1e-10)
                         features[f'{f1}/{f2}'] = np.nan_to_num(r, nan=0.0, posinf=10.0, neginf=-10.0)
 
+        # === 新規：Lambda³物理量と周波数特徴の相互作用 ===
+        if 'event_freq_peak_amp' in features:
+            # Q_Λと周波数振幅の相互作用
+            features['Q_Λ×freq_amplitude'] = Qs.mean() * features['event_freq_peak_amp']
+            features['σ_Q×freq_amplitude'] = Sigmas.mean() * features['event_freq_peak_amp']
+            features['E×freq_amplitude'] = Es.mean() * features['event_freq_peak_amp']
+            
+            # 周波数エネルギーとの相互作用
+            if 'event_freq_energy' in features:
+                features['Q_Λ×freq_energy'] = Qs.mean() * features['event_freq_energy']
+                features['Q_Λ/freq_energy'] = Qs.mean() / (features['event_freq_energy'] + 1e-10)
+
         # 5. 非線形変換（全特徴に適用）
         for k, v in list(features.items()):
-            features[f'log_{k}'] = np.log1p(np.abs(v))
-            features[f'sqrt_{k}'] = np.sqrt(np.abs(v))
-            features[f'sq_{k}'] = v ** 2
-            features[f'sig_{k}'] = 1 / (1 + np.exp(-v))
+            # 周波数関連特徴は既に非線形なのでスキップ
+            if 'freq' not in k and 'fft' not in k:
+                features[f'log_{k}'] = np.log1p(np.abs(v))
+                features[f'sqrt_{k}'] = np.sqrt(np.abs(v))
+                features[f'sq_{k}'] = v ** 2
+                features[f'sig_{k}'] = 1 / (1 + np.exp(-v))
 
         # 6. イベントレベルの統計量
         features['event_mean'] = np.mean(events, axis=1)
         features['event_std'] = np.std(events, axis=1)
 
+        return features
+
+    def _extract_frequency_features_from_path(self, path: np.ndarray) -> Dict[str, float]:
+        """パスの周波数特徴を抽出"""
+        # FFT計算
+        fft = np.fft.fft(path)
+        fft_abs = np.abs(fft)
+        fft_freqs = np.fft.fftfreq(len(path))
+        
+        # 正の周波数のみ
+        pos_mask = fft_freqs > 0
+        pos_freqs = fft_freqs[pos_mask]
+        pos_fft = fft_abs[pos_mask]
+        
+        features = {}
+        
+        if len(pos_fft) > 0:
+            # ピーク周波数とその振幅
+            peak_idx = np.argmax(pos_fft)
+            features['freq_peak'] = pos_freqs[peak_idx]
+            features['freq_peak_amp'] = pos_fft[peak_idx]
+            
+            # 周波数エネルギー
+            features['freq_energy'] = np.sum(pos_fft ** 2)
+            
+            # スペクトル重心
+            if np.sum(pos_fft) > 0:
+                features['freq_centroid'] = np.sum(pos_freqs * pos_fft) / np.sum(pos_fft)
+            else:
+                features['freq_centroid'] = 0.0
+            
+            # スペクトルエントロピー
+            if np.sum(pos_fft) > 0:
+                norm_fft = pos_fft / np.sum(pos_fft)
+                features['freq_entropy'] = -np.sum(norm_fft * np.log(norm_fft + 1e-10))
+            else:
+                features['freq_entropy'] = 0.0
+            
+            # 高周波/低周波比率
+            mid_point = len(pos_fft) // 2
+            if mid_point > 0:
+                low_energy = np.sum(pos_fft[:mid_point] ** 2)
+                high_energy = np.sum(pos_fft[mid_point:] ** 2)
+                features['freq_hf_lf_ratio'] = high_energy / (low_energy + 1e-10)
+            else:
+                features['freq_hf_lf_ratio'] = 0.0
+        else:
+            # デフォルト値
+            features = {
+                'freq_peak': 0.0,
+                'freq_peak_amp': 0.0,
+                'freq_energy': 0.0,
+                'freq_centroid': 0.0,
+                'freq_entropy': 0.0,
+                'freq_hf_lf_ratio': 0.0
+            }
+        
+        return features
+
+    def _extract_event_frequency_features(self, events: np.ndarray) -> Dict[str, np.ndarray]:
+        """イベント空間での周波数特徴を抽出"""
+        n_events, n_features = events.shape
+        
+        # 各特徴次元でFFT
+        all_ffts = np.fft.fft(events, axis=0)
+        all_fft_abs = np.abs(all_ffts)
+        
+        features = {}
+        
+        # 全体的な周波数特徴
+        # ピーク振幅（各特徴の最大値の平均）
+        features['freq_peak_amp'] = np.mean(np.max(all_fft_abs[1:n_events//2], axis=0))
+        
+        # 周波数エネルギー（全特徴の平均）
+        features['freq_energy'] = np.mean(np.sum(all_fft_abs ** 2, axis=0))
+        
+        # 支配的周波数の分散（特徴間の周波数パターンの違い）
+        peak_freqs = []
+        for f in range(n_features):
+            fft_f = all_fft_abs[1:n_events//2, f]
+            if len(fft_f) > 0 and np.max(fft_f) > 0:
+                peak_idx = np.argmax(fft_f)
+                peak_freqs.append(peak_idx / len(fft_f))
+        
+        if peak_freqs:
+            features['freq_dispersion'] = np.std(peak_freqs)
+        else:
+            features['freq_dispersion'] = 0.0
+        
+        # 低周波成分の割合
+        low_freq_cutoff = n_events // 10
+        if low_freq_cutoff > 1:
+            low_freq_energy = np.sum(all_fft_abs[1:low_freq_cutoff] ** 2)
+            total_energy = np.sum(all_fft_abs[1:n_events//2] ** 2)
+            features['low_freq_ratio'] = low_freq_energy / (total_energy + 1e-10)
+        else:
+            features['low_freq_ratio'] = 0.0
+        
+        # 特徴間の周波数相関
+        if n_features > 1:
+            freq_corrs = []
+            for i in range(n_features):
+                for j in range(i+1, n_features):
+                    corr = np.corrcoef(all_fft_abs[:, i], all_fft_abs[:, j])[0, 1]
+                    freq_corrs.append(corr)
+            features['freq_correlation'] = np.mean(freq_corrs)
+        else:
+            features['freq_correlation'] = 0.0
+        
+        # これらはスカラー値なので、イベント数に合わせて拡張
+        for fname in list(features.keys()):
+            features[fname] = np.full(n_events, features[fname])
+        
         return features
 
     def project_to_event_space(self,
@@ -954,120 +1574,269 @@ class Lambda3FeatureOptimizer:
         # 基本的に同じロジックだが、射影は不要
         return self.optimize_features(event_features, labels, None, mode)
 
+# ===============================
+# Lambda3FocusedDetectorV2
+# ===============================
 class Lambda3FocusedDetector:
     """
-    Lambda³焦点型異常検知システム
-    - 明確なサンプルから学習した特徴を全データに適用
-    - 特徴群の相関構造を保持
+    Lambda³焦点型異常検知システム 完全拡張版
+    構造空間での次元整合性を保証
     """
 
     def __init__(self,
                  correlation_threshold: float = 0.4,
                  weight_threshold_ratio: float = 0.3,
                  min_clear_samples: int = 15,
-                 max_features: int = 30,
-                 regularization: float = 0.05):
-        """
-        Args:
-            correlation_threshold: 特徴群を形成する相関閾値
-            weight_threshold_ratio: 重要特徴と判定する重み比率
-            min_clear_samples: 最適化に必要な最小サンプル数
-            max_features: 最大特徴数
-            regularization: 正則化パラメータ
-        """
+                 max_features: int = 50,
+                 regularization: float = 0.05,
+                 use_advanced_features: bool = True,
+                 domain: Optional[str] = None):
         self.correlation_threshold = correlation_threshold
         self.weight_threshold_ratio = weight_threshold_ratio
         self.min_clear_samples = min_clear_samples
-        self.feature_extractor = Lambda3FeatureExtractor()
-        self.feature_optimizer = Lambda3FeatureOptimizer(
-            max_features=max_features,
-            regularization=regularization
-        )
+        self.max_features = max_features
+        self.regularization = regularization
+        self.use_advanced_features = use_advanced_features
+        self.domain = domain
+        
+        # 特徴抽出器と最適化器は外部から注入されることを想定
+        self.feature_extractor = None
+        self.feature_optimizer = None
+
+    def set_components(self, feature_extractor, feature_optimizer):
+        """コンポーネントの設定"""
+        self.feature_extractor = feature_extractor
+        self.feature_optimizer = feature_optimizer
 
     def detect_anomalies(self,
-                        result: Lambda3Result,
+                        result: 'Lambda3Result',
                         events: np.ndarray,
-                        base_detector_func: Optional[callable] = None) -> np.ndarray:
+                        base_detector_func: Optional[callable] = None,
+                        verbose: bool = True) -> np.ndarray:
         """
         焦点型異常検知のメインメソッド
-
-        Args:
-            result: Lambda³解析結果
-            events: イベントデータ
-            base_detector_func: 基本異常検知関数（疑似ラベル生成用）
-
-        Returns:
-            異常スコア配列
         """
+        if verbose:
+            print(f"\n=== Lambda³ Focused Detector V2 ===")
+            print(f"Advanced features: {self.use_advanced_features}")
+            print(f"Domain: {self.domain if self.domain else 'General'}")
+        
         # 1. 特徴量抽出
-        features = self._extract_all_features(result, events)
-
+        features = self._extract_all_features(result, events, verbose)
+        
         # 2. 検出戦略の決定
         strategy = self._determine_detection_strategy(
-            features, result, events, base_detector_func
+            features, result, events, base_detector_func, verbose
         )
-
+        
         # 3. 戦略に基づいた異常スコア計算
         scores = self._apply_detection_strategy(strategy, features, result, events)
-
+        
         return scores
 
     def _extract_all_features(self,
-                            result: Lambda3Result,
-                            events: np.ndarray) -> Dict[str, np.ndarray]:
-        """全特徴量の抽出"""
+                            result: 'Lambda3Result',
+                            events: np.ndarray,
+                            verbose: bool = True) -> Dict[str, np.ndarray]:
+        """全特徴量の抽出（構造空間の整合性を保証）"""
+        if verbose:
+            print("\nExtracting features...")
+        
+        # 基本のLambda³特徴量（パス空間）
         paths_matrix = np.stack(list(result.paths.values()))
+        basic_features = self.feature_extractor.extract_basic_features(result, events)
+        advanced_features = self.feature_extractor.extract_advanced_features(result, events)
+        
+        # 全特徴を統合
+        features = {**basic_features, **advanced_features}
+        
+        if not self.use_advanced_features:
+            if verbose:
+                print(f"  Basic Lambda³ features: {len(features)}")
+            return features
+        
+        # 拡張特徴量の追加（イベント空間）
+        if verbose:
+            print("  Adding advanced features...")
+        
+        # 1. 周波数特徴
+        try:
+            freq_features = compute_frequency_features(events)
+            features.update(freq_features)
+            if verbose:
+                print(f"    - Frequency features: {len(freq_features)}")
+        except Exception as e:
+            if verbose:
+                print(f"    - Frequency features skipped: {e}")
+        
+        # 2. ウェーブレット特徴
+        try:
+            wavelet_features = compute_wavelet_features(events)
+            features.update(wavelet_features)
+            if verbose:
+                print(f"    - Wavelet features: {len(wavelet_features)}")
+        except Exception as e:
+            if verbose:
+                print(f"    - Wavelet features skipped: {e}")
+        
+        # 3. 欠損パターン
+        if np.any(np.isnan(events)):
+            try:
+                missing_features = compute_missing_features(events)
+                features.update(missing_features)
+                if verbose:
+                    print(f"    - Missing pattern features: {len(missing_features)}")
+            except Exception as e:
+                if verbose:
+                    print(f"    - Missing features skipped: {e}")
+        
+        # 4. 同期特徴（マルチチャンネル）
+        if events.shape[1] > 1:
+            try:
+                sync_features = compute_sync_features(events)
+                features.update(sync_features)
+                if verbose:
+                    print(f"    - Synchronization features: {len(sync_features)}")
+            except Exception as e:
+                if verbose:
+                    print(f"    - Sync features skipped: {e}")
+        
+        # 5. Lambda³物理量との相互作用（構造空間での整合性を保証）
+        self._add_interaction_features(features, result, paths_matrix, events)
+        
+        if verbose:
+            print(f"  Total features extracted: {len(features)}")
+        
+        return features
 
-        # 基本特徴量の抽出
-        basic_features = self.feature_extractor.extract_basic_features(result)
-
-        # 高度な特徴量の生成
-        advanced_features = self.feature_extractor.extract_advanced_features(
-            basic_features, paths_matrix
-        )
-
-        return advanced_features
+    def _add_interaction_features(self, 
+                                features: Dict[str, np.ndarray], 
+                                result: 'Lambda3Result',
+                                paths_matrix: np.ndarray,
+                                events: np.ndarray):
+        """Lambda³物理量と拡張特徴の相互作用（次元整合性を保証）"""
+        n_events = events.shape[0]
+        
+        # パス空間のLambda³物理量をイベント空間に射影
+        path_features = {
+            'Q_Λ': features.get('Q_Λ'),
+            'E': features.get('E'),
+            'σ_Q': features.get('σ_Q')
+        }
+        
+        # パス特徴量をイベント空間に射影
+        event_projections = {}
+        for name, values in path_features.items():
+            if values is not None and len(values) == paths_matrix.shape[0]:
+                # パス特徴量をイベント空間に射影
+                proj = self.feature_extractor.project_to_event_space(
+                    {name: values}, paths_matrix
+                )
+                event_projections[name] = proj.get(name, np.zeros(n_events))
+        
+        # イベント空間での相互作用を計算
+        interaction_count = 0
+        
+        # Q_Λとの相互作用
+        if 'Q_Λ' in event_projections:
+            Qs_event = event_projections['Q_Λ']
+            
+            # 周波数との相互作用
+            if 'fft_peak' in features and len(features['fft_peak']) == n_events:
+                features['Q_Λ×fft_peak'] = Qs_event * features['fft_peak']
+                interaction_count += 1
+            
+            if 'freq_entropy' in features and len(features['freq_entropy']) == n_events:
+                features['Q_Λ×freq_entropy'] = Qs_event * features['freq_entropy']
+                interaction_count += 1
+            
+            # ウェーブレットとの相互作用
+            if 'wavelet_energy' in features and len(features['wavelet_energy']) == n_events:
+                features['Q_Λ×wavelet_energy'] = Qs_event * features['wavelet_energy']
+                interaction_count += 1
+            
+            # 欠損との相互作用
+            if 'missing_ratio' in features and len(features['missing_ratio']) == n_events:
+                features['Q_Λ×missing'] = Qs_event * features['missing_ratio']
+                interaction_count += 1
+        
+        # エネルギーとの相互作用
+        if 'E' in event_projections:
+            Es_event = event_projections['E']
+            
+            if 'wavelet_entropy' in features and len(features['wavelet_entropy']) == n_events:
+                features['E×wavelet_entropy'] = Es_event * features['wavelet_entropy']
+                interaction_count += 1
+            
+            if 'spectral_centroid' in features and len(features['spectral_centroid']) == n_events:
+                features['E×spectral_centroid'] = Es_event * features['spectral_centroid']
+                interaction_count += 1
+        
+        # 安定性との相互作用
+        if 'σ_Q' in event_projections:
+            sigmas_event = event_projections['σ_Q']
+            
+            if 'cross_correlation_max' in features and len(features['cross_correlation_max']) == n_events:
+                features['σ_Q×cross_corr'] = sigmas_event * features['cross_correlation_max']
+                interaction_count += 1
 
     def _determine_detection_strategy(self,
                                     features: Dict[str, np.ndarray],
-                                    result: Lambda3Result,
+                                    result: 'Lambda3Result',
                                     events: np.ndarray,
-                                    base_detector_func: Optional[callable]) -> DetectionStrategy:
+                                    base_detector_func: Optional[callable],
+                                    verbose: bool = True) -> DetectionStrategy:
         """最適な検出戦略を決定"""
-
+        if verbose:
+            print("\nDetermining detection strategy...")
+        
         # 疑似ラベルの生成
         if base_detector_func is None:
             base_scores = self._compute_fallback_scores(result, events)
         else:
             base_scores = base_detector_func(result, events)
-
+        
         # 明確なサンプルの選択
         clear_samples = self._select_clear_samples(base_scores)
-
+        
+        if verbose:
+            print(f"  Clear samples: {clear_samples['count']} "
+                  f"(normal: {len(clear_samples['normal_indices'])}, "
+                  f"anomaly: {len(clear_samples['anomaly_indices'])})")
+        
         if clear_samples['count'] < self.min_clear_samples:
             # サンプル不足：フォールバック戦略
+            if verbose:
+                print("  → Using fallback strategy (insufficient samples)")
             return self._create_fallback_strategy()
-
+        
         # 特徴最適化
         optimization_result = self._optimize_features_with_clear_samples(
-            features, result, clear_samples
+            features, result, clear_samples, verbose
         )
-
+        
         # 特徴群の解析
         feature_groups = self._analyze_feature_groups(
             optimization_result.selected_features,
             optimization_result.feature_correlations
         )
-
+        
         # 戦略の決定
-        return self._create_optimal_strategy(
+        strategy = self._create_optimal_strategy(
             optimization_result, feature_groups
         )
+        
+        if verbose:
+            print(f"  → Strategy: {strategy.method}")
+            print(f"  → Selected features: {len(strategy.features)}")
+            print(f"  → Confidence: {strategy.confidence:.3f}")
+        
+        return strategy
 
     def _select_clear_samples(self, base_scores: np.ndarray) -> Dict:
-        """明確なサンプルの選択（より柔軟な方法）"""
+        """明確なサンプルの選択"""
         n_samples = len(base_scores)
-
+        
         # 動的なパーセンタイル設定
         if n_samples < 100:
             low_percentile, high_percentile = 15, 85
@@ -1075,19 +1844,15 @@ class Lambda3FocusedDetector:
             low_percentile, high_percentile = 10, 90
         else:
             low_percentile, high_percentile = 5, 95
-
+        
         thresholds = np.percentile(base_scores, [low_percentile, high_percentile])
-
+        
         clear_normal = base_scores < thresholds[0]
         clear_anomaly = base_scores > thresholds[1]
-
-        # 中間層も考慮したサンプリング（オプション）
-        ambiguous = ~(clear_normal | clear_anomaly)
-
+        
         return {
             'normal_indices': np.where(clear_normal)[0],
             'anomaly_indices': np.where(clear_anomaly)[0],
-            'ambiguous_indices': np.where(ambiguous)[0],
             'clear_indices': np.where(clear_normal | clear_anomaly)[0],
             'clear_labels': clear_anomaly[clear_normal | clear_anomaly].astype(int),
             'count': np.sum(clear_normal) + np.sum(clear_anomaly),
@@ -1096,35 +1861,59 @@ class Lambda3FocusedDetector:
 
     def _optimize_features_with_clear_samples(self,
                                             features: Dict[str, np.ndarray],
-                                            result: Lambda3Result,
-                                            clear_samples: Dict) -> OptimizationResult:
+                                            result: 'Lambda3Result',
+                                            clear_samples: Dict,
+                                            verbose: bool = True) -> OptimizationResult:
         """明確なサンプルでの特徴最適化"""
         paths_matrix = np.stack(list(result.paths.values()))
-
+        
         # 明確なサンプルのインデックス
         clear_indices = clear_samples['clear_indices']
         clear_labels = clear_samples['clear_labels']
-
-        # 特徴量をイベント空間に射影（明確なサンプルのみ）
-        event_features = self.feature_extractor.project_to_event_space(
-            features,
-            paths_matrix,
-            event_indices=clear_indices
-        )
-
-        # 特徴最適化（射影済みのイベント特徴量を使用）
+        
+        # パス特徴量とイベント特徴量を分離
+        path_features = {}
+        event_features = {}
+        
+        for name, feat in features.items():
+            if len(feat) == paths_matrix.shape[0]:
+                # パス特徴量
+                path_features[name] = feat
+            elif len(feat) == len(clear_indices) or len(feat) == paths_matrix.shape[1]:
+                # イベント特徴量
+                event_features[name] = feat[clear_indices] if len(feat) > len(clear_indices) else feat
+        
+        # パス特徴量をイベント空間に射影（明確なサンプルのみ）
+        if path_features:
+            projected_features = self.feature_extractor.project_to_event_space(
+                path_features,
+                paths_matrix,
+                event_indices=clear_indices
+            )
+            event_features.update(projected_features)
+        
+        # 特徴最適化
         optimization_result = self.feature_optimizer.optimize_features_for_events(
             event_features,
             clear_labels,
             mode="robust"
         )
-
+        
         # 特徴群の情報を追加
         optimization_result.feature_groups = self._analyze_feature_groups(
             optimization_result.selected_features,
             optimization_result.feature_correlations
         )
-
+        
+        if verbose and len(optimization_result.selected_features) > 0:
+            print(f"\n  Top features (by weight):")
+            sorted_features = sorted(
+                [(f, w) for f, w in optimization_result.weights.items()],
+                key=lambda x: x[1], reverse=True
+            )[:5]
+            for feat, weight in sorted_features:
+                print(f"    - {feat}: {weight:.3f}")
+        
         return optimization_result
 
     def _analyze_feature_groups(self,
@@ -1132,33 +1921,53 @@ class Lambda3FocusedDetector:
                                correlations: Dict[str, float]) -> Dict[str, List[str]]:
         """相関の高い特徴をグループ化"""
         groups = {}
-
+        
         # 相関閾値を超える特徴を収集
         high_corr_features = [
             feat for feat in selected_features
             if correlations.get(feat, 0) >= self.correlation_threshold
         ]
-
+        
         if high_corr_features:
             # 特徴名のパターンでグループ化
-            # 例：Q_Λ関連、σ_Q関連など
             for feat in high_corr_features:
                 base_pattern = self._extract_base_pattern(feat)
                 if base_pattern not in groups:
                     groups[base_pattern] = []
                 groups[base_pattern].append(feat)
-
+        
         return groups
 
     def _extract_base_pattern(self, feature_name: str) -> str:
         """特徴名から基本パターンを抽出"""
-        # 例：'sq_Q_Λ' → 'Q_Λ', 'E×σ_Q' → 'σ_Q'
+        # Lambda³コア物理量
         if 'Q_Λ' in feature_name:
             return 'Q_Λ'
         elif 'σ_Q' in feature_name:
             return 'σ_Q'
         elif 'E' in feature_name and 'σ_Q' not in feature_name:
             return 'E'
+        # エントロピー系
+        elif 'shannon' in feature_name.lower() or 'renyi' in feature_name or 'tsallis' in feature_name:
+            return 'entropy'
+        # 拍動系
+        elif 'jump' in feature_name or 'pulse' in feature_name or 'asymm' in feature_name:
+            return 'pulsation'
+        # 周波数系
+        elif 'fft' in feature_name or 'freq' in feature_name or 'spectral' in feature_name:
+            return 'frequency'
+        # ウェーブレット系
+        elif 'wavelet' in feature_name:
+            return 'wavelet'
+        # 欠損系
+        elif 'missing' in feature_name:
+            return 'missing'
+        # 同期系
+        elif 'sync' in feature_name or 'cross' in feature_name or 'coherence' in feature_name:
+            return 'synchronization'
+        # 統計系
+        elif 'skew' in feature_name or 'kurt' in feature_name or 'autocorr' in feature_name:
+            return 'statistics'
         else:
             return 'other'
 
@@ -1166,18 +1975,20 @@ class Lambda3FocusedDetector:
                                optimization_result: OptimizationResult,
                                feature_groups: Dict[str, List[str]]) -> DetectionStrategy:
         """最適な検出戦略を作成"""
-
+        if not optimization_result.weights:
+            return self._create_fallback_strategy()
+        
         # 最高重みとその閾値
         max_weight = max(optimization_result.weights.values())
         weight_threshold = max_weight * self.weight_threshold_ratio
-
+        
         # 重要な特徴を選択
         important_features = [
             (feat, weight)
             for feat, weight in optimization_result.weights.items()
             if weight >= weight_threshold
         ]
-
+        
         # 戦略の決定
         if len(important_features) == 1 and important_features[0][1] > 0.9:
             # 単一特徴が支配的
@@ -1187,69 +1998,69 @@ class Lambda3FocusedDetector:
                 weights={important_features[0][0]: 1.0},
                 confidence=optimization_result.auc
             )
-
-        elif feature_groups and len(list(feature_groups.values())[0]) > 1:
-            # 特徴群が存在
-            dominant_group = max(feature_groups.items(), key=lambda x: len(x[1]))
-            group_features = dominant_group[1]
-
-            # グループ内の重みを再正規化
-            group_weights = {
-                feat: optimization_result.weights.get(feat, 0)
-                for feat in group_features
-            }
-            total_weight = sum(group_weights.values())
-            if total_weight > 0:
-                group_weights = {k: v/total_weight for k, v in group_weights.items()}
-
-            return DetectionStrategy(
-                method="group",
-                features=group_features,
-                weights=group_weights,
-                confidence=optimization_result.auc
-            )
-
-        else:
-            # 複数特徴のアンサンブル
-            feature_list = [f[0] for f in important_features]
-            feature_weights = {f[0]: f[1] for f in important_features}
-
-            # 重みの再正規化
-            total_weight = sum(feature_weights.values())
-            if total_weight > 0:
-                feature_weights = {k: v/total_weight for k, v in feature_weights.items()}
-
-            return DetectionStrategy(
-                method="ensemble",
-                features=feature_list,
-                weights=feature_weights,
-                confidence=optimization_result.auc
-            )
+        
+        elif feature_groups:
+            # 最大の特徴群を使用
+            largest_group = max(feature_groups.items(), key=lambda x: len(x[1]))
+            if len(largest_group[1]) > 2:
+                group_features = largest_group[1]
+                
+                # グループ内の重みを再正規化
+                group_weights = {
+                    feat: optimization_result.weights.get(feat, 0)
+                    for feat in group_features
+                }
+                total_weight = sum(group_weights.values())
+                if total_weight > 0:
+                    group_weights = {k: v/total_weight for k, v in group_weights.items()}
+                
+                return DetectionStrategy(
+                    method="group",
+                    features=group_features,
+                    weights=group_weights,
+                    confidence=optimization_result.auc
+                )
+        
+        # デフォルト：複数特徴のアンサンブル
+        feature_list = [f[0] for f in important_features]
+        feature_weights = {f[0]: f[1] for f in important_features}
+        
+        # 重みの再正規化
+        total_weight = sum(feature_weights.values())
+        if total_weight > 0:
+            feature_weights = {k: v/total_weight for k, v in feature_weights.items()}
+        
+        return DetectionStrategy(
+            method="ensemble",
+            features=feature_list,
+            weights=feature_weights,
+            confidence=optimization_result.auc
+        )
 
     def _apply_detection_strategy(self,
                                 strategy: DetectionStrategy,
                                 features: Dict[str, np.ndarray],
-                                result: Lambda3Result,
+                                result: 'Lambda3Result',
                                 events: np.ndarray) -> np.ndarray:
         """検出戦略を適用してスコアを計算"""
         paths_matrix = np.stack(list(result.paths.values()))
         n_events = events.shape[0]
-
+        
         print(f"\nApplying {strategy.method} detection strategy")
-        print(f"Features: {strategy.features}")
+        print(f"Features: {strategy.features[:5]}{'...' if len(strategy.features) > 5 else ''}")
         print(f"Confidence: {strategy.confidence:.4f}")
-
+        
         if strategy.method == "single":
             # 単一特徴
             feat_name = strategy.features[0]
             return self._compute_single_feature_score(
-                feat_name, features[feat_name], paths_matrix, n_events
+                feat_name, features.get(feat_name), paths_matrix, n_events
             )
-
+        
         else:  # "group" or "ensemble"
             # 複数特徴の重み付き結合
             combined_score = np.zeros(n_events)
-
+            
             for feat_name in strategy.features:
                 if feat_name in features:
                     weight = strategy.weights.get(feat_name, 0)
@@ -1258,21 +2069,24 @@ class Lambda3FocusedDetector:
                             feat_name, features[feat_name], paths_matrix, n_events
                         )
                         combined_score += weight * feat_score
-
+            
             # 最終的な標準化
             if np.std(combined_score) > 1e-10:
                 combined_score = (combined_score - np.mean(combined_score)) / np.std(combined_score)
-
+            
             return combined_score
 
     def _compute_single_feature_score(self,
                                     feature_name: str,
-                                    feature_values: np.ndarray,
+                                    feature_values: Optional[np.ndarray],
                                     paths_matrix: np.ndarray,
                                     n_events: int) -> np.ndarray:
         """単一特徴のスコアを計算"""
+        if feature_values is None:
+            return np.zeros(n_events)
+        
         n_paths = paths_matrix.shape[0]
-
+        
         # パス特徴量の場合は射影が必要
         if len(feature_values) == n_paths:
             # 全イベントに対して射影
@@ -1280,20 +2094,25 @@ class Lambda3FocusedDetector:
                 {feature_name: feature_values},
                 paths_matrix
             )
-            scores = event_features[feature_name]
+            scores = event_features.get(feature_name, np.zeros(n_events))
         elif len(feature_values) == n_events:  # 既にイベント特徴
             scores = feature_values
         else:
-            scores = np.zeros(n_events)
-
+            # サイズが合わない場合は補間またはゼロパディング
+            if len(feature_values) < n_events:
+                scores = np.zeros(n_events)
+                scores[:len(feature_values)] = feature_values
+            else:
+                scores = feature_values[:n_events]
+        
         # 標準化
         if np.std(scores) > 1e-10:
             scores = (scores - np.mean(scores)) / np.std(scores)
-
+        
         return scores
 
     def _create_fallback_strategy(self) -> DetectionStrategy:
-        """フォールバック戦略（サンプル不足時）"""
+        """フォールバック戦略"""
         return DetectionStrategy(
             method="single",
             features=["sq_Q_Λ"],
@@ -1302,25 +2121,67 @@ class Lambda3FocusedDetector:
         )
 
     def _compute_fallback_scores(self,
-                               result: Lambda3Result,
+                               result: 'Lambda3Result',
                                events: np.ndarray) -> np.ndarray:
         """フォールバックスコアの計算"""
         charges = np.array(list(result.topological_charges.values()))
         sq_charges = charges ** 2
         paths_matrix = np.stack(list(result.paths.values()))
         scores = np.sum(np.abs(paths_matrix) * sq_charges[:, None], axis=0)
-
+        
         if np.std(scores) > 0:
             scores = (scores - np.mean(scores)) / np.std(scores)
-
+        
         return scores
+
+    def explain_detection(self, 
+                         strategy: DetectionStrategy,
+                         features: Dict[str, np.ndarray],
+                         top_n: int = 10) -> str:
+        """検出結果の説明文を生成"""
+        explanation = []
+        explanation.append(f"\n=== Detection Explanation ===")
+        explanation.append(f"Strategy: {strategy.method}")
+        explanation.append(f"Confidence: {strategy.confidence:.2%}")
+        
+        # 特徴の分類
+        feature_categories = {}
+        for feat in strategy.features[:top_n]:
+            pattern = self._extract_base_pattern(feat)
+            if pattern not in feature_categories:
+                feature_categories[pattern] = []
+            feature_categories[pattern].append((feat, strategy.weights.get(feat, 0)))
+        
+        explanation.append(f"\nTop contributing feature groups:")
+        for category, feats in feature_categories.items():
+            total_weight = sum(w for _, w in feats)
+            explanation.append(f"\n{category.upper()} ({total_weight:.2%} contribution):")
+            for feat_name, weight in sorted(feats, key=lambda x: x[1], reverse=True):
+                explanation.append(f"  - {feat_name}: {weight:.3f}")
+        
+        # 物理的解釈
+        explanation.append(f"\nPhysical interpretation:")
+        if 'Q_Λ' in feature_categories:
+            explanation.append("  - Topological structure shows significant anomalies")
+        if 'frequency' in feature_categories:
+            explanation.append("  - Frequency domain reveals abnormal spectral patterns")
+        if 'wavelet' in feature_categories:
+            explanation.append("  - Time-frequency analysis detected localized anomalies")
+        if 'synchronization' in feature_categories:
+            explanation.append("  - Multi-channel synchronization patterns are disrupted")
+        if 'pulsation' in feature_categories:
+            explanation.append("  - Structural jumps (ΔΛC) indicate sudden changes")
+        
+        return "\n".join(explanation)
 
 # ===============================
 # 統一異常検知システム
 # ===============================
 class Lambda3ZeroShotDetector:
     """
-    Lambda³ゼロショット異常検知システム
+    リファクタリング版Lambda³ゼロショット異常検知システム
+    基本：構造テンソル解析 + 特徴量最適化
+    オプション：ジャンプ解析、カーネル空間、アンサンブル
     """
 
     def __init__(self, config: L3Config = None):
@@ -1349,6 +2210,10 @@ class Lambda3ZeroShotDetector:
         """Lambda³解析の実行"""
         if n_paths is None:
             n_paths = self.config.n_paths
+
+        # 動的パラメータ調整（新規追加）
+        adaptive_params = compute_adaptive_window_size(events)
+        update_global_constants(adaptive_params)    
 
         # キャッシュチェック
         cache_key = f"{events.shape}_{n_paths}"
@@ -1395,13 +2260,13 @@ class Lambda3ZeroShotDetector:
     def detect_anomalies(self, result: Lambda3Result, events: np.ndarray,
                     use_adaptive_weights: bool = False) -> np.ndarray:
         """
-        異常検知
+        圧倒的な性能を目指す革命的異常検知
         """
         n_events = events.shape[0]
         paths_matrix = np.stack(list(result.paths.values()))
         charges = np.array(list(result.topological_charges.values()))
         stabilities = np.array(list(result.stabilities.values()))
-        
+
         # 1. マルチスケールジャンプ検出（複数の解像度で異常を捕捉）
         multi_jump_scores = []
         for window, percentile in zip(MULTI_SCALE_WINDOWS, MULTI_SCALE_PERCENTILES):
@@ -1410,10 +2275,10 @@ class Lambda3ZeroShotDetector:
             )
             jump_scores = self._compute_jump_anomaly_scores(jump_analyzer, events)
             multi_jump_scores.append(self._ensure_length(jump_scores, n_events))
-        
+
         # 最大値を取る（どのスケールでも異常なら異常）
         jump_anomaly_scores = np.max(multi_jump_scores, axis=0)
-        
+
         # 2. 強化版ハイブリッドスコア
         hybrid_scores = compute_lambda3_hybrid_tikhonov_scores(
             paths_matrix, events, charges, stabilities,
@@ -1424,7 +2289,7 @@ class Lambda3ZeroShotDetector:
             w_pulse=0.3     # 拍動も考慮
         )
         hybrid_scores = self._ensure_length(hybrid_scores, n_events)
-        
+
         # 3. アンサンブルカーネル戦略（複数カーネルの強みを統合）
         kernel_scores_list = []
         kernel_types = [
@@ -1437,14 +2302,14 @@ class Lambda3ZeroShotDetector:
                 events, result, kernel_type=k_type, **k_params
             )
             kernel_scores_list.append(self._ensure_length(k_scores, n_events))
-        
+
         # 各カーネルの最良スコアを採用
         kernel_scores = np.max(kernel_scores_list, axis=0)
-        
+
         # 4. 新規：構造的異常スコア
         structural_scores = self._compute_structural_anomaly_scores(result, events)
         structural_scores = self._ensure_length(structural_scores, n_events)
-        
+
         # 5. 革新的な統合戦略
         if use_adaptive_weights:
             # より積極的な適応
@@ -1454,40 +2319,40 @@ class Lambda3ZeroShotDetector:
                 0.30 * kernel_scores +
                 0.15 * structural_scores
             )
-            
+
             # 明確なサンプルの選択（より積極的に）
             score_percentiles = np.percentile(base_scores, [10, 90])
             clear_normal = base_scores < score_percentiles[0]
             clear_anomaly = base_scores > score_percentiles[1]
-            
+
             if np.sum(clear_normal) > 5 and np.sum(clear_anomaly) > 5:
                 clear_mask = clear_normal | clear_anomaly
                 clear_labels = clear_anomaly[clear_mask].astype(int)
                 clear_indices = np.where(clear_mask)[0]
-                
+
                 component_scores = {
                     'jump': jump_anomaly_scores[clear_mask],
                     'hybrid': hybrid_scores[clear_mask],
                     'kernel': kernel_scores[clear_mask],
                     'structural': structural_scores[clear_mask]
                 }
-                
+
                 self._last_result = result
-                
+
                 # 強制的に全コンポーネントを使用する最適化
                 optimal_weights = self._optimize_component_weights_aggressive(
-                    component_scores, 
+                    component_scores,
                     clear_labels,
                     event_indices=clear_indices,
                     events=events,
                     force_all_components=True,
                     verbose=True
                 )
-                
+
                 print(f"Adaptive weights learned from {len(clear_labels)} clear samples:")
                 for name, weight in optimal_weights.items():
                     print(f"  {name}: {weight:.3f}")
-                
+
                 # 最適化された重みで最終スコアを計算
                 final_scores = (
                     optimal_weights.get('jump', 0.20) * jump_anomaly_scores +
@@ -1506,10 +2371,10 @@ class Lambda3ZeroShotDetector:
                 0.30 * kernel_scores +
                 0.15 * structural_scores
             )
-        
+
         # 6. 非線形変換で異常を強調
         final_scores = np.sign(final_scores) * np.power(np.abs(final_scores), 0.8)
-        
+
         # 7. 革新的な適応的標準化
         return self._adaptive_standardize(final_scores)
 
@@ -1517,9 +2382,9 @@ class Lambda3ZeroShotDetector:
         """Lambda³構造の歪みを直接評価"""
         n_events = events.shape[0]
         scores = np.zeros(n_events)
-        
+
         paths_matrix = np.stack(list(result.paths.values()))
-        
+
         # 1. パス間の相関破壊
         for i in range(n_events):
             if i > 0:
@@ -1527,7 +2392,7 @@ class Lambda3ZeroShotDetector:
                 local_changes = np.abs(paths_matrix[:, i] - paths_matrix[:, i-1])
                 # 変化の不均一性（一部のパスだけ大きく変化）
                 scores[i] += np.std(local_changes) * np.max(local_changes)
-        
+
         # 2. トポロジカルチャージの急変
         charges = np.array(list(result.topological_charges.values()))
         for i in range(1, n_events):
@@ -1535,14 +2400,14 @@ class Lambda3ZeroShotDetector:
             eff_charge_curr = np.sum(np.abs(paths_matrix[:, i]) * np.abs(charges))
             eff_charge_prev = np.sum(np.abs(paths_matrix[:, i-1]) * np.abs(charges))
             scores[i] += np.abs(eff_charge_curr - eff_charge_prev)
-        
+
         # 3. エネルギー集中度
         for i in range(n_events):
             path_energies = paths_matrix[:, i] ** 2
             # エネルギーが特定のパスに集中している場合
             concentration = np.max(path_energies) / (np.sum(path_energies) + 1e-10)
             scores[i] += concentration ** 2
-        
+
         return scores
 
     def _adaptive_standardize(self, scores: np.ndarray) -> np.ndarray:
@@ -1550,13 +2415,13 @@ class Lambda3ZeroShotDetector:
         # 1. 基本統計量
         median = np.median(scores)
         mad = np.median(np.abs(scores - median))  # Median Absolute Deviation
-        
+
         # 2. 外れ値の識別
         if mad > 0:
             z_scores = 0.6745 * (scores - median) / mad  # MADベースのzスコア
         else:
             z_scores = (scores - np.mean(scores)) / (np.std(scores) + 1e-10)
-        
+
         # 3. 外れ値を強調する変換
         # 正常範囲（|z| < 2）はそのまま、異常値は指数的に強調
         emphasized = np.where(
@@ -1564,32 +2429,57 @@ class Lambda3ZeroShotDetector:
             z_scores,
             np.sign(z_scores) * (2 + np.log1p(np.abs(z_scores) - 2) * 3)
         )
-        
-        return emphasized  
 
-    def _detect_multiscale_jumps_with_params(self, events: np.ndarray, 
-                                        window_size: int, 
-                                        percentile: float) -> Dict:
-        """パラメータ化されたジャンプ検出"""
+        return emphasized
+
+    def _detect_multiscale_jumps_with_params(self, events: np.ndarray,
+                                        window_size: int = None,
+                                        percentile: float = None) -> Dict:
+        """パラメータ化されたジャンプ検出（動的調整版）"""
         n_events, n_features = events.shape
         jump_data = {'features': {}, 'integrated': {}}
+        
+        # 動的パラメータ計算（未指定の場合）
+        if window_size is None or percentile is None:
+            adaptive_params = compute_adaptive_window_size(events)
+            if window_size is None:
+                window_size = adaptive_params['jump']
+            if percentile is None:
+                # ボラティリティに基づく動的パーセンタイル
+                volatility = adaptive_params['volatility_metrics']['global_volatility']
+                percentile = 94.0 - (volatility - 1.0) * 2.0  # 高ボラティリティでより敏感に
+                percentile = np.clip(percentile, 85.0, 98.0)
         
         # 各特徴次元でのジャンプ検出（カスタムパラメータ使用）
         for f in range(n_features):
             data = events[:, f]
             
+            # 特徴量ごとの局所ボラティリティ
+            feature_volatility = np.std(data) / (np.mean(np.abs(data)) + 1e-10)
+            
+            # 特徴量別の動的調整
+            feature_window = int(window_size * (1.0 / (1.0 + feature_volatility)))
+            feature_window = max(5, min(feature_window, 50))
+            
+            feature_percentile = percentile - feature_volatility * 1.5
+            feature_percentile = np.clip(feature_percentile, 80.0, 98.0)
+            
             # カスタムパーセンタイルでジャンプ検出
-            diff, threshold = calculate_diff_and_threshold(data, percentile)
+            diff, threshold = calculate_diff_and_threshold(data, feature_percentile)
             pos_jumps, neg_jumps = detect_jumps(diff, threshold)
             
             # カスタムウィンドウサイズで局所適応的ジャンプ
-            local_std = calculate_local_std(data, window_size)
+            local_std = calculate_local_std(data, feature_window)
             score = np.abs(diff) / (local_std + 1e-8)
-            local_threshold = np.percentile(score, percentile)
+            
+            # 動的な局所閾値（特徴量の特性に応じて）
+            local_percentile = feature_percentile - 2.0  # 局所的にはより敏感に
+            local_threshold = np.percentile(score[score > 0], local_percentile)
             local_jumps = (score > local_threshold).astype(int)
             
-            # テンションスカラー（カスタムウィンドウ）
-            rho_t = calculate_rho_t(data, window_size)
+            # テンションスカラー（動的ウィンドウ）
+            tension_window = int(feature_window * 0.8)  # テンション用は少し小さく
+            rho_t = calculate_rho_t(data, tension_window)
             
             # 拍動エネルギー
             jump_intensity, asymmetry, pulse_power = compute_pulsation_energy_from_jumps(
@@ -1606,12 +2496,24 @@ class Lambda3ZeroShotDetector:
                 'jump_intensity': jump_intensity,
                 'asymmetry': asymmetry,
                 'pulse_power': pulse_power,
-                'window_size': window_size,
-                'percentile': percentile
+                'window_size': feature_window,  # 実際に使用したウィンドウサイズ
+                'percentile': feature_percentile,  # 実際に使用したパーセンタイル
+                'feature_volatility': feature_volatility,  # デバッグ用
+                'tension_window': tension_window  # テンション計算用ウィンドウ
             }
         
         # 統合ジャンプパターン
         jump_data['integrated'] = self._integrate_cross_feature_jumps(jump_data['features'])
+        
+        # 適応的パラメータの記録
+        jump_data['adaptive_params'] = {
+            'base_window': window_size,
+            'base_percentile': percentile,
+            'n_features_with_jumps': sum(1 for f in jump_data['features'].values() 
+                                        if np.any(f['pos_jumps']) or np.any(f['neg_jumps'])),
+            'avg_feature_volatility': np.mean([f['feature_volatility'] 
+                                              for f in jump_data['features'].values()])
+        }
         
         return jump_data
 
@@ -1623,33 +2525,33 @@ class Lambda3ZeroShotDetector:
         """パラメータを指定してカーネル異常スコアを計算"""
         # カーネルGram行列の計算
         K = compute_kernel_gram_matrix(
-            events, 
+            events,
             kernel_type=kernel_type,
             gamma=kernel_params.get('gamma', 1.0),
             degree=kernel_params.get('degree', 3),
             coef0=kernel_params.get('coef0', 1.0),
             alpha=kernel_params.get('alpha', 0.01)
         )
-        
+
         paths_matrix = np.stack(list(result.paths.values()))
         n_events = events.shape[0]
-        
+
         # カーネル空間での再構成
         K_recon = np.zeros((n_events, n_events))
         for i in range(n_events):
             for j in range(n_events):
                 for k in range(len(paths_matrix)):
                     K_recon[i, j] += paths_matrix[k, i] * K[i, j] * paths_matrix[k, j]
-        
+
         # 正規化
         K_norm = np.sqrt(np.trace(K @ K))
         if K_norm > 0:
             K /= K_norm
-        
+
         recon_norm = np.sqrt(np.trace(K_recon @ K_recon))
         if recon_norm > 0:
             K_recon /= recon_norm
-        
+
         # イベントごとの再構成誤差
         kernel_scores = np.zeros(n_events)
         for i in range(n_events):
@@ -1658,9 +2560,9 @@ class Lambda3ZeroShotDetector:
                 diff = K[i, j] - K_recon[i, j]
                 row_error += diff * diff
             kernel_scores[i] = np.sqrt(row_error)
-        
-        return kernel_scores                 
-        
+
+        return kernel_scores
+
     def _compute_sync_anomaly_scores(self, jump_structures: Dict) -> np.ndarray:
         """Calculate synchronization anomaly scores"""
         # unified_jumpsから実際のイベント数を決定
@@ -1670,7 +2572,7 @@ class Lambda3ZeroShotDetector:
             # フォールバック：最初の特徴のジャンプ配列から推定
             first_feature = list(jump_structures['features'].values())[0]
             n_events = len(first_feature['pos_jumps'])
-        
+
         scores = np.zeros(n_events)
 
         # Anomalies in high synchronization clusters
@@ -1683,22 +2585,22 @@ class Lambda3ZeroShotDetector:
             if f_idx in jump_structures['features']:
                 feature_data = jump_structures['features'][f_idx]
                 feature_sync = np.mean([sync_matrix[f_idx, j] for j in range(n_features) if j != f_idx])
-                
+
                 if feature_sync > sync_threshold:
                     pos_jumps = feature_data['pos_jumps']
                     neg_jumps = feature_data['neg_jumps']
-                    
+
                     # Ensure jumps arrays have correct length
                     jumps_len = min(len(pos_jumps), len(neg_jumps), n_events)
                     jumps = np.zeros(n_events, dtype=bool)
                     jumps[:jumps_len] = (pos_jumps[:jumps_len] | neg_jumps[:jumps_len]).astype(bool)
-                    
+
                     scores += jumps * feature_sync
 
         # Normalize by number of features
         if n_features > 0:
             scores = scores / n_features
-            
+
         return scores
 
     def _optimize_component_weights_aggressive(self,
@@ -1716,29 +2618,29 @@ class Lambda3ZeroShotDetector:
         from scipy.optimize import differential_evolution
         from sklearn.metrics import roc_auc_score
         from sklearn.preprocessing import StandardScaler
-        
+
         feature_names = list(component_scores.keys())
         n_features = len(feature_names)
         n_samples = len(labels)
-        
+
         # 1. 特徴量行列の構築
         feature_matrix = np.column_stack([component_scores[name] for name in feature_names])
         feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=10.0, neginf=-10.0)
-        
+
         # 2. 多重共線性の除去（強制モードではスキップ）
         if not force_all_components and remove_collinearity and n_features > 2:
             # 既存のコードと同じ処理
             corr_matrix = np.corrcoef(feature_matrix.T)
             corr_matrix = np.nan_to_num(corr_matrix, nan=0.0)
             # ... (既存の共線性除去コード)
-        
+
         # 3. スケーリング（ロバスト版）
         scaler = StandardScaler()
         X_scaled = scaler.fit_transform(feature_matrix)
-        
+
         # 4. サンプル重みの計算（よりアグレッシブに）
         sample_weights = np.ones(n_samples)
-        
+
         # クラスバランスを強く考慮
         try:
             from sklearn.utils.class_weight import compute_sample_weight
@@ -1748,58 +2650,58 @@ class Lambda3ZeroShotDetector:
             sample_weights *= class_weights
         except:
             pass
-        
+
         sample_weights = np.clip(sample_weights, 0.1, 10.0)
-        
+
         # 5. 差分進化を最初から使用（L1正則化をスキップ）
         if verbose:
             print(f"Aggressive optimization with {n_features} components")
-        
+
         def objective(weights):
             # 重み付きスコア
             scores = X_scaled @ weights
-            
+
             # より急峻なシグモイド変換（異常をより明確に分離）
             scores_normalized = (scores - np.mean(scores)) / (np.std(scores) + 1e-8)
             probs = 1 / (1 + np.exp(-2 * scores_normalized))  # 係数2で急峻化
-            
+
             try:
                 # AUC最大化
                 auc = roc_auc_score(labels, probs, sample_weight=sample_weights)
-                
+
                 # ペナルティ項
                 penalty = 0
-                
+
                 if force_all_components:
                     # 全コンポーネント使用を強制
                     min_weight = np.min(weights)
                     if min_weight < 0.05:  # 最小5%の重み
                         penalty += 0.2 * (0.05 - min_weight) ** 2
-                    
+
                     # 重みの分散を促進（一つの特徴に偏らないように）
                     weight_std = np.std(weights)
                     if weight_std > 0.4:  # 分散が大きすぎる場合
                         penalty += 0.1 * (weight_std - 0.4)
-                
+
                 # エントロピー正則化（重みの多様性を促進）
                 weights_norm = weights / (np.sum(weights) + 1e-8)
                 entropy = -np.sum(weights_norm * np.log(weights_norm + 1e-8))
                 max_entropy = np.log(n_features)
                 entropy_bonus = 0.05 * (entropy / max_entropy)  # 0-0.05のボーナス
-                
+
                 return -(auc + entropy_bonus - penalty)
-                
+
             except Exception as e:
                 if verbose:
                     print(f"Objective function error: {e}")
                 return 1.0
-        
+
         # 境界設定：強制モードでは最小値を高く設定
         if force_all_components:
             bounds = [(0.05, 1.0) for _ in range(n_features)]  # 最小5%
         else:
             bounds = [(0.0, 1.0) for _ in range(n_features)]
-        
+
         # 差分進化の実行（より多くの反復）
         result_de = differential_evolution(
             objective,
@@ -1813,14 +2715,14 @@ class Lambda3ZeroShotDetector:
             polish=True,  # 最終的な局所最適化
             disp=verbose
         )
-        
+
         # 最適重みの取得
         best_weights = result_de.x
-        
+
         # 6. 追加の局所最適化（Nelder-Mead）
         if force_all_components:
             from scipy.optimize import minimize
-            
+
             # 初期値は差分進化の結果
             local_result = minimize(
                 objective,
@@ -1828,42 +2730,128 @@ class Lambda3ZeroShotDetector:
                 method='Nelder-Mead',
                 options={'maxiter': 200}
             )
-            
+
             if local_result.fun < result_de.fun:
                 best_weights = local_result.x
                 if verbose:
                     print("Local optimization improved the solution")
-        
+
         # 7. 正規化と最小重みの保証
         if force_all_components:
             # 最小重みを保証
             best_weights = np.maximum(best_weights, 0.05)
-        
+
         # 合計が1になるように正規化
         best_weights = best_weights / np.sum(best_weights)
-        
+
         # 最終的なAUCを計算
         final_scores = X_scaled @ best_weights
         final_probs = 1 / (1 + np.exp(-2 * (final_scores - np.mean(final_scores)) / (np.std(final_scores) + 1e-8)))
         final_auc = roc_auc_score(labels, final_probs, sample_weight=sample_weights)
-        
+
         # 辞書形式に変換
         optimal_weights = {feature_names[i]: best_weights[i] for i in range(n_features)}
-        
+
         if verbose:
             print(f"\nAggressive optimization completed:")
             print(f"  Final AUC: {final_auc:.4f}")
             print(f"  All weights > 0.05: {all(w >= 0.05 for w in best_weights)}")
             print(f"  Weight std: {np.std(best_weights):.4f}")
-            
+
             sorted_weights = sorted(optimal_weights.items(), key=lambda x: x[1], reverse=True)
             print("\nComponent weights:")
             for feat, weight in sorted_weights:
                 print(f"  {feat}: {weight:.4f}")
-        
+
         return optimal_weights
 
-    
+    def explain_anomaly(self, event_idx: int, result: Lambda3Result, events: np.ndarray) -> Dict:
+        """異常の物理的説明を生成"""
+        explanation = {
+            'event_index': event_idx,
+            'anomaly_score': 0.0,
+            'jump_based': {},
+            'topological': {},
+            'energetic': {},
+            'entropic': {},
+            'kernel_space': {},
+            'recommendation': ""
+        }
+
+        # 異常スコア計算
+        anomaly_scores = self.detect_anomalies(result, events)
+        explanation['anomaly_score'] = float(anomaly_scores[event_idx])
+
+        # ジャンプベースの説明
+        if self.jump_analyzer and result.jump_structures:
+            integrated = result.jump_structures['integrated']
+            if integrated['unified_jumps'][event_idx]:
+                sync_features = []
+                for f, data in result.jump_structures['features'].items():
+                    if (data['pos_jumps'][event_idx] or data['neg_jumps'][event_idx]):
+                        sync_features.append(f)
+
+                explanation['jump_based'] = {
+                    'is_jump': True,
+                    'importance': float(integrated['jump_importance'][event_idx]),
+                    'synchronized_features': sync_features,
+                    'n_sync_features': len(sync_features),
+                    'in_cluster': any(event_idx in c['indices'] for c in integrated['jump_clusters'])
+                }
+
+        # トポロジカル説明
+        topo_info = {}
+        for p, path in result.paths.items():
+            if event_idx > 0:
+                delta = np.abs(path[event_idx] - path[event_idx-1])
+                path_std = np.std(np.diff(path))
+                if delta > path_std * 2:
+                    topo_info[f'path_{p}'] = {
+                        'charge': float(result.topological_charges[p]),
+                        'stability': float(result.stabilities[p]),
+                        'classification': result.classifications[p],
+                        'delta_lambda': float(delta),
+                        'relative_jump': float(delta / path_std)
+                    }
+        explanation['topological'] = topo_info
+
+        # エネルギー説明
+        energy_info = {}
+        for p in result.paths.keys():
+            energy_info[f'path_{p}'] = {
+                'total_energy': float(result.energies[p]),
+                'local_energy': float(result.paths[p][event_idx]**2)
+            }
+        explanation['energetic'] = energy_info
+
+        # エントロピー説明
+        entropy_info = {}
+        for p, ent_dict in result.entropies.items():
+            main_entropy = ent_dict.get('shannon', 0)
+            jump_entropy = ent_dict.get('shannon_jump', None)
+
+            entropy_info[f'path_{p}'] = {
+                'shannon': float(main_entropy),
+                'jump_conditional': float(jump_entropy) if jump_entropy else None
+            }
+        explanation['entropic'] = entropy_info
+
+        # 推奨アクション
+        if explanation['anomaly_score'] > 2.0:
+            if explanation['jump_based'].get('is_jump') and explanation['jump_based']['importance'] > 0.7:
+                explanation['recommendation'] = "Critical structural transition detected. " \
+                                              "Immediate investigation required. " \
+                                              "Multiple synchronized features show simultaneous jumps."
+            else:
+                explanation['recommendation'] = "High anomaly score detected. Investigation recommended."
+        elif explanation['anomaly_score'] > 1.0:
+            explanation['recommendation'] = "Moderate anomaly detected. Monitor adjacent events for cascading effects."
+        else:
+            explanation['recommendation'] = "Low anomaly level. Continue normal monitoring."
+
+        return explanation
+
+
     def save_results(self, 
                     result: Lambda3Result,
                     anomaly_scores: np.ndarray,
@@ -2033,92 +3021,6 @@ class Lambda3ZeroShotDetector:
             print(f"  - Max feature sync: {result.jump_structures['integrated']['max_sync']:.3f}")
         
         return saved_files
-      
-    def explain_anomaly(self, event_idx: int, result: Lambda3Result, events: np.ndarray) -> Dict:
-        """異常の物理的説明を生成"""
-        explanation = {
-            'event_index': event_idx,
-            'anomaly_score': 0.0,
-            'jump_based': {},
-            'topological': {},
-            'energetic': {},
-            'entropic': {},
-            'kernel_space': {},
-            'recommendation': ""
-        }
-
-        # 異常スコア計算
-        anomaly_scores = self.detect_anomalies(result, events)
-        explanation['anomaly_score'] = float(anomaly_scores[event_idx])
-
-        # ジャンプベースの説明
-        if self.jump_analyzer and result.jump_structures:
-            integrated = result.jump_structures['integrated']
-            if integrated['unified_jumps'][event_idx]:
-                sync_features = []
-                for f, data in result.jump_structures['features'].items():
-                    if (data['pos_jumps'][event_idx] or data['neg_jumps'][event_idx]):
-                        sync_features.append(f)
-
-                explanation['jump_based'] = {
-                    'is_jump': True,
-                    'importance': float(integrated['jump_importance'][event_idx]),
-                    'synchronized_features': sync_features,
-                    'n_sync_features': len(sync_features),
-                    'in_cluster': any(event_idx in c['indices'] for c in integrated['jump_clusters'])
-                }
-
-        # トポロジカル説明
-        topo_info = {}
-        for p, path in result.paths.items():
-            if event_idx > 0:
-                delta = np.abs(path[event_idx] - path[event_idx-1])
-                path_std = np.std(np.diff(path))
-                if delta > path_std * 2:
-                    topo_info[f'path_{p}'] = {
-                        'charge': float(result.topological_charges[p]),
-                        'stability': float(result.stabilities[p]),
-                        'classification': result.classifications[p],
-                        'delta_lambda': float(delta),
-                        'relative_jump': float(delta / path_std)
-                    }
-        explanation['topological'] = topo_info
-
-        # エネルギー説明
-        energy_info = {}
-        for p in result.paths.keys():
-            energy_info[f'path_{p}'] = {
-                'total_energy': float(result.energies[p]),
-                'local_energy': float(result.paths[p][event_idx]**2)
-            }
-        explanation['energetic'] = energy_info
-
-        # エントロピー説明
-        entropy_info = {}
-        for p, ent_dict in result.entropies.items():
-            main_entropy = ent_dict.get('shannon', 0)
-            jump_entropy = ent_dict.get('shannon_jump', None)
-
-            entropy_info[f'path_{p}'] = {
-                'shannon': float(main_entropy),
-                'jump_conditional': float(jump_entropy) if jump_entropy else None
-            }
-        explanation['entropic'] = entropy_info
-
-        # 推奨アクション
-        if explanation['anomaly_score'] > 2.0:
-            if explanation['jump_based'].get('is_jump') and explanation['jump_based']['importance'] > 0.7:
-                explanation['recommendation'] = "Critical structural transition detected. " \
-                                              "Immediate investigation required. " \
-                                              "Multiple synchronized features show simultaneous jumps."
-            else:
-                explanation['recommendation'] = "High anomaly score detected. Investigation recommended."
-        elif explanation['anomaly_score'] > 1.0:
-            explanation['recommendation'] = "Moderate anomaly detected. Monitor adjacent events for cascading effects."
-        else:
-            explanation['recommendation'] = "Low anomaly level. Continue normal monitoring."
-
-        return explanation
 
     def visualize_results(self,
                          events: np.ndarray,
@@ -2290,19 +3192,88 @@ class Lambda3ZeroShotDetector:
         return scores
 
     def _select_clear_samples(self,
-                            base_scores: np.ndarray,
-                            percentiles: Tuple[float, float]) -> Tuple[np.ndarray, np.ndarray]:
-        """明確な正常/異常サンプルの選択"""
+                        base_scores: np.ndarray,
+                        percentiles: Tuple[float, float],
+                        events: np.ndarray = None,
+                        result: Lambda3Result = None) -> Tuple[np.ndarray, np.ndarray]:
+        """明確な正常/異常サンプルの選択（弱い異常パターン考慮版）"""
         low_threshold = np.percentile(base_scores, percentiles[0])
         high_threshold = np.percentile(base_scores, percentiles[1])
-
+        
         clear_normal = base_scores < low_threshold
         clear_anomaly = base_scores > high_threshold
-
+        
+        # === 弱い異常パターンの追加検出 ===
+        if events is not None and result is not None:
+            middle_scores = base_scores[(~clear_normal) & (~clear_anomaly)]
+            if len(middle_scores) > 0:
+                middle_indices = np.where((~clear_normal) & (~clear_anomaly))[0]
+                
+                # 1. 部分的異常の検出（特徴量の一部だけ異常）
+                partial_anomalies = []
+                for idx in middle_indices:
+                    feature_deviations = np.abs(events[idx] - np.median(events, axis=0)) / (np.std(events, axis=0) + 1e-10)
+                    # 30%以上の特徴が異常値を示す
+                    if np.sum(feature_deviations > 3.0) >= events.shape[1] * 0.3:
+                        partial_anomalies.append(idx)
+                
+                # 2. 緩やかな劣化パターン（前後との相関が低い）
+                degradation_anomalies = []
+                for idx in middle_indices:
+                    if 1 < idx < len(events) - 1:
+                        # 前後のイベントとの相関
+                        corr_prev = np.corrcoef(events[idx], events[idx-1])[0,1]
+                        corr_next = np.corrcoef(events[idx], events[idx+1])[0,1]
+                        # 相関が急激に低下
+                        if corr_prev < 0.3 or corr_next < 0.3:
+                            degradation_anomalies.append(idx)
+                
+                # 3. 微小な周期的異常（FFTで検出）
+                periodic_anomalies = []
+                if len(middle_indices) > 10:
+                    for idx in middle_indices:
+                        # 局所的なFFT（前後5イベント）
+                        local_start = max(0, idx - 5)
+                        local_end = min(len(events), idx + 6)
+                        local_fft = np.abs(np.fft.fft(events[local_start:local_end], axis=0))
+                        # 特定周波数にピーク
+                        if np.max(local_fft[1:len(local_fft)//2]) > np.mean(local_fft) * 5:
+                            periodic_anomalies.append(idx)
+                
+                # 4. ジャンプ構造からの弱い異常
+                weak_jump_anomalies = []
+                if result.jump_structures:
+                    jump_importance = result.jump_structures['integrated']['jump_importance']
+                    for idx in middle_indices:
+                        # 弱いジャンプ（0.2-0.4の重要度）
+                        if 0.2 < jump_importance[idx] < 0.4:
+                            weak_jump_anomalies.append(idx)
+                
+                # 弱い異常を統合
+                weak_anomaly_set = set(partial_anomalies + degradation_anomalies + 
+                                      periodic_anomalies + weak_jump_anomalies)
+                
+                # スコアに基づいて上位を異常として追加
+                weak_anomaly_indices = np.array(sorted(weak_anomaly_set))
+                if len(weak_anomaly_indices) > 0:
+                    weak_scores = base_scores[weak_anomaly_indices]
+                    # 中間領域の上位30%を異常として追加
+                    weak_threshold = np.percentile(weak_scores, 70)
+                    additional_anomalies = weak_anomaly_indices[weak_scores >= weak_threshold]
+                    
+                    # 既存の明確な異常に追加
+                    clear_anomaly[additional_anomalies] = True
+        
         clear_mask = clear_normal | clear_anomaly
         clear_indices = np.where(clear_mask)[0]
         clear_labels = clear_anomaly[clear_mask].astype(int)
-
+        
+        # デバッグ情報
+        if events is not None:
+            print(f"  Clear samples enhanced:")
+            print(f"    Original clear: {np.sum(clear_normal) + np.sum(clear_anomaly)}")
+            print(f"    After weak pattern detection: {len(clear_indices)}")
+        
         return clear_indices, clear_labels
 
     def _compute_with_optimized_features(self,
@@ -2504,7 +3475,7 @@ class Lambda3ZeroShotDetector:
         # 各特徴次元でのジャンプ検出
         for f in range(n_features):
             data = events[:, f]
-            
+
             # ここで配列サイズを確認
             assert len(data) == n_events, f"Feature {f} has wrong size: {len(data)} vs {n_events}"
 
@@ -2767,43 +3738,149 @@ class Lambda3ZeroShotDetector:
         return energies
 
     def _compute_jump_conditional_entropies(self,
-                                          paths: Dict[int, np.ndarray],
-                                          jump_structures: Dict) -> Dict[int, Dict[str, float]]:
-        """ジャンプイベントでの条件付きエントロピー"""
+                                      paths: Dict[int, np.ndarray],
+                                      jump_structures: Dict) -> Dict[int, Dict[str, float]]:
+        """ジャンプイベントでの条件付きエントロピー（局所構造解析強化版）"""
         entropies = {}
         jump_mask = jump_structures['integrated']['unified_jumps']
-
+        
+        # ジャンプ周辺の窓サイズ
+        JUMP_WINDOW = 5  # ジャンプ前後5イベント
+        
         for i, path in paths.items():
             # 全体のエントロピー
             all_entropies = compute_all_entropies_jit(path)
             entropy_keys = ["shannon", "renyi_2", "tsallis_1.5", "max", "min", "var"]
-
+            
             # ジャンプ位置と非ジャンプ位置で分離
             jump_indices = np.where(jump_mask)[0]
             non_jump_indices = np.where(~jump_mask)[0]
-
+            
             entropy_dict = {}
-
+            
             # 全体エントロピー
             for j, key in enumerate(entropy_keys):
                 entropy_dict[key] = all_entropies[j]
-
+            
             # ジャンプ条件付きエントロピー
             if len(jump_indices) > 0:
                 jump_path = path[jump_indices]
                 jump_entropies = compute_all_entropies_jit(jump_path)
                 for j, key in enumerate(entropy_keys):
                     entropy_dict[f"{key}_jump"] = jump_entropies[j]
-
+            
             # 非ジャンプ条件付きエントロピー
             if len(non_jump_indices) > 0:
                 non_jump_path = path[non_jump_indices]
                 non_jump_entropies = compute_all_entropies_jit(non_jump_path)
                 for j, key in enumerate(entropy_keys):
                     entropy_dict[f"{key}_non_jump"] = non_jump_entropies[j]
-
+            
+            # === 新規追加：ジャンプ周辺のエントロピー解析 ===
+            
+            # 1. ジャンプ前後の窓内エントロピー
+            jump_vicinity_indices = set()
+            for jump_idx in jump_indices:
+                for offset in range(-JUMP_WINDOW, JUMP_WINDOW + 1):
+                    vicinity_idx = jump_idx + offset
+                    if 0 <= vicinity_idx < len(path):
+                        jump_vicinity_indices.add(vicinity_idx)
+            
+            if jump_vicinity_indices:
+                vicinity_indices = np.array(sorted(jump_vicinity_indices))
+                vicinity_path = path[vicinity_indices]
+                vicinity_entropies = compute_all_entropies_jit(vicinity_path)
+                for j, key in enumerate(entropy_keys):
+                    entropy_dict[f"{key}_vicinity"] = vicinity_entropies[j]
+            
+            # 2. ジャンプ前のエントロピー（構造崩壊の前兆）
+            pre_jump_indices = []
+            for jump_idx in jump_indices:
+                for offset in range(1, JUMP_WINDOW + 1):
+                    pre_idx = jump_idx - offset
+                    if pre_idx >= 0:
+                        pre_jump_indices.append(pre_idx)
+            
+            if pre_jump_indices:
+                pre_jump_path = path[pre_jump_indices]
+                pre_jump_entropies = compute_all_entropies_jit(pre_jump_path)
+                for j, key in enumerate(entropy_keys):
+                    entropy_dict[f"{key}_pre_jump"] = pre_jump_entropies[j]
+            
+            # 3. ジャンプ後のエントロピー（構造再編成）
+            post_jump_indices = []
+            for jump_idx in jump_indices:
+                for offset in range(1, JUMP_WINDOW + 1):
+                    post_idx = jump_idx + offset
+                    if post_idx < len(path):
+                        post_jump_indices.append(post_idx)
+            
+            if post_jump_indices:
+                post_jump_path = path[post_jump_indices]
+                post_jump_entropies = compute_all_entropies_jit(post_jump_path)
+                for j, key in enumerate(entropy_keys):
+                    entropy_dict[f"{key}_post_jump"] = post_jump_entropies[j]
+            
+            # 4. エントロピー勾配（ジャンプによる構造変化の急峻さ）
+            if len(jump_indices) > 0:
+                entropy_gradients = []
+                for jump_idx in jump_indices:
+                    # ジャンプ前後のローカルエントロピーを計算
+                    pre_start = max(0, jump_idx - JUMP_WINDOW)
+                    pre_end = jump_idx
+                    post_start = jump_idx + 1
+                    post_end = min(len(path), jump_idx + JUMP_WINDOW + 1)
+                    
+                    if pre_end > pre_start and post_end > post_start:
+                        pre_local = compute_all_entropies_jit(path[pre_start:pre_end])
+                        post_local = compute_all_entropies_jit(path[post_start:post_end])
+                        
+                        # 各エントロピータイプの勾配
+                        gradient = post_local - pre_local
+                        entropy_gradients.append(gradient)
+                
+                if entropy_gradients:
+                    mean_gradients = np.mean(entropy_gradients, axis=0)
+                    for j, key in enumerate(entropy_keys):
+                        entropy_dict[f"{key}_gradient"] = mean_gradients[j]
+            
+            # 5. 局所エントロピー変動性（ジャンプ周辺の不安定性）
+            if len(jump_indices) > 0:
+                local_variations = []
+                for jump_idx in jump_indices:
+                    # 各ジャンプ周辺での小窓エントロピー計算
+                    for window_start in range(max(0, jump_idx - JUMP_WINDOW), 
+                                            min(len(path) - 2, jump_idx + JUMP_WINDOW)):
+                        if window_start + 3 <= len(path):  # 最小3点で計算
+                            local_window = path[window_start:window_start + 3]
+                            local_ent = compute_all_entropies_jit(local_window)
+                            local_variations.append(local_ent)
+                
+                if local_variations:
+                    # 変動性を標準偏差で評価
+                    variations_std = np.std(local_variations, axis=0)
+                    for j, key in enumerate(entropy_keys):
+                        entropy_dict[f"{key}_local_variation"] = variations_std[j]
+            
+            # 6. 遠隔エントロピー（ジャンプから離れた領域）
+            if len(jump_vicinity_indices) > 0:
+                all_indices = set(range(len(path)))
+                remote_indices = sorted(all_indices - jump_vicinity_indices)
+                
+                if remote_indices:
+                    remote_path = path[np.array(remote_indices)]
+                    remote_entropies = compute_all_entropies_jit(remote_path)
+                    for j, key in enumerate(entropy_keys):
+                        entropy_dict[f"{key}_remote"] = remote_entropies[j]
+                    
+                    # ジャンプ近傍と遠隔の比率（構造的な局所性の指標）
+                    for j, key in enumerate(entropy_keys):
+                        if f"{key}_vicinity" in entropy_dict and entropy_dict[f"{key}_remote"] != 0:
+                            ratio = entropy_dict[f"{key}_vicinity"] / (entropy_dict[f"{key}_remote"] + 1e-10)
+                            entropy_dict[f"{key}_locality_ratio"] = ratio
+            
             entropies[i] = entropy_dict
-
+        
         return entropies
 
     def _compute_jump_anomaly_scores(self,
@@ -2819,7 +3896,7 @@ class Lambda3ZeroShotDetector:
         # ジャンプの重要度に基づくスコア
         jump_mask = integrated['unified_jumps'].astype(float)
         importance = integrated['jump_importance']
-        
+
         # 配列サイズの確認と調整
         if len(jump_mask) != n_events:
             # ジャンプ構造とイベント数が一致しない場合は、小さい方に合わせる
@@ -2827,7 +3904,7 @@ class Lambda3ZeroShotDetector:
             jump_mask = jump_mask[:min_length]
             importance = importance[:min_length]
             scores = scores[:min_length]
-        
+
         # 重要度が高いジャンプのみを考慮
         importance_threshold = np.percentile(importance[importance > 0], 75) if np.any(importance > 0) else 0.5
         significant_jumps = jump_mask * (importance >= importance_threshold)
@@ -2859,7 +3936,7 @@ class Lambda3ZeroShotDetector:
             min_length = min(n_events, min(len(fs) for fs in feature_scores))
             feature_scores_aligned = [fs[:min_length] for fs in feature_scores]
             feature_contribution = np.max(feature_scores_aligned, axis=0)
-            
+
             # scoresの長さも調整
             if len(scores) > min_length:
                 scores = scores[:min_length]
@@ -2867,7 +3944,7 @@ class Lambda3ZeroShotDetector:
                 new_scores = np.zeros(min_length)
                 new_scores[:len(scores)] = scores
                 scores = new_scores
-                
+
             scores += feature_contribution * 0.5
 
         # 最終的な長さをn_eventsに合わせる
@@ -2875,20 +3952,23 @@ class Lambda3ZeroShotDetector:
             final_scores = np.zeros(n_events)
             final_scores[:min(len(scores), n_events)] = scores[:min(len(scores), n_events)]
             return final_scores
-        
+
         return scores
 
     def _compute_kernel_anomaly_scores_optimized(self,
                                             events: np.ndarray,
                                             result: Lambda3Result) -> np.ndarray:
-        """最適なカーネルを自動選択してカーネル空間での異常スコアを計算"""
+        """最適なカーネルを自動選択してカーネル空間での異常スコアを計算（周期カーネル追加版）"""
+
+        # 周期推定（データから自動検出）
+        estimated_periods = self._estimate_periods(events)
         
         # カーネルタイプとパラメータの候補
         kernel_configs = [
-            {'type': 0, 'name': 'RBF', 'params': {'gamma': gamma}} 
+            {'type': 0, 'name': 'RBF', 'params': {'gamma': gamma}}
             for gamma in [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0, 5.0, 10.0]
         ] + [
-            {'type': 1, 'name': 'Polynomial', 'params': {'degree': d, 'coef0': 1.0}}
+            {'type': 1, 'name': 'Polynomial', 'params': {'degree': d, 'coef0': c}}
             for d in [2, 3, 4, 5, 7] for c in [0.0, 0.5, 1.0, 2.0]
         ] + [
             {'type': 2, 'name': 'Sigmoid', 'params': {'alpha': a, 'coef0': 0.0}}
@@ -2896,11 +3976,15 @@ class Lambda3ZeroShotDetector:
         ] + [
             {'type': 3, 'name': 'Laplacian', 'params': {'gamma': gamma}}
             for gamma in [0.01, 0.05, 0.1, 0.3, 0.5, 1.0, 2.0]
+        ] + [
+            # 新規：周期カーネル（検出された周期に基づく）
+            {'type': 4, 'name': 'Periodic', 'params': {'period': p, 'length_scale': ls}}
+            for p in estimated_periods for ls in [0.5, 1.0, 2.0]
         ]
-        
+
         paths_matrix = np.stack(list(result.paths.values()))
         n_events = events.shape[0]
-        
+
         # サンプリングして計算量を削減（大規模データの場合）
         if n_events > 300:
             sample_idx = np.random.choice(n_events, 300, replace=False)
@@ -2910,23 +3994,26 @@ class Lambda3ZeroShotDetector:
             events_sample = events
             paths_sample = paths_matrix
             sample_idx = np.arange(n_events)
-        
+
         best_score = -np.inf
         best_config = None
         best_scores = None
-        
+
         # 各カーネルで評価
         for config in kernel_configs:
             # カーネルGram行列の計算
-            K = compute_kernel_gram_matrix(
-                events_sample, 
-                kernel_type=config['type'],
-                gamma=config['params'].get('gamma', 1.0),
-                degree=config['params'].get('degree', 3),
-                coef0=config['params'].get('coef0', 1.0),
-                alpha=config['params'].get('alpha', 0.01)
-            )
+            kernel_params = {
+                'kernel_type': config['type'],
+                'gamma': config['params'].get('gamma', 1.0),
+                'degree': config['params'].get('degree', 3),
+                'coef0': config['params'].get('coef0', 1.0),
+                'alpha': config['params'].get('alpha', 0.01),
+                'period': config['params'].get('period', 10.0),
+                'length_scale': config['params'].get('length_scale', 1.0)
+            }
             
+            K = compute_kernel_gram_matrix(events_sample, **kernel_params)
+
             # カーネル空間での再構成
             n_sample = len(events_sample)
             K_recon = np.zeros((n_sample, n_sample))
@@ -2934,27 +4021,27 @@ class Lambda3ZeroShotDetector:
                 for j in range(n_sample):
                     for k in range(len(paths_sample)):
                         K_recon[i, j] += paths_sample[k, i] * K[i, j] * paths_sample[k, j]
-            
+
             # 正規化
             K_norm = np.sqrt(np.trace(K @ K))
             if K_norm > 0:
                 K /= K_norm
-            
+
             recon_norm = np.sqrt(np.trace(K_recon @ K_recon))
             if recon_norm > 0:
                 K_recon /= recon_norm
-            
+
             # 再構成誤差の計算
             reconstruction_error = np.linalg.norm(K - K_recon, 'fro')
-            
+
             # Lambda³理論の観点：再構成誤差が大きいほど、構造テンソルが
             # そのカーネル空間で異常を捉えやすい
             score = -reconstruction_error  # 負の誤差をスコアとする
-            
+
             if score > best_score:
                 best_score = score
                 best_config = config
-                
+
                 # このカーネルでの異常スコアを計算
                 kernel_scores = np.zeros(n_sample)
                 for i in range(n_sample):
@@ -2963,9 +4050,9 @@ class Lambda3ZeroShotDetector:
                         diff = K[i, j] - K_recon[i, j]
                         row_error += diff * diff
                     kernel_scores[i] = np.sqrt(row_error)
-                
+
                 # サンプリングした場合は全データに拡張
-                if n_events > 200:
+                if n_events > 300:
                     full_scores = np.zeros(n_events)
                     full_scores[sample_idx] = kernel_scores
                     # 残りは最近傍で補間
@@ -2978,42 +4065,75 @@ class Lambda3ZeroShotDetector:
                     best_scores = full_scores
                 else:
                     best_scores = kernel_scores
-        
+
         print(f"Optimal kernel: {best_config['name']} with params {best_config['params']}")
-        
+
         return best_scores
+
+    def _estimate_periods(self, events: np.ndarray) -> List[float]:
+        """データから周期を自動推定"""
+        n_events = events.shape[0]
+        periods = []
+        
+        # 各特徴量でFFT解析
+        for i in range(events.shape[1]):
+            fft = np.fft.fft(events[:, i])
+            fft_abs = np.abs(fft[1:n_events//2])
+            
+            # 上位3つのピーク周波数を検出
+            if len(fft_abs) > 3:
+                peak_indices = np.argsort(fft_abs)[-3:]
+                for idx in peak_indices:
+                    if fft_abs[idx] > np.mean(fft_abs) * 2:
+                        # 周波数から周期に変換
+                        period = n_events / (idx + 1)
+                        if 5 <= period <= n_events / 2:  # 妥当な周期範囲
+                            periods.append(period)
+        
+        # 重複を除去して代表的な周期を選択
+        if periods:
+            unique_periods = []
+            sorted_periods = sorted(set(periods))
+            for p in sorted_periods:
+                # 近い周期はグループ化
+                if not any(abs(p - up) < 2 for up in unique_periods):
+                    unique_periods.append(p)
+            return unique_periods[:5]  # 最大5つの周期
+        else:
+            # デフォルト周期
+            return [10.0, 20.0, 50.0]
 
     def _compute_kernel_anomaly_scores(self,
                                     events: np.ndarray,
                                     result: Lambda3Result,
                                     kernel_type: int = -1) -> np.ndarray:
         """カーネル空間での異常スコア計算（自動選択オプション付き）"""
-        
+
         # kernel_type = -1 の場合は自動選択
         if kernel_type == -1:
             return self._compute_kernel_anomaly_scores_optimized(events, result)
-        
+
         # 既存の実装（特定のカーネルを使用）
         K = compute_kernel_gram_matrix(events, kernel_type, gamma=1.0)
-        
+
         # 以下、既存のコードと同じ...
         paths_matrix = np.stack(list(result.paths.values()))
         n_events = events.shape[0]
-        
+
         K_recon = np.zeros((n_events, n_events))
         for i in range(n_events):
             for j in range(n_events):
                 for k in range(len(paths_matrix)):
                     K_recon[i, j] += paths_matrix[k, i] * K[i, j] * paths_matrix[k, j]
-        
+
         K_norm = np.sqrt(np.trace(K @ K))
         if K_norm > 0:
             K /= K_norm
-        
+
         recon_norm = np.sqrt(np.trace(K_recon @ K_recon))
         if recon_norm > 0:
             K_recon /= recon_norm
-        
+
         kernel_scores = np.zeros(n_events)
         for i in range(n_events):
             row_error = 0.0
@@ -3021,7 +4141,7 @@ class Lambda3ZeroShotDetector:
                 diff = K[i, j] - K_recon[i, j]
                 row_error += diff * diff
             kernel_scores[i] = np.sqrt(row_error)
-        
+
         return kernel_scores
 
     #===============================
@@ -3532,11 +4652,11 @@ def create_complex_natural_dataset(n_events=200, n_features=20, anomaly_ratio=0.
     return events, labels, anomaly_labels_detailed
 
 # ===============================
-# デモ用メイン関数
+# MainDemo code
 # ===============================
 def demo_refactored_system():
     """リファクタリング版システムのデモ（適応的重み最適化を含む）"""
-    np.random.seed(42)
+    np.random.seed(96)
 
     print("=== Lambda³ Zero-Shot Anomaly Detection System (Enhanced) ===")
     print("Unified Architecture with Adaptive Weight Optimization")
@@ -3597,6 +4717,13 @@ def demo_refactored_system():
     # 5. 焦点型検知（Lambda3FocusedDetectorを使用）
     print("\n--- Focused Mode (Feature-Optimized) ---")
     focused_detector = Lambda3FocusedDetector()
+    
+    # コンポーネントを明示的に設定（これが必要）
+    focused_detector.set_components(
+        Lambda3FeatureExtractor(),
+        Lambda3FeatureOptimizer()
+    )
+    
     start_time = time.time()
     focused_scores = focused_detector.detect_anomalies(
         result, events, 
