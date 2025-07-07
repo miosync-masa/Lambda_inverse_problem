@@ -499,7 +499,7 @@ class MultiChannelDetector:
                                       integrated_scores: np.ndarray,
                                       channel_contributions: Dict[str, np.ndarray]) -> float:
         """検出結果の総合信頼度を計算"""
-        # 1. チャンネル間の同期度
+        # 1. チャンネル間の同期度（正規化版）
         sync_matrix = sync_result.sync_matrix
         # 対角成分（自己相関）を除外
         mask = ~np.eye(sync_matrix.shape[0], dtype=bool)
@@ -507,10 +507,16 @@ class MultiChannelDetector:
         
         if len(off_diagonal) > 0:
             avg_sync = np.mean(off_diagonal)
+            # 同期率を0-1の範囲に正規化
+            # 異常スコアの同期の場合、値が大きくなることがあるため
+            if avg_sync > 1.0:
+                # シグモイド関数で0-1に変換
+                avg_sync = 2.0 / (1.0 + np.exp(-avg_sync/5.0)) - 1.0
+            avg_sync = np.clip(avg_sync, 0.0, 1.0)
         else:
             avg_sync = 0.5
         
-        # 2. 寄与度の一貫性
+        # 2. 寄与度の一貫性（相関係数）
         contributions = np.array(list(channel_contributions.values()))
         if len(contributions) > 1:
             # 相関行列の平均（対角成分を除く）
@@ -518,6 +524,8 @@ class MultiChannelDetector:
             if not np.any(np.isnan(corr_matrix)):
                 mask = ~np.eye(corr_matrix.shape[0], dtype=bool)
                 contribution_correlation = np.mean(corr_matrix[mask])
+                # 相関係数は-1から1なので0-1に変換
+                contribution_correlation = (contribution_correlation + 1.0) / 2.0
             else:
                 contribution_correlation = 0.5
         else:
@@ -526,16 +534,29 @@ class MultiChannelDetector:
         # 3. スコアの明確性（SNR的な指標）
         if np.std(integrated_scores) > 1e-6:
             score_snr = np.mean(integrated_scores) / np.std(integrated_scores)
+            # SNRが負の場合も考慮
             score_clarity = 1.0 / (1.0 + np.exp(-score_snr))
         else:
             score_clarity = 0.5
         
-        # 総合信頼度
-        confidence = 0.4 * avg_sync + 0.3 * contribution_correlation + 0.3 * score_clarity
+        # 値の範囲を確保（0-1）
+        avg_sync = np.clip(avg_sync, 0.0, 1.0)
+        contribution_correlation = np.clip(contribution_correlation, 0.0, 1.0)
+        score_clarity = np.clip(score_clarity, 0.0, 1.0)
+        
+        # 総合信頼度（重み付き平均）
+        confidence = (
+            0.4 * avg_sync + 
+            0.3 * contribution_correlation + 
+            0.3 * score_clarity
+        )
+        
+        # 最終的な信頼度も0-1の範囲に
+        confidence = np.clip(confidence, 0.0, 1.0)
         
         # デバッグ情報
         print(f"\nConfidence calculation:")
-        print(f"  Avg sync: {avg_sync:.3f}")
+        print(f"  Avg sync (normalized): {avg_sync:.3f}")
         print(f"  Contribution correlation: {contribution_correlation:.3f}")
         print(f"  Score clarity: {score_clarity:.3f}")
         print(f"  Final confidence: {confidence:.3f}")
