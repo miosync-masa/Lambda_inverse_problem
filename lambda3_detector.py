@@ -24,7 +24,7 @@ from scipy.signal import hilbert
 
 from sklearn.decomposition import PCA  
 from sklearn.linear_model import LogisticRegression
-from sklearn.manifold import TSNE
+from sklearn.manifold import TSNE 
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
 
@@ -1873,7 +1873,7 @@ class Lambda3ZeroShotDetector:
                     save_full_result: bool = False,
                     compress: bool = True) -> Dict[str, str]:
         """
-        Lambda³解析結果をファイルに保存
+        Lambda³解析結果をファイルに保存（jump_structures詳細版）
     
         Args:
             result: Lambda3Result オブジェクト
@@ -1885,7 +1885,7 @@ class Lambda3ZeroShotDetector:
             compress: npzで圧縮保存するか
         
         Returns:
-                保存したファイルパスの辞書
+            保存したファイルパスの辞書
         """    
         # ディレクトリ作成
         channel_dir = os.path.join(save_dir, channel_name)
@@ -1898,18 +1898,68 @@ class Lambda3ZeroShotDetector:
         np.save(scores_path, anomaly_scores)
         saved_files['anomaly_scores'] = scores_path
     
-        # 2. ジャンプイベントの保存
+        # 2. ジャンプ構造の詳細保存（拡張版）
         if result.jump_structures:
+            # 統合ジャンプ情報
             jump_events = result.jump_structures['integrated']['unified_jumps']
             jump_path = os.path.join(channel_dir, "jump_events.npy")
             np.save(jump_path, jump_events)
             saved_files['jump_events'] = jump_path
-        
-        # ジャンプ重要度も保存
-        jump_importance = result.jump_structures['integrated']['jump_importance']
-        importance_path = os.path.join(channel_dir, "jump_importance.npy")
-        np.save(importance_path, jump_importance)
-        saved_files['jump_importance'] = importance_path
+            
+            # ジャンプ重要度
+            jump_importance = result.jump_structures['integrated']['jump_importance']
+            importance_path = os.path.join(channel_dir, "jump_importance.npy")
+            np.save(importance_path, jump_importance)
+            saved_files['jump_importance'] = importance_path
+            
+            # 同期マトリックス
+            sync_matrix = result.jump_structures['integrated']['sync_matrix']
+            sync_path = os.path.join(channel_dir, "jump_sync_matrix.npy")
+            np.save(sync_path, sync_matrix)
+            saved_files['jump_sync_matrix'] = sync_path
+            
+            # ジャンプクラスター情報
+            jump_clusters = result.jump_structures['integrated']['jump_clusters']
+            clusters_path = os.path.join(channel_dir, "jump_clusters.json")
+            with open(clusters_path, 'w') as f:
+                json.dump(jump_clusters, f, indent=2)
+            saved_files['jump_clusters'] = clusters_path
+            
+            # 各特徴のジャンプ詳細（圧縮保存）
+            feature_jumps = {}
+            for f_idx, f_data in result.jump_structures['features'].items():
+                # NumPy配列として保存
+                feature_jumps[f'feature_{f_idx}_pos_jumps'] = f_data['pos_jumps']
+                feature_jumps[f'feature_{f_idx}_neg_jumps'] = f_data['neg_jumps']
+                feature_jumps[f'feature_{f_idx}_rho_t'] = f_data['rho_t']
+                feature_jumps[f'feature_{f_idx}_diff'] = f_data['diff']
+                
+                # スカラー値はメタデータとして配列に
+                feature_jumps[f'feature_{f_idx}_metadata'] = np.array([
+                    f_data['threshold'],
+                    f_data['jump_intensity'],
+                    f_data['asymmetry'], 
+                    f_data['pulse_power']
+                ])
+            
+            features_path = os.path.join(channel_dir, "jump_features.npz")
+            if compress:
+                np.savez_compressed(features_path, **feature_jumps)
+            else:
+                np.savez(features_path, **feature_jumps)
+            saved_files['jump_features'] = features_path
+            
+            # 統合情報のサマリー
+            jump_summary = {
+                'n_total_jumps': int(result.jump_structures['integrated']['n_total_jumps']),
+                'max_sync': float(result.jump_structures['integrated']['max_sync']),
+                'n_clusters': len(jump_clusters),
+                'n_features': len(result.jump_structures['features'])
+            }
+            summary_path = os.path.join(channel_dir, "jump_summary.json")
+            with open(summary_path, 'w') as f:
+                json.dump(jump_summary, f, indent=2)
+            saved_files['jump_summary'] = summary_path
     
         # 3. 主要な物理量のみ保存（軽量化）
         physics_data = {
@@ -1938,7 +1988,8 @@ class Lambda3ZeroShotDetector:
             },
             'n_jumps': int(np.sum(result.jump_structures['integrated']['unified_jumps'])) 
                        if result.jump_structures else 0,
-            'config': asdict(self.config)
+            'config': asdict(self.config),
+            'saved_at': str(np.datetime64('now'))
         }
         metadata_path = os.path.join(channel_dir, "metadata.json")
         with open(metadata_path, 'w') as f:
@@ -1958,6 +2009,16 @@ class Lambda3ZeroShotDetector:
                 np.savez(paths_path, **paths_dict)
             saved_files['lambda_paths'] = paths_path
             
+            # エントロピー情報
+            entropy_data = {}
+            for i, ent_dict in result.entropies.items():
+                if isinstance(ent_dict, dict):
+                    entropy_data[str(i)] = ent_dict
+            entropy_path = os.path.join(channel_dir, "entropies.json")
+            with open(entropy_path, 'w') as f:
+                json.dump(entropy_data, f, indent=2)
+            saved_files['entropies'] = entropy_path
+            
             # Pickleで完全保存
             full_result_path = os.path.join(channel_dir, "full_result.pkl")
             with open(full_result_path, 'wb') as f:
@@ -1967,6 +2028,9 @@ class Lambda3ZeroShotDetector:
         print(f"Saved Lambda³ results for {channel_name} to {channel_dir}")
         print(f"  - Anomaly scores: shape={anomaly_scores.shape}, mean={metadata['anomaly_score_stats']['mean']:.3f}")
         print(f"  - Detected jumps: {metadata['n_jumps']}")
+        if result.jump_structures:
+            print(f"  - Jump clusters: {len(jump_clusters)}")
+            print(f"  - Max feature sync: {result.jump_structures['integrated']['max_sync']:.3f}")
         
         return saved_files
       
@@ -3624,3 +3688,4 @@ if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("Demo completed successfully!")
     print(f"Lambda³ Zero-Shot Detection System - Ready for deployment")
+    
