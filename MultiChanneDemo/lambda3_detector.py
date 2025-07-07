@@ -1,7 +1,7 @@
 """
 Lambda³ Zero-Shot Anomaly Detection System - Stable/Fix Version
 Jump-Driven Zero-Shot Anomaly Detection System (Revised Edition)
-Author: Based on Dr. Iizumi's Lambda³ Theory
+Author: Based on Mr. Iizumi's Lambda³ Theory
 """
 
 import json
