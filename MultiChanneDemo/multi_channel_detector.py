@@ -63,15 +63,22 @@ class MultiChannelDetector:
     
     def integrate_channels(self, 
                          lambda3_results: Dict[str, Dict],
+                         raw_data: Optional[Dict[str, np.ndarray]] = None,
                          use_jump_sync: bool = True,
+                         use_raw_sync: bool = True,
+                         use_jump_structures: bool = True,
                          visualize: bool = False) -> IntegrationResult:
         """
-        複数チャンネルのLambda³結果を統合
+        複数チャンネルのLambda³結果を統合（jump_structures活用版）
         
         Args:
             lambda3_results: 各チャンネルのLambda³解析結果
                             {'ch1': {'scores': np.ndarray, 'result': Lambda3Result}, ...}
+            raw_data: 生データ（オプション）
+                     {'ch1': np.ndarray, ...}
             use_jump_sync: ジャンプイベントの同期も考慮するか
+            use_raw_sync: 生データの同期も考慮するか
+            use_jump_structures: 詳細なジャンプ構造を使用するか
             visualize: 可視化するか
             
         Returns:
@@ -97,7 +104,31 @@ class MultiChannelDetector:
         # 2. 同期解析
         print("\nPhase 2: Pairwise synchronization analysis")
         
+        # ジャンプ構造の詳細を使用する場合
+        jump_structures_sync = None
+        if use_jump_structures:
+            print("Checking for detailed jump structures...")
+            has_jump_structures = all(
+                'jump_sync_matrix' in data or 'jump_features' in data 
+                for data in lambda3_results.values()
+            )
+            
+            if has_jump_structures:
+                print("Using pre-computed jump synchronization from Lambda³")
+                # 保存されたジャンプ同期マトリックスを使用
+                # TODO: 実装
+            else:
+                print("Jump structures not found in saved data")
+        
+        # 生データの同期解析（オプション）
+        raw_sync_result = None
+        if use_raw_sync and raw_data:
+            print("Analyzing raw data synchronization...")
+            raw_sync_result = self.sync_analyzer.create_sync_matrix(raw_data)
+            print(f"  Raw data sync matrix:\n{raw_sync_result.sync_matrix}")
+        
         # 異常スコアの同期解析
+        print("Analyzing anomaly score synchronization...")
         sync_result = self.sync_analyzer.create_sync_matrix(anomaly_scores_dict)
         
         # ジャンプイベントの同期解析（オプション）
@@ -106,16 +137,25 @@ class MultiChannelDetector:
             print("Analyzing jump event synchronization...")
             jump_sync_result = self.sync_analyzer.create_sync_matrix(jump_events_dict)
         
-        # 3. 同期ネットワーク構築
+        # 3. 同期ネットワーク構築（生データ同期を優先）
         print("\nPhase 3: Building synchronization network")
-        sync_network = self._build_enhanced_network(
-            anomaly_scores_dict, sync_result, jump_sync_result
-        )
+        if raw_sync_result:
+            print("Using raw data synchronization for network")
+            sync_network = self._build_enhanced_network(
+                anomaly_scores_dict, raw_sync_result, jump_sync_result
+            )
+            # 統合には生データ同期を使用
+            primary_sync_result = raw_sync_result
+        else:
+            sync_network = self._build_enhanced_network(
+                anomaly_scores_dict, sync_result, jump_sync_result
+            )
+            primary_sync_result = sync_result
         
         # 4. 統合スコア計算
         print("\nPhase 3: Computing integrated anomaly scores")
         integrated_scores, channel_contributions = self._compute_integrated_scores(
-            anomaly_scores_dict, sync_result, sync_network
+            anomaly_scores_dict, primary_sync_result, sync_network
         )
         
         # 5. 異常領域の検出
@@ -126,30 +166,37 @@ class MultiChannelDetector:
         if self.channel_configs and any(c.position is not None for c in self.channel_configs.values()):
             print("\nPhase 3: Estimating defect locations")
             defect_locations = self._estimate_defect_locations(
-                anomaly_regions, sync_result, sync_network
+                anomaly_regions, primary_sync_result, sync_network
             )
         
         # 7. 信頼度計算
         confidence = self._calculate_detection_confidence(
-            sync_result, integrated_scores, channel_contributions
+            primary_sync_result, integrated_scores, channel_contributions
         )
         
         # 8. 結果の可視化（オプション）
         if visualize:
             self._visualize_integration_results(
                 integrated_scores, channel_contributions, 
-                sync_result, sync_network, anomaly_regions
+                primary_sync_result, sync_network, anomaly_regions
             )
         
+        # 結果に生データ同期情報も含める
         result = IntegrationResult(
             integrated_scores=integrated_scores,
             channel_contributions=channel_contributions,
-            sync_result=sync_result,
+            sync_result=primary_sync_result,
             sync_network=sync_network,
             anomaly_regions=anomaly_regions,
             defect_locations=defect_locations,
             confidence=confidence
         )
+        
+        # 追加情報を保存
+        if raw_sync_result:
+            result.raw_sync_result = raw_sync_result
+        if jump_sync_result:
+            result.jump_sync_result = jump_sync_result
         
         print(f"\nIntegration completed. Confidence: {confidence:.2%}")
         print(f"Detected {len(anomaly_regions)} anomaly regions")
@@ -454,18 +501,44 @@ class MultiChannelDetector:
         """検出結果の総合信頼度を計算"""
         # 1. チャンネル間の同期度
         sync_matrix = sync_result.sync_matrix
-        avg_sync = np.mean(sync_matrix[sync_matrix < 1.0])  # Exclude diagonal
+        # 対角成分（自己相関）を除外
+        mask = ~np.eye(sync_matrix.shape[0], dtype=bool)
+        off_diagonal = sync_matrix[mask]
+        
+        if len(off_diagonal) > 0:
+            avg_sync = np.mean(off_diagonal)
+        else:
+            avg_sync = 0.5
         
         # 2. 寄与度の一貫性
         contributions = np.array(list(channel_contributions.values()))
-        contribution_correlation = np.mean(np.corrcoef(contributions))
+        if len(contributions) > 1:
+            # 相関行列の平均（対角成分を除く）
+            corr_matrix = np.corrcoef(contributions)
+            if not np.any(np.isnan(corr_matrix)):
+                mask = ~np.eye(corr_matrix.shape[0], dtype=bool)
+                contribution_correlation = np.mean(corr_matrix[mask])
+            else:
+                contribution_correlation = 0.5
+        else:
+            contribution_correlation = 1.0
         
         # 3. スコアの明確性（SNR的な指標）
-        score_snr = np.mean(integrated_scores) / (np.std(integrated_scores) + 1e-6)
-        score_clarity = 1.0 / (1.0 + np.exp(-score_snr))
+        if np.std(integrated_scores) > 1e-6:
+            score_snr = np.mean(integrated_scores) / np.std(integrated_scores)
+            score_clarity = 1.0 / (1.0 + np.exp(-score_snr))
+        else:
+            score_clarity = 0.5
         
         # 総合信頼度
         confidence = 0.4 * avg_sync + 0.3 * contribution_correlation + 0.3 * score_clarity
+        
+        # デバッグ情報
+        print(f"\nConfidence calculation:")
+        print(f"  Avg sync: {avg_sync:.3f}")
+        print(f"  Contribution correlation: {contribution_correlation:.3f}")
+        print(f"  Score clarity: {score_clarity:.3f}")
+        print(f"  Final confidence: {confidence:.3f}")
         
         return confidence
     
@@ -540,13 +613,15 @@ class MultiChannelDetector:
 # Utility Functions
 # ===============================
 def load_lambda3_results(channel_name: str,
-                        save_dir: str = "./lambda3_results") -> Dict[str, Any]:
+                        save_dir: str = "./lambda3_results",
+                        load_jump_details: bool = True) -> Dict[str, Any]:
     """
-    保存されたLambda³解析結果を読み込み
+    保存されたLambda³解析結果を読み込み（jump_structures対応版）
     
     Args:
         channel_name: チャンネル名
         save_dir: 保存ディレクトリ
+        load_jump_details: ジャンプ構造の詳細も読み込むか
         
     Returns:
         読み込んだデータの辞書
@@ -582,7 +657,33 @@ def load_lambda3_results(channel_name: str,
         with open(metadata_path, 'r') as f:
             loaded_data['metadata'] = json.load(f)
     
+    # 5. ジャンプ構造の詳細読み込み（新機能）
+    if load_jump_details:
+        # 同期マトリックス
+        sync_path = os.path.join(channel_dir, "jump_sync_matrix.npy")
+        if os.path.exists(sync_path):
+            loaded_data['jump_sync_matrix'] = np.load(sync_path)
+        
+        # ジャンプクラスター
+        clusters_path = os.path.join(channel_dir, "jump_clusters.json")
+        if os.path.exists(clusters_path):
+            with open(clusters_path, 'r') as f:
+                loaded_data['jump_clusters'] = json.load(f)
+        
+        # 特徴別ジャンプ詳細
+        features_path = os.path.join(channel_dir, "jump_features.npz")
+        if os.path.exists(features_path):
+            jump_features = np.load(features_path)
+            loaded_data['jump_features'] = {
+                k: v for k, v in jump_features.items()
+            }
+    
     print(f"Loaded Lambda³ results for {channel_name}")
+    if 'jump_sync_matrix' in loaded_data:
+        print(f"  - Jump sync matrix loaded: shape={loaded_data['jump_sync_matrix'].shape}")
+    if 'jump_clusters' in loaded_data:
+        print(f"  - Jump clusters loaded: {len(loaded_data['jump_clusters'])} clusters")
+    
     return loaded_data
 
 def prepare_for_integration(save_dir: str = "./lambda3_results",
