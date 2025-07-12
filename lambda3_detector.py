@@ -107,28 +107,21 @@ class DetectionStrategy:
     weights: Dict[str, float]                  # Weights for each feature/component
     confidence: float                          # Confidence score of current detection logic
 
-
 # ===============================
 # adaptive　Parameter
 # ===============================
-def compute_adaptive_window_size(events: np.ndarray, 
-                               base_window: int = 30,  # 15から30に増加
-                               min_window: int = 10,   # 5から10に増加
-                               max_window: int = 100) -> Dict[str, int]:  # 50から100に増加
-    """
-    データのボラティリティに基づいて適応的なウィンドウサイズを計算
-    
-    Args:
-        events: イベントデータ (n_events, n_features)
-        base_window: 基準ウィンドウサイズ
-        min_window: 最小ウィンドウサイズ
-        max_window: 最大ウィンドウサイズ
-    
-    Returns:
-        各用途別の最適ウィンドウサイズ辞書
-    """
+def compute_adaptive_window_size(
+    events: np.ndarray,
+    base_window: int = 30,
+    min_window: int = 10,
+    max_window: int = None
+) -> Dict[str, int]:
     n_events, n_features = events.shape
-    
+
+    # データ長依存のmax_window: 例として最大で「n_events // 10」, ただし2000超えない
+    if max_window is None:
+        max_window = max(100, min(n_events // 10, 2000))
+
     # データサイズに基づく基準調整
     if n_events > 300:
         size_adjusted_base = base_window
@@ -136,94 +129,94 @@ def compute_adaptive_window_size(events: np.ndarray,
         size_adjusted_base = int(base_window * 0.8)
     else:
         size_adjusted_base = int(base_window * 0.6)
-    
+
     # 最小でもn_events/20は確保
     size_adjusted_base = max(size_adjusted_base, n_events // 20)
-    
+
     # 1. グローバルボラティリティの計算
     global_std = np.std(events)
     global_mean = np.mean(np.abs(events))
     volatility_ratio = global_std / (global_mean + 1e-10)
-    
+
     # 2. 時系列的な変動性（隣接イベント間の変化率）
     temporal_changes = np.diff(events, axis=0)
     temporal_volatility = np.mean(np.std(temporal_changes, axis=0))
-    
+
     # 3. 特徴量間の相関構造の複雑さ
     correlation_matrix = np.corrcoef(events.T)
     correlation_complexity = 1.0 - np.mean(np.abs(correlation_matrix[np.triu_indices(n_features, k=1)]))
-    
+
     # 4. 局所的な変動パターンの検出
     local_volatilities = []
     for i in range(0, n_events - base_window, base_window // 2):
         window_data = events[i:i + base_window]
         local_volatilities.append(np.std(window_data))
-    
+
     volatility_variation = np.std(local_volatilities) / (np.mean(local_volatilities) + 1e-10)
-    
+
     # 5. スペクトル解析による支配的周期の推定
     fft_magnitudes = np.abs(np.fft.fft(events, axis=0))
     # 低周波成分の割合
     low_freq_ratio = np.sum(fft_magnitudes[:n_events//10]) / np.sum(fft_magnitudes[:n_events//2])
-    
+
     # === ウィンドウサイズの計算 ===
-    
+
     # 基本スケーリング係数
     scale_factor = 1.0
-    
+
     # ボラティリティが高い場合は小さいウィンドウ
     if volatility_ratio > 2.0:  # 1.5から2.0に緩和
         scale_factor *= 0.8     # 0.7から0.8に緩和
     elif volatility_ratio < 0.3:  # 0.5から0.3に変更
         scale_factor *= 1.5     # 1.3から1.5に増加
-    
+
     # 時間的変動が大きい場合は小さいウィンドウ
     if temporal_volatility > global_std * 2.0:  # 1.5から2.0に緩和
         scale_factor *= 0.9     # 0.8から0.9に緩和
     elif temporal_volatility < global_std * 0.3:  # 0.5から0.3に変更
         scale_factor *= 1.4     # 1.2から1.4に増加
-    
+
     # 相関構造が複雑な場合は大きいウィンドウ
     if correlation_complexity > 0.7:
         scale_factor *= 1.2
     elif correlation_complexity < 0.3:
         scale_factor *= 0.9
-    
+
     # 局所的変動が大きい場合は適応的に
     if volatility_variation > 1.0:
         scale_factor *= 0.85
-    
+
     # 低周波成分が支配的な場合は大きいウィンドウ
     if low_freq_ratio > 0.8:
         scale_factor *= 1.4
     elif low_freq_ratio < 0.3:
         scale_factor *= 0.8
-    
+
     # === 用途別のウィンドウサイズ ===
-    
+
     # 局所統計量用（標準偏差など）
     local_window = int(size_adjusted_base * scale_factor)
     local_window = np.clip(local_window, min_window, max_window)
-    
+
     # ジャンプ検出用（より敏感に、小さめ）
     jump_window = int(local_window * 0.5)  # 0.7から0.5に変更
     jump_window = np.clip(jump_window, min_window // 2, max_window // 3)  # 上限も調整
-    
+
     # エントロピー計算用（より安定に）
     entropy_window = int(local_window * 1.3)
     entropy_window = np.clip(entropy_window, min_window * 2, max_window)
-    
+
     # マルチスケール解析用（より広いレンジ）
     multiscale_windows = []
     for scale in [0.5, 1.0, 2.0, 4.0, 8.0]:  # 8.0を追加
         window = int(local_window * scale)
         window = np.clip(window, min_window, max_window)
         multiscale_windows.append(window)
-    
+
     # テンション計算用（ρT）- より大きなウィンドウで安定的に
     tension_window = int(local_window * 1.5)  # 1.5倍で大きく
     tension_window = np.clip(tension_window, min_window, max_window)
-    
+
     return {
         'local': local_window,
         'jump': jump_window,
