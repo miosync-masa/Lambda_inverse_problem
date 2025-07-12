@@ -10,7 +10,7 @@ import pickle
 import time
 import pywt
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 
