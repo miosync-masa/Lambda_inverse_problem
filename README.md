@@ -1,6 +1,19 @@
 # 📕 Lambda³ Zero-Shot Anomaly Detection
 
-## Physics-based Zero-Shot Anomaly Detection at 93.03% AUC — no training, just physical law.
+<p align="center">
+  <img src="https://www.miosync.link/github/0_2.jpg" alt="Lambda³" width="100"/>
+</p>
+
+<p align="center">
+  <strong>Physics-based Zero-Shot Anomaly Detection</strong><br>
+   at 97.83% AUC — no training, just physical law.
+</p>
+
+<p align="center">
+  <a href="#"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
+  <a href="#"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License"></a>
+  <a href="#"><img src="[https://img.shields.io/badge/license-MIT-green.svg](https://colab.research.google.com/assets/colab-badge.svg)" alt="colab"></a>
+</p>
 
 A physics-inspired anomaly detection system that requires no training data, based on Lambda³ (Lambda-Cubed) theory.
 
