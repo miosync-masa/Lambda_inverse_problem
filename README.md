@@ -12,7 +12,7 @@
 <p align="center">
   <a href="#"><img src="https://img.shields.io/badge/python-3.10+-blue.svg" alt="Python 3.10+"></a>
   <a href="#"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="MIT License"></a>
-  <a href="#"><img src="[https://img.shields.io/badge/license-MIT-green.svg](https://colab.research.google.com/assets/colab-badge.svg)" alt="colab"></a>
+  <a href="#"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="colab"></a>
 </p>
 
 A physics-inspired anomaly detection system that requires no training data, based on Lambda³ (Lambda-Cubed) theory.
