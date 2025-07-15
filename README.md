@@ -2,7 +2,7 @@
   <img src="https://www.miosync.link/github/0_2.jpg" alt="Lambda³" width="100"/>
 </p>
 
-<p align="center"># 📕 Lambda³ Zero-Shot Anomaly Detection</p>
+# 📕 Lambda³ Zero-Shot Anomaly Detection
 
 <p align="center">
   <strong>Physics-based Zero-Shot Anomaly Detection</strong><br>
