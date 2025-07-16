@@ -8,59 +8,59 @@ import json
 
 class WIN32ProperDecoder:
     """
-    WIN32フォーマット正式デコーダー
+    WIN32 Format Official Decoder
     
-    仕様書に基づく正確な実装
-    - 1分間 = 60フレーム（1秒ごと）
-    - 各フレーム = 全チャンネルのデータ
-    - 差分圧縮による効率的な記録
+    Accurate implementation based on specification
+    - 1 minute = 60 frames (per second)
+    - Each frame = data for all channels
+    - Efficient recording with differential compression
     """
     
     def __init__(self, channel_info: Dict[int, Dict] = None):
         """
         Args:
-            channel_info: チャンネルID -> 観測点情報のマッピング
+            channel_info: Channel ID -> Station info mapping
         """
         self.channel_info = channel_info or {}
-        self.header_size = 4  # フォーマットID + バージョン + 予備
-        self.frame_header_size = 16  # 時刻(8) + フレーム時間長(4) + データブロックサイズ(4)
+        self.header_size = 4  # Format ID + version + reserved
+        self.frame_header_size = 16  # Time(8) + frame duration(4) + data block size(4)
         
     def decode_win32_file(self, filepath: str) -> Dict[str, np.ndarray]:
         """
-        WIN32ファイルの完全デコード
+        Complete WIN32 file decoding
         
         Returns:
             {
-                'channel_XXXX': np.ndarray(6000,),  # 1分間のデータ
+                'channel_XXXX': np.ndarray(6000,),  # 1 minute of data
                 ...
             }
         """
-        print(f"WIN32デコード開始: {os.path.basename(filepath)}")
+        print(f"WIN32 decoding started: {os.path.basename(filepath)}")
         
         with open(filepath, 'rb') as f:
             raw_data = f.read()
         
-        # ファイルヘッダー読み込み
+        # Read file header
         file_header = self._read_file_header(raw_data)
         
-        # 全60フレームをデコード
+        # Decode all 60 frames
         decoded_data = {}
         position = self.header_size
         
-        for frame_idx in range(60):  # 0-59秒
+        for frame_idx in range(60):  # 0-59 seconds
             if position >= len(raw_data):
-                print(f"  警告: フレーム{frame_idx}でデータ終了")
+                print(f"  Warning: Data ended at frame {frame_idx}")
                 break
                 
-            # フレームヘッダー読み込み
+            # Read frame header
             frame_header = self._read_frame_header(raw_data[position:])
             position += self.frame_header_size
             
-            # フレーム内の全チャンネルをデコード
+            # Decode all channels in frame
             frame_end = position + frame_header['data_block_size']
             
             while position < frame_end and position < len(raw_data):
-                # チャンネルブロックをデコード
+                # Decode channel block
                 channel_data, bytes_read = self._decode_channel_block(
                     raw_data[position:frame_end]
                 )
@@ -68,7 +68,7 @@ class WIN32ProperDecoder:
                 if channel_data is None:
                     break
                     
-                # チャンネルIDをキーとしてデータを蓄積
+                # Accumulate data with channel ID as key
                 channel_id = channel_data['channel_id']
                 channel_key = f"channel_{channel_id:04X}"
                 
@@ -79,20 +79,20 @@ class WIN32ProperDecoder:
                 position += bytes_read
             
             if frame_idx % 10 == 0:
-                print(f"  フレーム {frame_idx}/59 完了")
+                print(f"  Frame {frame_idx}/59 completed")
         
-        # リストをnumpy配列に変換
+        # Convert lists to numpy arrays
         for key in decoded_data:
             decoded_data[key] = np.array(decoded_data[key])
         
-        print(f"デコード完了: {len(decoded_data)}チャンネル")
+        print(f"Decoding completed: {len(decoded_data)} channels")
         
         return decoded_data
     
     def _read_file_header(self, data: bytes) -> Dict:
-        """ファイルヘッダーの読み込み"""
+        """Read file header"""
         if len(data) < 4:
-            raise ValueError("データが短すぎます")
+            raise ValueError("Data too short")
             
         return {
             'format_id': data[0],
@@ -101,11 +101,11 @@ class WIN32ProperDecoder:
         }
     
     def _read_frame_header(self, data: bytes) -> Dict:
-        """フレームヘッダーの読み込み"""
+        """Read frame header"""
         if len(data) < 16:
-            raise ValueError("フレームヘッダーが不完全")
+            raise ValueError("Incomplete frame header")
         
-        # BCD形式の時刻を読み込み
+        # Read BCD format time
         time_bcd = data[0:8]
         year = self._bcd_to_int(time_bcd[0:2])
         month = self._bcd_to_int(time_bcd[2:3])
@@ -124,7 +124,7 @@ class WIN32ProperDecoder:
         }
     
     def _bcd_to_int(self, bcd_bytes: bytes) -> int:
-        """BCD形式をintに変換"""
+        """Convert BCD format to int"""
         result = 0
         for byte in bcd_bytes:
             high = (byte >> 4) & 0x0F
@@ -134,28 +134,28 @@ class WIN32ProperDecoder:
     
     def _decode_channel_block(self, data: bytes) -> Tuple[Optional[Dict], int]:
         """
-        チャンネルブロックのデコード
+        Decode channel block
         
         Returns:
-            (デコード結果, 読み込みバイト数)
+            (decode result, bytes read)
         """
-        if len(data) < 8:  # 最小ヘッダーサイズ
+        if len(data) < 8:  # Minimum header size
             return None, 0
         
         position = 0
         
-        # チャンネルブロックヘッダー
+        # Channel block header
         org_id = data[position]
         net_id = data[position + 1]
         channel_id = struct.unpack('>H', data[position + 2:position + 4])[0]
         
-        # サンプルサイズとサンプル数
+        # Sample size and count
         sample_size_bits = (data[position + 4] >> 4) & 0x0F
         sample_count = struct.unpack('>H', data[position + 4:position + 6])[0] & 0x0FFF
         
         position += 6
         
-        # 最初のサンプル（32bit）
+        # First sample (32bit)
         if len(data) < position + 4:
             return None, position
             
@@ -164,10 +164,10 @@ class WIN32ProperDecoder:
         
         samples = [first_sample]
         
-        # 差分サンプルのデコード
+        # Decode differential samples
         if sample_size_bits == 0:  # 4bit
             samples.extend(self._decode_4bit_diff(data[position:], sample_count - 1))
-            position += ((sample_count - 1) + 1) // 2  # 4bit = 0.5バイト
+            position += ((sample_count - 1) + 1) // 2  # 4bit = 0.5 bytes
         elif sample_size_bits == 1:  # 8bit
             samples.extend(self._decode_8bit_diff(data[position:], sample_count - 1))
             position += sample_count - 1
@@ -181,7 +181,7 @@ class WIN32ProperDecoder:
             samples.extend(self._decode_32bit_diff(data[position:], sample_count - 1))
             position += (sample_count - 1) * 4
         
-        # 累積和で元の値を復元
+        # Restore original values with cumulative sum
         for i in range(1, len(samples)):
             samples[i] = samples[i-1] + samples[i]
         
@@ -193,7 +193,7 @@ class WIN32ProperDecoder:
         }, position
     
     def _decode_4bit_diff(self, data: bytes, count: int) -> List[int]:
-        """4bit差分データのデコード"""
+        """Decode 4-bit differential data"""
         samples = []
         for i in range(count):
             byte_idx = i // 2
@@ -201,21 +201,21 @@ class WIN32ProperDecoder:
                 break
                 
             if i % 2 == 0:
-                # 上位4bit
+                # Upper 4 bits
                 diff = (data[byte_idx] >> 4) & 0x0F
-                if diff & 0x08:  # 負数の場合
+                if diff & 0x08:  # Negative number
                     diff |= 0xFFFFFFF0
             else:
-                # 下位4bit
+                # Lower 4 bits
                 diff = data[byte_idx] & 0x0F
-                if diff & 0x08:  # 負数の場合
+                if diff & 0x08:  # Negative number
                     diff |= 0xFFFFFFF0
                     
             samples.append(diff)
         return samples
     
     def _decode_8bit_diff(self, data: bytes, count: int) -> List[int]:
-        """8bit差分データのデコード"""
+        """Decode 8-bit differential data"""
         samples = []
         for i in range(min(count, len(data))):
             diff = struct.unpack('b', data[i:i+1])[0]  # signed char
@@ -223,7 +223,7 @@ class WIN32ProperDecoder:
         return samples
     
     def _decode_16bit_diff(self, data: bytes, count: int) -> List[int]:
-        """16bit差分データのデコード"""
+        """Decode 16-bit differential data"""
         samples = []
         for i in range(count):
             if i * 2 + 2 > len(data):
@@ -233,14 +233,14 @@ class WIN32ProperDecoder:
         return samples
     
     def _decode_24bit_diff(self, data: bytes, count: int) -> List[int]:
-        """24bit差分データのデコード"""
+        """Decode 24-bit differential data"""
         samples = []
         for i in range(count):
             if i * 3 + 3 > len(data):
                 break
-            # 24bitを32bitに拡張（符号拡張）
+            # Extend 24bit to 32bit (sign extension)
             bytes3 = data[i*3:i*3+3]
-            if bytes3[0] & 0x80:  # 負数
+            if bytes3[0] & 0x80:  # Negative
                 diff = struct.unpack('>i', b'\xff' + bytes3)[0]
             else:
                 diff = struct.unpack('>i', b'\x00' + bytes3)[0]
@@ -248,7 +248,7 @@ class WIN32ProperDecoder:
         return samples
     
     def _decode_32bit_diff(self, data: bytes, count: int) -> List[int]:
-        """32bit差分データのデコード"""
+        """Decode 32-bit differential data"""
         samples = []
         for i in range(count):
             if i * 4 + 4 > len(data):
@@ -260,10 +260,10 @@ class WIN32ProperDecoder:
 
 class WIN32ToLambda3Converter:
     """
-    WIN32データをLambda3解析用に直接変換
+    Direct conversion from WIN32 data to Lambda3 analysis format
     
-    Lambda3理論では観測データそのものが意味空間への射影であるため、
-    追加の特徴量抽出は行わない
+    In Lambda3 theory, observation data itself is a projection to semantic space,
+    so no additional feature extraction is performed
     """
     
     def __init__(self, decoder=None):
@@ -276,41 +276,41 @@ class WIN32ToLambda3Converter:
                          output_dir: str,
                          file_pattern: str = "*.cnt"):
         """
-        ディレクトリ内の全WIN32ファイルをLambda3解析用形式に変換
+        Convert all WIN32 files in directory to Lambda3 analysis format
         
         Args:
-            input_dir: WIN32ファイルのディレクトリ
-            output_dir: 出力ディレクトリ
-            file_pattern: ファイルパターン
+            input_dir: WIN32 files directory
+            output_dir: Output directory
+            file_pattern: File pattern
         """
-        print(f"=== WIN32 → Lambda3 直接変換開始 ===")
-        print(f"入力: {input_dir}")
-        print(f"出力: {output_dir}")
-        print(f"Lambda3理論: 観測データ = 意味空間への射影")
+        print(f"=== WIN32 → Lambda3 Direct Conversion Started ===")
+        print(f"Input: {input_dir}")
+        print(f"Output: {output_dir}")
+        print(f"Lambda3 Theory: Observation data = Projection to semantic space")
         
-        # 出力ディレクトリ作成
+        # Create output directory
         os.makedirs(output_dir, exist_ok=True)
         
-        # WIN32ファイルリスト取得
+        # Get WIN32 file list
         cnt_files = sorted(glob.glob(os.path.join(input_dir, '**', file_pattern), recursive=True))
-        print(f"対象ファイル数: {len(cnt_files)}")
+        print(f"Target files: {len(cnt_files)}")
         
-        # 時系列でソート
+        # Sort by time sequence
         cnt_files = self._sort_files_by_time(cnt_files)
         
-        # 全体のデータ構造
-        all_channels_data = {}  # {channel_id: [時系列データのリスト]}
-        file_info = []  # 各ファイルの情報
+        # Overall data structure
+        all_channels_data = {}  # {channel_id: [time series data list]}
+        file_info = []  # Information for each file
         
-        # 各ファイルを処理
+        # Process each file
         for i, filepath in enumerate(cnt_files):
-            print(f"\n処理中 ({i+1}/{len(cnt_files)}): {os.path.basename(filepath)}")
+            print(f"\nProcessing ({i+1}/{len(cnt_files)}): {os.path.basename(filepath)}")
             
             try:
-                # WIN32デコード
+                # WIN32 decode
                 decoded = self.decoder.decode_win32_file(filepath)
                 
-                # ファイル情報を記録
+                # Record file information
                 timestamp = self._extract_timestamp(filepath)
                 file_info.append({
                     'filename': os.path.basename(filepath),
@@ -318,7 +318,7 @@ class WIN32ToLambda3Converter:
                     'index': i
                 })
                 
-                # チャンネルごとにデータを蓄積
+                # Accumulate data by channel
                 for channel_key, data in decoded.items():
                     if channel_key not in all_channels_data:
                         all_channels_data[channel_key] = []
@@ -327,22 +327,22 @@ class WIN32ToLambda3Converter:
                 self.processed_files.append(filepath)
                 
             except Exception as e:
-                print(f"  エラー: {e}")
+                print(f"  Error: {e}")
                 self.failed_files.append(filepath)
                 continue
         
-        # Lambda3解析用のデータ構造として保存
+        # Save as Lambda3 analysis data structure
         self._save_lambda3_format(all_channels_data, file_info, output_dir)
         
-        # 処理結果のサマリー
+        # Save processing summary
         self._save_summary(output_dir)
         
-        print(f"\n=== 変換完了 ===")
-        print(f"成功: {len(self.processed_files)}ファイル")
-        print(f"失敗: {len(self.failed_files)}ファイル")
+        print(f"\n=== Conversion Completed ===")
+        print(f"Success: {len(self.processed_files)} files")
+        print(f"Failed: {len(self.failed_files)} files")
     
     def _sort_files_by_time(self, files: List[str]) -> List[str]:
-        """ファイル名から時刻を抽出してソート"""
+        """Sort files by time extracted from filename"""
         def get_time_key(filepath):
             filename = os.path.basename(filepath)
             try:
@@ -353,7 +353,7 @@ class WIN32ToLambda3Converter:
         return sorted(files, key=get_time_key)
     
     def _extract_timestamp(self, filepath: str) -> str:
-        """ファイル名からタイムスタンプ抽出"""
+        """Extract timestamp from filename"""
         filename = os.path.basename(filepath)
         try:
             year = filename[0:4]
@@ -370,23 +370,23 @@ class WIN32ToLambda3Converter:
                             all_channels_data: Dict[str, List[np.ndarray]], 
                             file_info: List[Dict],
                             output_dir: str):
-        """Lambda3解析用フォーマットで保存"""
-        print(f"\n=== Lambda3形式での保存 ===")
+        """Save in Lambda3 analysis format"""
+        print(f"\n=== Saving in Lambda3 Format ===")
         
-        # チャンネルごとの連続データ
+        # Continuous data for each channel
         for channel_key, data_list in all_channels_data.items():
-            print(f"\nチャンネル {channel_key}:")
+            print(f"\nChannel {channel_key}:")
             
-            # 時系列データを連結
+            # Concatenate time series data
             continuous_data = np.concatenate(data_list)
-            print(f"  総サンプル数: {len(continuous_data)}")
-            print(f"  データ範囲: [{np.min(continuous_data)}, {np.max(continuous_data)}]")
+            print(f"  Total samples: {len(continuous_data)}")
+            print(f"  Data range: [{np.min(continuous_data)}, {np.max(continuous_data)}]")
             
-            # 個別チャンネルファイルとして保存
+            # Save as individual channel file
             channel_file = os.path.join(output_dir, f"{channel_key}_continuous.npy")
             np.save(channel_file, continuous_data)
             
-            # メタデータ
+            # Metadata
             metadata = {
                 'channel': channel_key,
                 'total_samples': len(continuous_data),
@@ -404,29 +404,29 @@ class WIN32ToLambda3Converter:
             with open(metadata_file, 'w') as f:
                 json.dump(metadata, f, indent=2)
         
-        # 統合データファイル（全チャンネル）
-        print("\n統合データの作成...")
+        # Create integrated data file (all channels)
+        print("\nCreating integrated data...")
         integrated_data = {}
         
-        # 同じ長さに揃える（最小長に合わせる）
+        # Align to same length (use minimum length)
         min_length = min(len(np.concatenate(data_list)) for data_list in all_channels_data.values())
         
         for channel_key, data_list in all_channels_data.items():
             continuous_data = np.concatenate(data_list)[:min_length]
             integrated_data[channel_key] = continuous_data
         
-        # 統合ファイルとして保存
+        # Save as integrated file
         integrated_file = os.path.join(output_dir, "all_channels_lambda3.npz")
         np.savez_compressed(integrated_file, **integrated_data)
-        print(f"統合ファイル保存: {integrated_file}")
+        print(f"Integrated file saved: {integrated_file}")
         
-        # ファイル情報も保存
+        # Save file information
         file_info_path = os.path.join(output_dir, "file_sequence.json")
         with open(file_info_path, 'w') as f:
             json.dump(file_info, f, indent=2)
     
     def _save_summary(self, output_dir: str):
-        """処理結果のサマリー保存"""
+        """Save processing summary"""
         summary = {
             'processing_time': datetime.now().isoformat(),
             'lambda3_theory': 'Direct observation data as semantic space projection',
@@ -445,28 +445,28 @@ class WIN32ToLambda3Converter:
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
         
-        print(f"\nサマリー保存: {summary_file}")
+        print(f"\nSummary saved: {summary_file}")
 
 
-# 使用例
+# Usage example
 if __name__ == "__main__":
-    # 設定
+    # Configuration
     input_directory = "/content/drive/MyDrive/Colab Notebooks/noto_earthquake_20240101/K-NET"
     output_directory = "/content/drive/MyDrive/Colab Notebooks/noto_earthquake_20240101/K-NET_lambda3"
     
-    # デコーダーと変換器を初期化
+    # Initialize decoder and converter
     decoder = WIN32ProperDecoder()
     converter = WIN32ToLambda3Converter(decoder=decoder)
     
-    # 変換実行
+    # Execute conversion
     converter.convert_directory(
         input_dir=input_directory,
         output_dir=output_directory,
         file_pattern="*.cnt"
     )
     
-    print("\n変換後のデータ構造：")
-    print("- 個別チャンネル: channel_XXXX_continuous.npy")
-    print("- メタデータ: channel_XXXX_metadata.json")
-    print("- 統合データ: all_channels_lambda3.npz")
-    print("\nLambda3解析の準備が完了しました。")
+    print("\nData structure after conversion:")
+    print("- Individual channels: channel_XXXX_continuous.npy")
+    print("- Metadata: channel_XXXX_metadata.json")
+    print("- Integrated data: all_channels_lambda3.npz")
+    print("\nLambda3 analysis preparation completed.")
