@@ -221,7 +221,7 @@ If you use this code, please cite:
 ⚠️ Opening this document may cause topological phase transitions in your brain.  
 “You are now entering the Λ³ zone. Proceed at your own risk.”
 
-- [Iizumi Masamichi – Zenodo Research Collection](https://zenodo.org/search?page=1&size=20&q=Iizumi%20Masamichi)
+- [Iizumi Masamichi – Zenodo Research Collection]([https://zenodo.org/search?page=1&size=20&q=Iizumi%20Masamichi](https://zenodo.org/search?q=metadata.creators.person_or_org.name%3A%22IIZUMI%2C%20MASAMICHI%22&l=list&p=1&s=10&sort=bestmatch))
 
 ## 🏷️ Author & Copyright
 
