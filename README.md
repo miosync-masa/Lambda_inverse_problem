@@ -6,8 +6,8 @@
 
 <p align="center">
   <strong>Physics-based Zero-Shot Anomaly Detection</strong><br>
-   at 97.83% AUC — no training, just physical law.㊗️<br>
-   <small>5000 STEPS, 20 dimensions, 2% anomaly rate</small>
+   at 97.57% AUC — no training, just physical law.㊗️<br>
+   <small>7999 STEPS, 20 dimensions, 0.03% anomaly rate</small>
 </p>
 
 
