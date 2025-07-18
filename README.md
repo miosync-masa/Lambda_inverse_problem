@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://www.miosync.link/github/0_4.jpg" alt="Lambda³" width="200"/>
+  <img src="https://www.miosync.link/github/0_4.jpg" alt="Lambda³" width="400"/>
 </p>
 
 <h1 align="center">📕 Lambda³ Zero-Shot Anomaly Detection</h1>
