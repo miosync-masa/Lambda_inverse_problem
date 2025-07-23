@@ -2017,7 +2017,7 @@ def demo_md_analysis():
 
 if __name__ == "__main__":
     # Load trajectory
-    trajectory = np.load('lysozyme_50k_trajectory.npy')
+    trajectory = np.load('lysozyme_50k_trajectory.npy').astype(np.float64)
     backbone_indices = np.load('lysozyme_50k_backbone_indices.npy')
     
     # Example 1: Standard analysis (backward compatible)
