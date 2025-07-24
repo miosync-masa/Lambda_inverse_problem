@@ -187,20 +187,23 @@ def detect_residue_anomalies(
     residue_anomaly_scores = {}
     
     for res_id in range(n_residues):
-        # ΛF magnitude anomalies
+        # ΛF magnitude anomalies (already n_frames-1)
         lambda_f_anomaly = detect_local_anomalies(
             residue_structures['residue_lambda_f_mag'][:, res_id],
             window=50
         )
         
-        # ρT anomalies
+        # ρT anomalies (n_frames)
         rho_t_anomaly = detect_local_anomalies(
             residue_structures['residue_rho_t'][:, res_id],
             window=50
         )
         
-        # Combined score
-        combined = (lambda_f_anomaly[:-1] + rho_t_anomaly[:-1]) / 2
+        # Combined score - align sizes correctly
+        # lambda_f_anomaly is already (n_frames-1)
+        # rho_t_anomaly is (n_frames), so we need to trim it
+        min_len = min(len(lambda_f_anomaly), len(rho_t_anomaly))
+        combined = (lambda_f_anomaly[:min_len] + rho_t_anomaly[:min_len]) / 2
         
         # Find significant anomalies
         if np.max(combined) > sensitivity:
@@ -677,3 +680,7 @@ if __name__ == "__main__":
     
     if result:
         print("\n✨ Two-stage analysis complete!")
+        print("Next steps:")
+        print("  1. Validate findings with experimental data")
+        print("  2. Design interventions targeting key residues")
+        print("  3. Test on ALS-related proteins")
