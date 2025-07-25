@@ -1,6 +1,6 @@
 """
-Lambda³ Residue-Level Focus Analysis Extension v2.0
-Two-stage hierarchical analysis with adaptive windows and async strong bonds
+Lambda³ Residue-Level Focus Analysis Extension v3.0
+Two-stage hierarchical analysis with adaptive windows, async bonds, and bootstrap confidence
 Author: Lambda³ Project (Enhanced by Tamaki & Mamichi)
 """
 
@@ -55,6 +55,8 @@ class ResidueLevelAnalysis:
     async_strong_bonds: List[Dict]
     sync_network: List[Dict]
     network_stats: Dict
+    # 追加: 信頼性評価結果
+    confidence_results: List[Dict] = None
 
 @dataclass
 class TwoStageLambda3Result:
@@ -262,6 +264,60 @@ def detect_residue_anomalies(
     return residue_anomaly_scores
 
 # ===============================
+# Bootstrap Confidence Estimation
+# ===============================
+
+@njit
+def bootstrap_correlation_confidence(
+    series_i: np.ndarray,
+    series_j: np.ndarray,
+    n_bootstrap: int = 100,
+    confidence_level: float = 0.95
+) -> Tuple[float, float, float]:
+    """
+    ブートストラップ法で相関の信頼区間を計算（軽量版）
+    """
+    n = len(series_i)
+    if n < 10:  # Too few samples
+        return 0.0, 0.0, 0.0
+        
+    correlations = np.empty(n_bootstrap)
+    
+    # Set seed for reproducibility
+    np.random.seed(42)
+    
+    for b in range(n_bootstrap):
+        # リサンプリング
+        indices = np.random.randint(0, n, size=n)
+        resampled_i = series_i[indices]
+        resampled_j = series_j[indices]
+        
+        # 相関計算
+        mean_i = np.mean(resampled_i)
+        mean_j = np.mean(resampled_j)
+        std_i = np.std(resampled_i)
+        std_j = np.std(resampled_j)
+        
+        if std_i > 1e-10 and std_j > 1e-10:
+            # Manual correlation calculation for numba
+            cov = np.mean((resampled_i - mean_i) * (resampled_j - mean_j))
+            correlations[b] = cov / (std_i * std_j)
+        else:
+            correlations[b] = 0.0
+    
+    # 信頼区間
+    alpha = 1 - confidence_level
+    lower_idx = int((alpha/2) * n_bootstrap)
+    upper_idx = int((1-alpha/2) * n_bootstrap)
+    
+    sorted_corr = np.sort(correlations)
+    lower = sorted_corr[lower_idx]
+    upper = sorted_corr[upper_idx]
+    mean_corr = np.mean(correlations)
+    
+    return mean_corr, lower, upper
+
+# ===============================
 # Advanced Causality Detection
 # ===============================
 
@@ -423,7 +479,10 @@ def analyze_macro_event(
     residue_atoms: Dict[int, List[int]],
     residue_names: Dict[int, str],
     sensitivity: float = 1.0,  # 下げた
-    correlation_threshold: float = 0.15  # 下げた
+    correlation_threshold: float = 0.15,  # 下げた
+    use_confidence: bool = True,  # 新規追加！
+    n_bootstrap: int = 50,  # 軽量化のため少なめ
+    confidence_level: float = 0.95
 ) -> ResidueLevelAnalysis:
     """
     Perform detailed residue-level analysis for a single macro event.
@@ -500,6 +559,60 @@ def analyze_macro_event(
     print(f"   Found {len(initiators)} initiator residues")
     print(f"   Detected {len(causality_chains)} causal relationships")
     
+    # Confidence estimation for top causal relationships
+    confidence_results = []
+    if use_confidence and len(causality_chains) > 0:
+        print("\n🎲 Computing Bootstrap Confidence Intervals...")
+        print(f"   Bootstrap iterations: {n_bootstrap}")
+        print(f"   Confidence level: {confidence_level*100:.0f}%")
+        
+        # Analyze top causal relationships
+        top_pairs = causality_chains[:min(10, len(causality_chains))]  # Top 10
+        
+        for res_i, res_j, strength in top_pairs:
+            if res_i in residue_anomaly_scores and res_j in residue_anomaly_scores:
+                scores_i = residue_anomaly_scores[res_i]
+                scores_j = residue_anomaly_scores[res_j]
+                
+                # Bootstrap confidence intervals
+                mean_corr, ci_lower, ci_upper = bootstrap_correlation_confidence(
+                    scores_i, scores_j, n_bootstrap, confidence_level
+                )
+                
+                # Check significance
+                is_significant = (ci_lower > 0 and ci_upper > 0) or (ci_lower < 0 and ci_upper < 0)
+                ci_width = ci_upper - ci_lower
+                confidence_score = 1.0 - ci_width  # Narrower CI = higher confidence
+                
+                confidence_results.append({
+                    'pair': (res_i, res_j),
+                    'strength': strength,
+                    'mean': mean_corr,
+                    'ci_lower': ci_lower,
+                    'ci_upper': ci_upper,
+                    'ci_width': ci_width,
+                    'confidence_score': confidence_score,
+                    'significant': is_significant
+                })
+        
+        # Display confidence summary
+        print(f"\n   [Bootstrap Confidence Summary]")
+        print(f"   {'Pair':<12} {'Strength':>8} {'Mean':>8} {'CI_Low':>8} {'CI_High':>8} {'Signif':>8}")
+        print("   " + "-" * 60)
+        
+        significant_count = 0
+        for conf in confidence_results[:5]:  # Show top 5
+            res_i, res_j = conf['pair']
+            signif = "YES" if conf['significant'] else "NO"
+            if conf['significant']:
+                significant_count += 1
+            
+            print(f"   R{res_i+1:<3}-R{res_j+1:<3}     "
+                  f"{conf['strength']:>8.3f} {conf['mean']:>8.3f} "
+                  f"{conf['ci_lower']:>8.3f} {conf['ci_upper']:>8.3f} {signif:>8}")
+        
+        print(f"\n   Total significant pairs: {significant_count}/{len(confidence_results)}")
+    
     return ResidueLevelAnalysis(
         event_name=event_name,
         macro_start=start_frame,
@@ -515,7 +628,8 @@ def analyze_macro_event(
             'n_sync': network_results['n_sync_links'],
             'n_async': network_results['n_async_bonds'],
             'mean_adaptive_window': np.mean(list(network_results['adaptive_windows'].values()))
-        }
+        },
+        confidence_results=confidence_results
     )
 
 def build_propagation_paths(
@@ -574,14 +688,15 @@ def perform_two_stage_analysis(
     detected_events: List[Tuple[int, int, str]],
     n_residues: int = 129,
     sensitivity: float = 1.0,  # 下げた
-    correlation_threshold: float = 0.15  # 下げた
+    correlation_threshold: float = 0.15,  # 下げた
+    use_confidence: bool = True  # 新規追加！
 ) -> TwoStageLambda3Result:
     """
     Perform two-stage analysis: macro events → residue-level causality.
     Enhanced with adaptive windows and network statistics.
     """
     print("\n" + "="*60)
-    print("=== Two-Stage Lambda³ Analysis (v2.0) ===")
+    print("=== Two-Stage Lambda³ Analysis (v3.0) ===")
     print("="*60)
     
     # Create residue mapping
@@ -604,7 +719,8 @@ def perform_two_stage_analysis(
             residue_atoms,
             residue_names,
             sensitivity=sensitivity,
-            correlation_threshold=correlation_threshold
+            correlation_threshold=correlation_threshold,
+            use_confidence=use_confidence
         )
         
         residue_analyses[event_name] = analysis
@@ -664,9 +780,9 @@ def visualize_residue_causality(
     save_path: Optional[str] = None
 ) -> plt.Figure:
     """
-    Enhanced visualization with async bonds and adaptive windows.
+    Enhanced visualization with async bonds, adaptive windows, and confidence intervals.
     """
-    fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # 1. Timeline of residue events with adaptive windows
     ax1 = axes[0, 0]
@@ -711,7 +827,7 @@ def visualize_residue_causality(
     ax2.axis('off')
     
     # 3. Async Strong Bonds
-    ax3 = axes[1, 0]
+    ax3 = axes[0, 2]
     ax3.set_title("Async Strong Bonds (同期なき強い結びつき)")
     
     if analysis.async_strong_bonds:
@@ -748,7 +864,7 @@ def visualize_residue_causality(
         cbar.set_label('Optimal Lag (frames)')
     
     # 4. Network Statistics
-    ax4 = axes[1, 1]
+    ax4 = axes[1, 0]
     ax4.set_title("Network Statistics")
     ax4.axis('off')
     
@@ -768,6 +884,68 @@ def visualize_residue_causality(
     ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, 
             fontsize=11, verticalalignment='top', fontfamily='monospace')
     
+    # 5. Confidence Intervals (NEW!)
+    ax5 = axes[1, 1]
+    ax5.set_title("Bootstrap Confidence Intervals")
+    
+    if analysis.confidence_results:
+        # Show confidence intervals for significant pairs
+        significant_pairs = [c for c in analysis.confidence_results if c['significant']][:8]
+        
+        if significant_pairs:
+            y_pos = np.arange(len(significant_pairs))
+            
+            for i, conf in enumerate(significant_pairs):
+                res_i, res_j = conf['pair']
+                # Plot confidence interval
+                ax5.plot([conf['ci_lower'], conf['ci_upper']], [i, i], 'b-', linewidth=2)
+                ax5.plot(conf['mean'], i, 'ro', markersize=8)
+                ax5.text(-0.15, i, f"R{res_i+1}-R{res_j+1}", ha='right', va='center', fontsize=9)
+            
+            ax5.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
+            ax5.set_xlabel("Correlation Coefficient")
+            ax5.set_yticks(y_pos)
+            ax5.set_yticklabels([])
+            ax5.set_ylim(-0.5, len(significant_pairs)-0.5)
+            ax5.grid(True, axis='x', alpha=0.3)
+            ax5.set_title(f"Confidence Intervals (n={len(significant_pairs)} significant)")
+        else:
+            ax5.text(0.5, 0.5, "No significant pairs found", 
+                    transform=ax5.transAxes, ha='center', va='center', fontsize=12)
+    else:
+        ax5.text(0.5, 0.5, "Confidence analysis not performed", 
+                transform=ax5.transAxes, ha='center', va='center', fontsize=12)
+    
+    # 6. Confidence Summary
+    ax6 = axes[1, 2]
+    ax6.set_title("Statistical Summary")
+    ax6.axis('off')
+    
+    if analysis.confidence_results:
+        n_total = len(analysis.confidence_results)
+        n_significant = sum(1 for c in analysis.confidence_results if c['significant'])
+        mean_width = np.mean([c['ci_width'] for c in analysis.confidence_results])
+        
+        summary_text = f"""
+Bootstrap Analysis Summary:
+- Total pairs analyzed: {n_total}
+- Significant pairs: {n_significant} ({n_significant/n_total*100:.1f}%)
+- Mean CI width: {mean_width:.3f}
+
+Top Confident Pairs:
+"""
+        # Sort by confidence score
+        sorted_conf = sorted(analysis.confidence_results, 
+                           key=lambda x: x['confidence_score'], reverse=True)
+        
+        for i, conf in enumerate(sorted_conf[:5]):
+            res_i, res_j = conf['pair']
+            summary_text += f"\n{i+1}. R{res_i+1}-R{res_j+1}: "
+            summary_text += f"[{conf['ci_lower']:.3f}, {conf['ci_upper']:.3f}]"
+        
+        ax6.text(0.1, 0.9, summary_text, transform=ax6.transAxes,
+                fontsize=10, verticalalignment='top', fontfamily='monospace')
+    
     plt.tight_layout()
     
     if save_path:
@@ -784,8 +962,8 @@ def create_intervention_report(
     """
     report = []
     report.append("="*60)
-    report.append("Lambda³ Two-Stage Analysis Report (v2.0)")
-    report.append("Residue-Level Intervention Recommendations")
+    report.append("Lambda³ Two-Stage Analysis Report (v3.0)")
+    report.append("Residue-Level Intervention Recommendations with Statistical Confidence")
     report.append("="*60)
     report.append("")
     
@@ -850,6 +1028,37 @@ def create_intervention_report(
         report.append(f"  Network: {analysis.network_stats['n_causal']} causal, "
                      f"{analysis.network_stats['n_sync']} sync, "
                      f"{analysis.network_stats['n_async']} async bonds")
+    
+    report.append("")
+    report.append("📊 STATISTICAL CONFIDENCE")
+    report.append("-"*30)
+    
+    # Collect all confidence results
+    all_confidence_results = []
+    for analysis in two_stage_result.residue_analyses.values():
+        if analysis.confidence_results:
+            all_confidence_results.extend(analysis.confidence_results)
+    
+    if all_confidence_results:
+        # Overall statistics
+        n_total_pairs = len(all_confidence_results)
+        n_significant = sum(1 for c in all_confidence_results if c['significant'])
+        
+        report.append(f"Total pairs analyzed: {n_total_pairs}")
+        report.append(f"Statistically significant: {n_significant} ({n_significant/n_total_pairs*100:.1f}%)")
+        
+        # Top confident pairs
+        sorted_by_confidence = sorted(all_confidence_results, 
+                                    key=lambda x: x['confidence_score'], reverse=True)
+        
+        report.append("\nMost Confident Causal Relationships:")
+        for i, conf in enumerate(sorted_by_confidence[:5]):
+            res_i, res_j = conf['pair']
+            report.append(f"{i+1}. R{res_i+1} → R{res_j+1}:")
+            report.append(f"   95% CI: [{conf['ci_lower']:.3f}, {conf['ci_upper']:.3f}]")
+            report.append(f"   Confidence score: {conf['confidence_score']:.3f}")
+    else:
+        report.append("No confidence analysis performed")
     
     report.append("")
     report.append("🔥 ASYNC STRONG BONDS (同期なき強い結びつき)")
@@ -947,11 +1156,11 @@ def analyze_aggregation_pathway(
 def demo_two_stage_analysis():
     """
     Demo two-stage analysis on 100k lysozyme trajectory.
-    Enhanced version with adaptive windows and async bonds.
+    Enhanced version with adaptive windows, async bonds, and bootstrap confidence.
     """
-    print("🔬 Lambda³ Two-Stage Analysis Demo v2.0")
+    print("🔬 Lambda³ Two-Stage Analysis Demo v3.0")
     print("Stage 1: Macro events (✓ Complete)")
-    print("Stage 2: Residue-level causality with adaptive windows (Starting...)")
+    print("Stage 2: Residue-level causality with confidence analysis (Starting...)")
     
     # Load trajectory
     try:
@@ -998,9 +1207,9 @@ def demo_two_stage_analysis():
         return None
 
 if __name__ == "__main__":
-    print("\n🚀 Lambda³ Residue-Level Focus Extension v2.0")
-    print("Enhanced with Adaptive Windows & Async Strong Bonds")
-    print("Taking Lambda³ analysis to the atomic scale with smarter detection...")
+    print("\n🚀 Lambda³ Residue-Level Focus Extension v3.0")
+    print("Enhanced with Adaptive Windows, Async Strong Bonds & Bootstrap Confidence")
+    print("Taking Lambda³ analysis to the atomic scale with statistical rigor...")
     
     result = demo_two_stage_analysis()
     
@@ -1009,5 +1218,6 @@ if __name__ == "__main__":
         print("New features:")
         print("  - Adaptive window sizing per residue")
         print("  - Async strong bond detection")
+        print("  - Bootstrap confidence intervals (95% CI)")
+        print("  - Statistical significance testing")
         print("  - Enhanced network statistics")
-        print("  - Lower thresholds for better sensitivity")
