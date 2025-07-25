@@ -178,7 +178,7 @@ def compute_residue_lambda_structures(
 
 def detect_residue_anomalies(
     residue_structures: Dict[str, np.ndarray],
-    sensitivity: float = 2.0
+    sensitivity: float = 1.5  # 2.0から1.5に下げる
 ) -> Dict[int, np.ndarray]:
     """
     Detect anomalies for each residue.
@@ -218,7 +218,8 @@ def detect_residue_anomalies(
 def detect_causality_chain(
     residue_anomaly_scores: Dict[int, np.ndarray],
     residue_coupling: np.ndarray,
-    lag_window: int = 100
+    lag_window: int = 100,
+    correlation_threshold: float = 0.3  # 0.5から0.3に下げる
 ) -> List[Tuple[int, int, float]]:
     """
     Detect causal relationships between residues based on temporal correlation.
@@ -247,11 +248,11 @@ def detect_causality_chain(
                             max_correlation = abs(corr)
                             best_lag = lag
             
-            # Strong correlation suggests causality
-            if max_correlation > 0.5:
+            # Strong correlation suggests causality (閾値を下げた)
+            if max_correlation > correlation_threshold:
                 # Also check spatial proximity
                 avg_coupling = np.mean(residue_coupling[:, res_i, res_j])
-                if avg_coupling > 0.1 or max_correlation > 0.7:
+                if avg_coupling > 0.1 or max_correlation > 0.5:  # 強い相関なら距離不問
                     causality_chains.append((res_i, res_j, max_correlation))
     
     return sorted(causality_chains, key=lambda x: x[2], reverse=True)
@@ -266,7 +267,9 @@ def analyze_macro_event(
     start_frame: int,
     end_frame: int,
     residue_atoms: Dict[int, List[int]],
-    residue_names: Dict[int, str]
+    residue_names: Dict[int, str],
+    sensitivity: float = 1.5,
+    correlation_threshold: float = 0.3
 ) -> ResidueLevelAnalysis:
     """
     Perform detailed residue-level analysis for a single macro event.
@@ -278,8 +281,8 @@ def analyze_macro_event(
         trajectory, start_frame, end_frame, residue_atoms
     )
     
-    # Detect anomalies per residue
-    residue_anomaly_scores = detect_residue_anomalies(residue_structures)
+    # Detect anomalies per residue (パラメータを渡す)
+    residue_anomaly_scores = detect_residue_anomalies(residue_structures, sensitivity)
     
     # Find initiator residues (earliest anomalies)
     initiators = []
@@ -287,7 +290,7 @@ def analyze_macro_event(
     
     for res_id, scores in residue_anomaly_scores.items():
         # Find first significant peak
-        peaks, properties = find_peaks(scores, height=2.0, distance=50)
+        peaks, properties = find_peaks(scores, height=sensitivity, distance=50)  # heightも調整
         
         if len(peaks) > 0:
             first_peak = peaks[0]
@@ -307,11 +310,12 @@ def analyze_macro_event(
             if first_peak < 50:  # Early responders
                 initiators.append(res_id)
     
-    # Detect causality chains
+    # Detect causality chains (閾値パラメータを渡す)
     causality_chains = detect_causality_chain(
         residue_anomaly_scores,
         residue_structures['residue_coupling'],
-        lag_window=100
+        lag_window=100,
+        correlation_threshold=correlation_threshold
     )
     
     # Build propagation paths
@@ -384,7 +388,9 @@ def perform_two_stage_analysis(
     trajectory: np.ndarray,
     macro_result: 'MDLambda3Result',
     detected_events: List[Tuple[int, int, str]],
-    n_residues: int = 129
+    n_residues: int = 129,
+    sensitivity: float = 1.5,
+    correlation_threshold: float = 0.3
 ) -> TwoStageLambda3Result:
     """
     Perform two-stage analysis: macro events → residue-level causality.
@@ -410,7 +416,9 @@ def perform_two_stage_analysis(
             start,
             end,
             residue_atoms,
-            residue_names
+            residue_names,
+            sensitivity=sensitivity,
+            correlation_threshold=correlation_threshold
         )
         
         residue_analyses[event_name] = analysis
