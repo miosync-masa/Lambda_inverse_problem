@@ -361,10 +361,13 @@ def detect_residue_network_enhanced(
     residue_coupling: np.ndarray,
     base_lag_window: int = 100,
     causality_threshold: float = 0.15,
-    sync_threshold: float = 0.2
+    sync_threshold: float = 0.2,
+    max_causal_links: int = 500,  # 追加: 最大リンク数制限
+    min_causality_strength: float = 0.2  # 追加: 最小因果強度
 ) -> Dict[str, any]:
     """
     拡張版：同期と因果を分離したネットワーク検出
+    メモリ爆発を防ぐための制限付き
     """
     residue_ids = sorted(residue_anomaly_scores.keys())
     n_residues = len(residue_ids)
@@ -374,6 +377,9 @@ def detect_residue_network_enhanced(
     sync_network = []
     async_strong_bonds = []  # 同期なき強い結びつき！
     
+    # 追加: 候補リストで事前フィルタリング
+    causal_candidates = []
+    
     # 各residueのアダプティブウィンドウを計算
     adaptive_windows = {}
     for res_id, scores in residue_anomaly_scores.items():
@@ -382,6 +388,12 @@ def detect_residue_network_enhanced(
     print(f"\n🎯 Adaptive Windows for top residues:")
     for res_id, window in list(adaptive_windows.items())[:5]:
         print(f"   Residue {res_id+1}: {window} frames")
+    
+    # 追加: ペア数が多すぎる場合の警告
+    total_pairs = n_residues * (n_residues - 1) // 2
+    if total_pairs > 1000:
+        print(f"\n⚠️  Warning: {total_pairs} residue pairs to analyze!")
+        print(f"   Applying stricter filtering to prevent memory explosion...")
     
     for i, res_i in enumerate(residue_ids):
         for j, res_j in enumerate(residue_ids[i+1:], i+1):
@@ -411,51 +423,85 @@ def detect_residue_network_enhanced(
             # 動的閾値（residueの活性度に応じて調整）
             activity_i = np.mean(scores_i > 1.0)
             activity_j = np.mean(scores_j > 1.0)
-            dynamic_causality_threshold = causality_threshold * (1 - 0.5 * min(activity_i, activity_j))
+            dynamic_causality_threshold = causality_threshold * (1 - 0.3 * min(activity_i, activity_j))
             
             # ネットワーク分類
-            has_causality = max(max_caus_ij, max_caus_ji) > dynamic_causality_threshold
+            max_causality = max(max_caus_ij, max_caus_ji)
+            has_causality = max_causality > dynamic_causality_threshold
             has_sync = abs(sync_rate) > sync_threshold
             
-            if has_causality:
-                # 因果ネットワークに追加
+            # 追加: 強度フィルタリング
+            if has_causality and max_causality > min_causality_strength:
+                # 候補として保存
                 if max_caus_ij > max_caus_ji:
-                    causal_network.append({
+                    causal_candidates.append({
                         'from': res_i,
                         'to': res_j,
                         'strength': max_caus_ij,
                         'lag': lag_ij,
                         'type': 'causal',
-                        'window_used': pair_window
+                        'window_used': pair_window,
+                        'sync_rate': sync_rate,
+                        'coupling': avg_coupling
                     })
                 else:
-                    causal_network.append({
+                    causal_candidates.append({
                         'from': res_j,
                         'to': res_i,
                         'strength': max_caus_ji,
                         'lag': lag_ji,
                         'type': 'causal',
-                        'window_used': pair_window
-                    })
-                
-                # 同期なき強い結びつきの検出！
-                if has_causality and not has_sync:
-                    async_strong_bonds.append({
-                        'residue_pair': (res_i, res_j),
-                        'causality': max(max_caus_ij, max_caus_ji),
+                        'window_used': pair_window,
                         'sync_rate': sync_rate,
-                        'optimal_lag': lag_ij if max_caus_ij > max_caus_ji else lag_ji,
-                        'coupling': avg_coupling,
-                        'window': pair_window
+                        'coupling': avg_coupling
                     })
             
             if has_sync:
-                # 同期ネットワークに追加
+                # 同期ネットワークに追加（こちらは制限なし）
                 sync_network.append({
                     'residue_pair': (res_i, res_j),
                     'sync_strength': abs(sync_rate),
                     'type': 'synchronous'
                 })
+    
+    # 因果候補を強度でソート
+    causal_candidates.sort(key=lambda x: x['strength'], reverse=True)
+    
+    # 上位N個のみを採用
+    if len(causal_candidates) > max_causal_links:
+        print(f"\n📊 Filtering causality network:")
+        print(f"   Total candidates: {len(causal_candidates)}")
+        print(f"   Keeping top {max_causal_links} links")
+        causal_candidates = causal_candidates[:max_causal_links]
+    
+    # 最終的なネットワークを構築
+    for candidate in causal_candidates:
+        causal_network.append({
+            'from': candidate['from'],
+            'to': candidate['to'],
+            'strength': candidate['strength'],
+            'lag': candidate['lag'],
+            'type': candidate['type'],
+            'window_used': candidate['window_used']
+        })
+        
+        # 同期なき強い結びつきの検出
+        if abs(candidate['sync_rate']) <= sync_threshold:
+            async_strong_bonds.append({
+                'residue_pair': (candidate['from'], candidate['to']),
+                'causality': candidate['strength'],
+                'sync_rate': candidate['sync_rate'],
+                'optimal_lag': candidate['lag'],
+                'coupling': candidate['coupling'],
+                'window': candidate['window_used']
+            })
+    
+    # 統計情報の出力
+    if len(causal_candidates) > 100:
+        print(f"\n📈 Causality strength distribution:")
+        print(f"   Top 10%: > {causal_candidates[int(len(causal_candidates)*0.1)]['strength']:.3f}")
+        print(f"   Top 25%: > {causal_candidates[int(len(causal_candidates)*0.25)]['strength']:.3f}")
+        print(f"   Median:    {causal_candidates[len(causal_candidates)//2]['strength']:.3f}")
     
     return {
         'causal_network': causal_network,
