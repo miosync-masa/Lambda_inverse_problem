@@ -1,29 +1,62 @@
 """
-Lambda³ Residue-Level Focus Analysis Extension v3.0
+Lambda³ Residue-Level Focus Analysis Extension v3.0 (Refactored)
 Two-stage hierarchical analysis with adaptive windows, async bonds, and bootstrap confidence
-Author: Lambda³ Project (Enhanced by Tamaki & Mamichi)
+Author: Lambda³ Project (Refactored by Tamaki)
 """
 
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import matplotlib.pyplot as plt
 from scipy.signal import find_peaks
 from scipy.ndimage import gaussian_filter1d
-from numba import njit, jit
+from numba import njit
 import warnings
 
 warnings.filterwarnings('ignore')
 
-# Import from main Lambda³ module
-try:
-    from lambda3_md_fixed import (
-        MDLambda3Result,
-        compute_structural_coherence,
-        detect_local_anomalies
-    )
-except ImportError:
-    print("Warning: Main Lambda³ module not found. Some features may be limited.")
+# ===============================
+# Configuration and Constants
+# ===============================
+
+class ResidueAnalysisConfig:
+    """Configuration for residue-level analysis"""
+    # Analysis parameters
+    sensitivity: float = 1.0
+    correlation_threshold: float = 0.15
+    sync_threshold: float = 0.2
+    
+    # Window parameters
+    min_window: int = 30
+    max_window: int = 300
+    base_window: int = 50
+    base_lag_window: int = 100
+    
+    # Network constraints
+    max_causal_links: int = 500
+    min_causality_strength: float = 0.2
+    
+    # Bootstrap parameters
+    use_confidence: bool = True
+    n_bootstrap: int = 50
+    confidence_level: float = 0.95
+    
+    # Event-specific settings
+    event_sensitivities = {
+        'ligand_binding_effect': 1.5,
+        'slow_helix_destabilization': 1.0,
+        'rapid_partial_unfold': 0.8,
+        'transient_refolding_attempt': 1.2,
+        'aggregation_onset': 1.0
+    }
+    
+    event_windows = {
+        'ligand_binding_effect': 100,
+        'slow_helix_destabilization': 500,
+        'rapid_partial_unfold': 50,
+        'transient_refolding_attempt': 200,
+        'aggregation_onset': 300
+    }
 
 # ===============================
 # Data Classes
@@ -37,275 +70,969 @@ class ResidueEvent:
     start_frame: int
     end_frame: int
     peak_lambda_f: float
-    propagation_delay: int  # Frames from macro event start
+    propagation_delay: int
     role: str  # 'initiator', 'propagator', 'responder'
-    adaptive_window: int = 100  # 追加: アダプティブウィンドウサイズ
+    adaptive_window: int = 100
 
-@dataclass 
+@dataclass
+class NetworkLink:
+    """Network connection between residues"""
+    from_res: int
+    to_res: int
+    strength: float
+    lag: int
+    distance: Optional[float] = None
+    sync_rate: Optional[float] = None
+    link_type: str = 'causal'
+
+@dataclass
+class ConfidenceResult:
+    """Bootstrap confidence analysis result"""
+    pair: Tuple[int, int]
+    strength: float
+    mean: float
+    ci_lower: float
+    ci_upper: float
+    ci_width: float
+    confidence_score: float
+    significant: bool
+
+@dataclass
 class ResidueLevelAnalysis:
     """Results of residue-level analysis for one macro event"""
     event_name: str
     macro_start: int
     macro_end: int
     residue_events: List[ResidueEvent]
-    causality_chain: List[Tuple[int, int, float]]  # (res1, res2, correlation)
+    causality_chain: List[Tuple[int, int, float]]
     initiator_residues: List[int]
     key_propagation_paths: List[List[int]]
-    # 追加: 同期なき強い結びつき
     async_strong_bonds: List[Dict]
     sync_network: List[Dict]
     network_stats: Dict
-    # 追加: 信頼性評価結果
-    confidence_results: List[Dict] = None
+    confidence_results: List[ConfidenceResult] = field(default_factory=list)
 
 @dataclass
 class TwoStageLambda3Result:
     """Complete two-stage analysis results"""
-    macro_result: 'MDLambda3Result'  # From main analysis
+    macro_result: any  # MDLambda3Result
     residue_analyses: Dict[str, ResidueLevelAnalysis]
     global_residue_importance: Dict[int, float]
     suggested_intervention_points: List[int]
-    # 追加: ネットワーク統計
     global_network_stats: Dict
 
 # ===============================
-# Residue Mapping Functions
+# Core Analysis Engine
 # ===============================
 
-def create_residue_mapping(n_atoms: int = 1079, n_residues: int = 129) -> Dict[int, List[int]]:
-    """
-    Create mapping from residue ID to atom indices.
-    This is a simplified version - in practice, would read from PDB.
-    """
-    atoms_per_residue = n_atoms // n_residues
-    residue_atoms = {}
+class Lambda3ResidueAnalyzer:
+    """Main analyzer class for residue-level Lambda³ analysis"""
     
-    for res_id in range(n_residues):
-        start_atom = res_id * atoms_per_residue
-        end_atom = min(start_atom + atoms_per_residue, n_atoms)
-        residue_atoms[res_id] = list(range(start_atom, end_atom))
+    def __init__(self, config: ResidueAnalysisConfig = None):
+        self.config = config or ResidueAnalysisConfig()
+        
+    def analyze_trajectory(self,
+                          trajectory: np.ndarray,
+                          macro_result: any,
+                          detected_events: List[Tuple[int, int, str]],
+                          n_residues: int = 129) -> TwoStageLambda3Result:
+        """
+        Main entry point for two-stage analysis
+        """
+        print("\n" + "="*60)
+        print("=== Two-Stage Lambda³ Analysis (v3.0 Refactored) ===")
+        print("="*60)
+        
+        # Setup
+        residue_atoms = self._create_residue_mapping(trajectory.shape[1], n_residues)
+        residue_names = self._get_residue_names(n_residues)
+        
+        # Analyze each event
+        residue_analyses = {}
+        all_important_residues = {}
+        
+        for start, end, event_name in detected_events:
+            print(f"\n📍 Processing {event_name}...")
+            
+            analysis = self._analyze_single_event(
+                trajectory, event_name, start, end,
+                residue_atoms, residue_names
+            )
+            
+            residue_analyses[event_name] = analysis
+            
+            # Track importance
+            for event in analysis.residue_events:
+                res_id = event.residue_id
+                if res_id not in all_important_residues:
+                    all_important_residues[res_id] = 0
+                importance = event.peak_lambda_f * (1 + 0.1 * (100 / event.adaptive_window))
+                all_important_residues[res_id] += importance
+        
+        # Global analysis
+        intervention_points = self._identify_intervention_points(all_important_residues)
+        global_stats = self._compute_global_stats(residue_analyses)
+        
+        self._print_summary(all_important_residues, global_stats, intervention_points)
+        
+        return TwoStageLambda3Result(
+            macro_result=macro_result,
+            residue_analyses=residue_analyses,
+            global_residue_importance=all_important_residues,
+            suggested_intervention_points=intervention_points,
+            global_network_stats=global_stats
+        )
     
-    # Handle remaining atoms
-    if n_atoms % n_residues != 0:
-        remaining_start = n_residues * atoms_per_residue
-        residue_atoms[n_residues-1].extend(range(remaining_start, n_atoms))
+    def _analyze_single_event(self,
+                             trajectory: np.ndarray,
+                             event_name: str,
+                             start_frame: int,
+                             end_frame: int,
+                             residue_atoms: Dict[int, List[int]],
+                             residue_names: Dict[int, str]) -> ResidueLevelAnalysis:
+        """Analyze a single macro event at residue level"""
+        
+        # Compute structures
+        structures = ResidueStructureComputer.compute(
+            trajectory, start_frame, end_frame, residue_atoms
+        )
+        
+        # Detect anomalies
+        anomaly_detector = ResidueAnomalyDetector(self.config)
+        anomaly_scores = anomaly_detector.detect(structures, self.config.sensitivity)
+        
+        # Network analysis
+        network_analyzer = ResidueNetworkAnalyzer(self.config)
+        network_results = network_analyzer.analyze(
+            anomaly_scores, structures['residue_coupling']
+        )
+        
+        # Build events and find initiators
+        residue_events = self._build_residue_events(
+            anomaly_scores, residue_names, start_frame, network_results
+        )
+        
+        initiators = self._find_initiators(residue_events, network_results['causal_network'])
+        
+        # Causality analysis
+        causality_chains = [
+            (link['from'], link['to'], link['strength'])
+            for link in network_results['causal_network']
+        ]
+        
+        propagation_paths = self._build_propagation_paths(initiators, causality_chains)
+        
+        # Confidence analysis
+        confidence_results = []
+        if self.config.use_confidence and causality_chains:
+            confidence_analyzer = ConfidenceAnalyzer(self.config)
+            confidence_results = confidence_analyzer.analyze(
+                causality_chains[:10], anomaly_scores
+            )
+        
+        return ResidueLevelAnalysis(
+            event_name=event_name,
+            macro_start=start_frame,
+            macro_end=end_frame,
+            residue_events=residue_events,
+            causality_chain=causality_chains,
+            initiator_residues=initiators,
+            key_propagation_paths=propagation_paths[:5],
+            async_strong_bonds=network_results['async_strong_bonds'],
+            sync_network=network_results['sync_network'],
+            network_stats={
+                'n_causal': network_results['n_causal_links'],
+                'n_sync': network_results['n_sync_links'],
+                'n_async': network_results['n_async_bonds'],
+                'mean_adaptive_window': np.mean(list(network_results['adaptive_windows'].values()))
+            },
+            confidence_results=confidence_results
+        )
     
-    return residue_atoms
-
-def get_residue_names() -> Dict[int, str]:
-    """
-    Get residue names for lysozyme.
-    In practice, would read from PDB file.
-    """
-    # Simplified - using residue number as name
-    return {i: f"RES{i+1}" for i in range(129)}
+    def _create_residue_mapping(self, n_atoms: int, n_residues: int) -> Dict[int, List[int]]:
+        """Create mapping from residue ID to atom indices"""
+        atoms_per_residue = n_atoms // n_residues
+        residue_atoms = {}
+        
+        for res_id in range(n_residues):
+            start_atom = res_id * atoms_per_residue
+            end_atom = min(start_atom + atoms_per_residue, n_atoms)
+            residue_atoms[res_id] = list(range(start_atom, end_atom))
+        
+        # Handle remaining atoms
+        if n_atoms % n_residues != 0:
+            remaining_start = n_residues * atoms_per_residue
+            residue_atoms[n_residues-1].extend(range(remaining_start, n_atoms))
+        
+        return residue_atoms
+    
+    def _get_residue_names(self, n_residues: int) -> Dict[int, str]:
+        """Get residue names"""
+        return {i: f"RES{i+1}" for i in range(n_residues)}
+    
+    def _build_residue_events(self,
+                             anomaly_scores: Dict[int, np.ndarray],
+                             residue_names: Dict[int, str],
+                             start_frame: int,
+                             network_results: Dict) -> List[ResidueEvent]:
+        """Build residue event objects from anomaly scores"""
+        events = []
+        
+        for res_id, scores in anomaly_scores.items():
+            peaks, properties = find_peaks(scores, height=self.config.sensitivity, distance=50)
+            
+            if len(peaks) > 0:
+                first_peak = peaks[0]
+                peak_height = properties['peak_heights'][0]
+                
+                event = ResidueEvent(
+                    residue_id=res_id,
+                    residue_name=residue_names.get(res_id, f"RES{res_id}"),
+                    start_frame=start_frame + first_peak,
+                    end_frame=start_frame + min(first_peak + 100, len(scores)),
+                    peak_lambda_f=float(peak_height),
+                    propagation_delay=first_peak,
+                    role='initiator' if first_peak < 50 else 'propagator',
+                    adaptive_window=network_results['adaptive_windows'].get(res_id, 100)
+                )
+                events.append(event)
+        
+        return events
+    
+    def _find_initiators(self,
+                        residue_events: List[ResidueEvent],
+                        causal_network: List[Dict]) -> List[int]:
+        """Identify initiator residues"""
+        initiators = []
+        
+        # Early responders
+        for event in residue_events:
+            if event.propagation_delay < 50:
+                initiators.append(event.residue_id)
+        
+        return initiators
+    
+    def _build_propagation_paths(self,
+                                initiators: List[int],
+                                causality_chains: List[Tuple[int, int, float]],
+                                max_depth: int = 5) -> List[List[int]]:
+        """Build propagation paths from initiators"""
+        # Build adjacency graph
+        graph = {}
+        for res1, res2, weight in causality_chains:
+            if res1 not in graph:
+                graph[res1] = []
+            graph[res1].append((res2, weight))
+        
+        paths = []
+        
+        def dfs(current: int, path: List[int], depth: int):
+            if depth >= max_depth:
+                paths.append(path.copy())
+                return
+            
+            if current in graph:
+                for neighbor, weight in graph[current]:
+                    if neighbor not in path:
+                        path.append(neighbor)
+                        dfs(neighbor, path, depth + 1)
+                        path.pop()
+            else:
+                paths.append(path.copy())
+        
+        # Start from each initiator
+        for initiator in initiators:
+            dfs(initiator, [initiator], 0)
+        
+        # Sort and deduplicate
+        unique_paths = []
+        seen = set()
+        for path in sorted(paths, key=len, reverse=True):
+            path_tuple = tuple(path)
+            if path_tuple not in seen and len(path) > 1:
+                seen.add(path_tuple)
+                unique_paths.append(path)
+        
+        return unique_paths
+    
+    def _identify_intervention_points(self,
+                                    importance_scores: Dict[int, float],
+                                    top_n: int = 10) -> List[int]:
+        """Identify top intervention targets"""
+        sorted_residues = sorted(importance_scores.items(), 
+                               key=lambda x: x[1], reverse=True)
+        return [res_id for res_id, score in sorted_residues[:top_n]]
+    
+    def _compute_global_stats(self,
+                             residue_analyses: Dict[str, ResidueLevelAnalysis]) -> Dict:
+        """Compute global network statistics"""
+        total_causal = sum(a.network_stats['n_causal'] for a in residue_analyses.values())
+        total_sync = sum(a.network_stats['n_sync'] for a in residue_analyses.values())
+        total_async = sum(a.network_stats['n_async'] for a in residue_analyses.values())
+        
+        return {
+            'total_causal_links': total_causal,
+            'total_sync_links': total_sync,
+            'total_async_bonds': total_async,
+            'async_to_causal_ratio': total_async / (total_causal + 1e-10),
+            'mean_adaptive_window': np.mean([
+                a.network_stats['mean_adaptive_window'] 
+                for a in residue_analyses.values()
+            ])
+        }
+    
+    def _print_summary(self,
+                      importance_scores: Dict,
+                      global_stats: Dict,
+                      intervention_points: List[int]):
+        """Print analysis summary"""
+        print("\n🎯 Global Analysis Complete!")
+        print(f"   Key residues identified: {len(importance_scores)}")
+        print(f"   Total causal links: {global_stats['total_causal_links']}")
+        print(f"   Total async strong bonds: {global_stats['total_async_bonds']} "
+              f"({global_stats['async_to_causal_ratio']:.1%})")
+        print(f"   Mean adaptive window: {global_stats['mean_adaptive_window']:.1f} frames")
+        print(f"   Suggested intervention points: {intervention_points[:5]}")
 
 # ===============================
-# Adaptive Window Calculation
+# Residue Structure Computer
+# ===============================
+
+class ResidueStructureComputer:
+    """Compute Lambda³ structures at residue level"""
+    
+    @staticmethod
+    @njit
+    def _compute_residue_com(trajectory: np.ndarray, atom_indices: np.ndarray) -> np.ndarray:
+        """Compute center of mass for a residue"""
+        n_frames = trajectory.shape[0]
+        com = np.zeros((n_frames, 3))
+        
+        for frame in range(n_frames):
+            for atom_idx in atom_indices:
+                com[frame] += trajectory[frame, atom_idx]
+            com[frame] /= len(atom_indices)
+        
+        return com
+    
+    @classmethod
+    def compute(cls,
+                trajectory: np.ndarray,
+                start_frame: int,
+                end_frame: int,
+                residue_atoms: Dict[int, List[int]],
+                window_size: int = 50) -> Dict[str, np.ndarray]:
+        """Compute all residue-level Lambda³ structures"""
+        
+        print(f"\n🔬 Computing residue-level Lambda³ for frames {start_frame}-{end_frame}")
+        
+        n_residues = len(residue_atoms)
+        n_frames = end_frame - start_frame
+        
+        # Initialize arrays
+        residue_lambda_f = np.zeros((n_frames-1, n_residues, 3))
+        residue_lambda_f_mag = np.zeros((n_frames-1, n_residues))
+        residue_rho_t = np.zeros((n_frames, n_residues))
+        residue_coupling = np.zeros((n_frames, n_residues, n_residues))
+        
+        # Compute residue COMs
+        residue_coms = np.zeros((n_frames, n_residues, 3))
+        for res_id, atoms in residue_atoms.items():
+            residue_coms[:, res_id] = cls._compute_residue_com(
+                trajectory[start_frame:end_frame], 
+                np.array(atoms)
+            )
+        
+        # 1. Residue-level ΛF
+        for frame in range(n_frames-1):
+            residue_lambda_f[frame] = residue_coms[frame+1] - residue_coms[frame]
+            residue_lambda_f_mag[frame] = np.linalg.norm(residue_lambda_f[frame], axis=1)
+        
+        # 2. Residue-level ρT
+        for frame in range(n_frames):
+            for res_id in range(n_residues):
+                local_start = max(0, frame - window_size//2)
+                local_end = min(n_frames, frame + window_size//2)
+                
+                local_coms = residue_coms[local_start:local_end, res_id]
+                if len(local_coms) > 1:
+                    cov = np.cov(local_coms.T)
+                    residue_rho_t[frame, res_id] = np.trace(cov)
+        
+        # 3. Residue-residue coupling
+        for frame in range(n_frames):
+            for res_i in range(n_residues):
+                for res_j in range(res_i+1, n_residues):
+                    dist = np.linalg.norm(residue_coms[frame, res_i] - residue_coms[frame, res_j])
+                    residue_coupling[frame, res_i, res_j] = 1.0 / (1.0 + dist)
+                    residue_coupling[frame, res_j, res_i] = residue_coupling[frame, res_i, res_j]
+        
+        return {
+            'residue_lambda_f': residue_lambda_f,
+            'residue_lambda_f_mag': residue_lambda_f_mag,
+            'residue_rho_t': residue_rho_t,
+            'residue_coupling': residue_coupling,
+            'residue_coms': residue_coms
+        }
+
+# ===============================
+# Anomaly Detection
+# ===============================
+
+class ResidueAnomalyDetector:
+    """Detect anomalies at residue level with event-specific filtering"""
+    
+    def __init__(self, config: ResidueAnalysisConfig):
+        self.config = config
+    
+    def detect(self,
+               residue_structures: Dict[str, np.ndarray],
+               sensitivity: float,
+               event_type: str = None) -> Dict[int, np.ndarray]:
+        """
+        Detect anomalies for each residue with event-specific sensitivity
+        and statistical filtering to find TRUE drug targets
+        """
+        
+        n_frames, n_residues = residue_structures['residue_rho_t'].shape
+        
+        # Event-specific sensitivity
+        if event_type and event_type in self.config.event_sensitivities:
+            base_sensitivity = self.config.event_sensitivities[event_type]
+        else:
+            base_sensitivity = sensitivity
+            
+        # Try to import from main module, fall back to simple version
+        try:
+            from lambda3_md_fixed import detect_local_anomalies
+        except ImportError:
+            print("Warning: Using simplified anomaly detection (lambda3_md_fixed not found)")
+            detect_local_anomalies = self._simple_anomaly_detection
+        
+        # First pass: compute all anomaly scores
+        all_lambda_f_mags = residue_structures['residue_lambda_f_mag']
+        
+        # Global statistics using MAD for robustness
+        global_median = np.median(all_lambda_f_mags)
+        mad = np.median(np.abs(all_lambda_f_mags - global_median))
+        robust_std = 1.4826 * mad  # MAD to std conversion
+        
+        print(f"\n🔍 Event-specific detection for {event_type if event_type else 'generic'}")
+        print(f"   Global stats: median={global_median:.4f}, MAD-std={robust_std:.4f}")
+        
+        # Collect significant residues
+        residue_candidates = []
+        
+        for res_id in range(n_residues):
+            # Compute anomalies
+            lambda_f_anomaly = detect_local_anomalies(
+                residue_structures['residue_lambda_f_mag'][:, res_id],
+                window=50
+            )
+            
+            rho_t_anomaly = detect_local_anomalies(
+                residue_structures['residue_rho_t'][:, res_id],
+                window=50
+            )
+            
+            # Combined score
+            min_len = min(len(lambda_f_anomaly), len(rho_t_anomaly))
+            combined = (lambda_f_anomaly[:min_len] + rho_t_anomaly[:min_len]) / 2
+            
+            # Statistical significance using z-score
+            local_max = np.max(residue_structures['residue_lambda_f_mag'][:, res_id])
+            local_mean = np.mean(residue_structures['residue_lambda_f_mag'][:, res_id])
+            
+            if robust_std > 1e-10:
+                z_score_max = (local_max - global_median) / robust_std
+                z_score_mean = (local_mean - global_median) / robust_std
+            else:
+                z_score_max = 0
+                z_score_mean = 0
+            
+            # Adaptive threshold based on activity
+            activity_level = np.sum(combined > 1.0) / len(combined)
+            threshold_multiplier = 1.0 - 0.5 * activity_level
+            significance_threshold = base_sensitivity * threshold_multiplier * 2.0  # 2σ
+            
+            if z_score_max > significance_threshold:
+                residue_candidates.append({
+                    'id': res_id,
+                    'z_score': z_score_max,
+                    'max_anomaly': np.max(combined),
+                    'anomaly_scores': combined
+                })
+        
+        print(f"   Candidates found: {len(residue_candidates)}/{n_residues}")
+        
+        # Filter to top 20% most significant
+        max_residues = max(1, int(n_residues * 0.2))
+        if len(residue_candidates) > max_residues:
+            residue_candidates.sort(key=lambda x: x['z_score'], reverse=True)
+            residue_candidates = residue_candidates[:max_residues]
+            print(f"   → Filtered to top {max_residues} residues (20%)")
+        
+        # Build final anomaly scores
+        residue_anomaly_scores = {
+            candidate['id']: candidate['anomaly_scores']
+            for candidate in residue_candidates
+        }
+        
+        return residue_anomaly_scores
+    
+    @staticmethod
+    @njit
+    def _simple_anomaly_detection(series: np.ndarray, window: int) -> np.ndarray:
+        """Simple anomaly detection fallback"""
+        anomaly = np.zeros_like(series)
+        
+        for i in range(len(series)):
+            start = max(0, i - window)
+            end = min(len(series), i + window + 1)
+            
+            local_mean = np.mean(series[start:end])
+            local_std = np.std(series[start:end])
+            
+            if local_std > 1e-10:
+                anomaly[i] = np.abs(series[i] - local_mean) / local_std
+        
+        return anomaly
+
+# ===============================
+# Network Analysis
+# ===============================
+
+class ResidueNetworkAnalyzer:
+    """Analyze residue interaction networks with spatial constraints"""
+    
+    def __init__(self, config: ResidueAnalysisConfig):
+        self.config = config
+        self.max_interaction_distance = 15.0  # Angstroms
+    
+    def analyze(self,
+                residue_anomaly_scores: Dict[int, np.ndarray],
+                residue_coupling: np.ndarray,
+                residue_coms: np.ndarray = None) -> Dict[str, any]:
+        """
+        Analyze network with adaptive windows and spatial constraints
+        Only considers physically plausible interactions
+        """
+        
+        residue_ids = sorted(residue_anomaly_scores.keys())
+        n_residues = len(residue_ids)
+        
+        # Compute adaptive windows
+        adaptive_windows = self._compute_adaptive_windows(residue_anomaly_scores)
+        
+        print(f"\n🎯 Adaptive Windows for top residues:")
+        for res_id, window in list(adaptive_windows.items())[:5]:
+            print(f"   Residue {res_id+1}: {window} frames")
+        
+        # Compute spatial constraints if COMs provided
+        spatial_pairs = None
+        if residue_coms is not None:
+            spatial_pairs = self._compute_spatial_constraints(residue_ids, residue_coms)
+            print(f"\n🔗 Spatial constraint analysis:")
+            print(f"   Total possible pairs: {n_residues * (n_residues-1) // 2}")
+            print(f"   Spatially valid pairs (<{self.max_interaction_distance}Å): {len(spatial_pairs)}")
+        else:
+            # If no spatial info, analyze all pairs but warn
+            print(f"\n⚠️  Warning: No spatial constraints applied (residue COMs not provided)")
+            spatial_pairs = []
+            for i, res_i in enumerate(residue_ids):
+                for j, res_j in enumerate(residue_ids[i+1:], i+1):
+                    spatial_pairs.append({
+                        'pair': (res_i, res_j),
+                        'distance': 0,  # Unknown
+                        'weight': 1.0
+                    })
+        
+        # Analyze spatially valid pairs only
+        causal_candidates = []
+        sync_network = []
+        
+        for pair_info in spatial_pairs:
+            res_i, res_j = pair_info['pair']
+            
+            result = self._analyze_pair(
+                res_i, res_j,
+                residue_anomaly_scores[res_i],
+                residue_anomaly_scores[res_j],
+                residue_coupling,
+                adaptive_windows,
+                pair_info['weight'],
+                pair_info['distance']
+            )
+            
+            if result['has_causality']:
+                result['causal_link']['distance'] = pair_info['distance']
+                causal_candidates.append(result['causal_link'])
+            
+            if result['has_sync']:
+                sync_network.append(result['sync_link'])
+        
+        # Filter and build final networks
+        causal_network, async_bonds = self._filter_causal_network(causal_candidates)
+        
+        return {
+            'causal_network': causal_network,
+            'sync_network': sync_network,
+            'async_strong_bonds': async_bonds,
+            'n_causal_links': len(causal_network),
+            'n_sync_links': len(sync_network),
+            'n_async_bonds': len(async_bonds),
+            'adaptive_windows': adaptive_windows,
+            'n_spatial_pairs': len(spatial_pairs) if spatial_pairs else 0
+        }
+    
+    def _compute_spatial_constraints(self, 
+                                   residue_ids: List[int],
+                                   residue_coms: np.ndarray) -> List[Dict]:
+        """Compute spatially valid residue pairs based on distance"""
+        from scipy.spatial.distance import cdist
+        
+        # Sample frames for distance calculation
+        n_frames = residue_coms.shape[0]
+        sample_frames = [0, n_frames//4, n_frames//2, 3*n_frames//4, n_frames-1]
+        sample_frames = [f for f in sample_frames if f < n_frames]
+        
+        # Compute average distances
+        n_all_residues = residue_coms.shape[1]
+        avg_distances = np.zeros((n_all_residues, n_all_residues))
+        
+        for frame_idx in sample_frames:
+            distances = cdist(residue_coms[frame_idx], residue_coms[frame_idx])
+            avg_distances += distances / len(sample_frames)
+        
+        # Find spatially valid pairs
+        spatial_pairs = []
+        
+        for i, res_i in enumerate(residue_ids):
+            for j, res_j in enumerate(residue_ids[i+1:], i+1):
+                if res_i < n_all_residues and res_j < n_all_residues:
+                    avg_dist = avg_distances[res_i, res_j]
+                    
+                    # Distance-based weight
+                    if avg_dist < 5.0:  # Direct contact
+                        weight = 1.0
+                    elif avg_dist < 10.0:  # Near
+                        weight = 0.8
+                    elif avg_dist < self.max_interaction_distance:  # Medium
+                        weight = 0.5
+                    else:  # Too far - skip
+                        continue
+                    
+                    spatial_pairs.append({
+                        'pair': (res_i, res_j),
+                        'distance': avg_dist,
+                        'weight': weight
+                    })
+        
+        return spatial_pairs
+    
+    def _analyze_pair(self,
+                     res_i: int,
+                     res_j: int,
+                     scores_i: np.ndarray,
+                     scores_j: np.ndarray,
+                     residue_coupling: np.ndarray,
+                     adaptive_windows: Dict[int, int],
+                     spatial_weight: float = 1.0,
+                     distance: float = 0) -> Dict:
+        """Analyze a single residue pair with spatial weighting"""
+        
+        # Optimal window for this pair
+        pair_window = int((adaptive_windows[res_i] + adaptive_windows[res_j]) / 2)
+        
+        # Causality analysis
+        causality_ij, max_caus_ij, lag_ij = calculate_structural_causality(
+            scores_i, scores_j, pair_window
+        )
+        causality_ji, max_caus_ji, lag_ji = calculate_structural_causality(
+            scores_j, scores_i, pair_window
+        )
+        
+        # Apply spatial weight
+        max_caus_ij *= spatial_weight
+        max_caus_ji *= spatial_weight
+        
+        # Synchrony analysis
+        if len(scores_i) > 10 and len(scores_j) > 10:
+            sync_rate = np.corrcoef(scores_i, scores_j)[0, 1]
+        else:
+            sync_rate = 0.0
+        
+        # Spatial coupling
+        avg_coupling = np.mean(residue_coupling[:, res_i, res_j])
+        
+        # Dynamic thresholds (adjusted by spatial weight)
+        activity_i = np.mean(scores_i > 1.0)
+        activity_j = np.mean(scores_j > 1.0)
+        dynamic_causality_threshold = self.config.correlation_threshold * (
+            1 - 0.3 * min(activity_i, activity_j)
+        ) / spatial_weight  # Lower threshold for closer residues
+        
+        # Determine relationships
+        max_causality = max(max_caus_ij, max_caus_ji)
+        has_causality = (max_causality > dynamic_causality_threshold and 
+                        max_causality > self.config.min_causality_strength)
+        has_sync = abs(sync_rate) > self.config.sync_threshold
+        
+        # Build result
+        result = {
+            'has_causality': has_causality,
+            'has_sync': has_sync,
+            'causal_link': None,
+            'sync_link': None
+        }
+        
+        if has_causality:
+            if max_caus_ij > max_caus_ji:
+                from_res, to_res, strength, lag = res_i, res_j, max_caus_ij/spatial_weight, lag_ij
+            else:
+                from_res, to_res, strength, lag = res_j, res_i, max_caus_ji/spatial_weight, lag_ji
+            
+            result['causal_link'] = {
+                'from': from_res,
+                'to': to_res,
+                'strength': strength,  # Raw strength without spatial weight
+                'weighted_strength': max_causality,  # With spatial weight
+                'lag': lag,
+                'sync_rate': sync_rate,
+                'coupling': avg_coupling,
+                'window_used': pair_window,
+                'spatial_weight': spatial_weight,
+                'distance': distance
+            }
+        
+        if has_sync:
+            result['sync_link'] = {
+                'residue_pair': (res_i, res_j),
+                'sync_strength': abs(sync_rate),
+                'type': 'synchronous',
+                'distance': distance
+            }
+        
+        return result
+    
+    def _filter_causal_network(self,
+                              candidates: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+        """Filter causal network and identify async bonds"""
+        
+        # Sort by strength
+        candidates.sort(key=lambda x: x['strength'], reverse=True)
+        
+        # Limit to top N
+        if len(candidates) > self.config.max_causal_links:
+            print(f"\n📊 Filtering causality network:")
+            print(f"   Total candidates: {len(candidates)}")
+            print(f"   Keeping top {self.config.max_causal_links} links")
+            
+            # Show distribution
+            if len(candidates) > 100:
+                print(f"\n📈 Causality strength distribution:")
+                print(f"   Top 10%: > {candidates[int(len(candidates)*0.1)]['strength']:.3f}")
+                print(f"   Top 25%: > {candidates[int(len(candidates)*0.25)]['strength']:.3f}")
+                print(f"   Median:    {candidates[len(candidates)//2]['strength']:.3f}")
+            
+            candidates = candidates[:self.config.max_causal_links]
+        
+        # Build final network and identify async bonds
+        causal_network = []
+        async_bonds = []
+        
+        for candidate in candidates:
+            # Causal link
+            causal_network.append({
+                'from': candidate['from'],
+                'to': candidate['to'],
+                'strength': candidate['strength'],
+                'lag': candidate['lag'],
+                'type': 'causal',
+                'window_used': candidate['window_used']
+            })
+            
+            # Check if async
+            if abs(candidate['sync_rate']) <= self.config.sync_threshold:
+                async_bonds.append({
+                    'residue_pair': (candidate['from'], candidate['to']),
+                    'causality': candidate['strength'],
+                    'sync_rate': candidate['sync_rate'],
+                    'optimal_lag': candidate['lag'],
+                    'coupling': candidate['coupling'],
+                    'window': candidate['window_used']
+                })
+        
+        return causal_network, async_bonds
+
+# ===============================
+# Confidence Analysis
+# ===============================
+
+class ConfidenceAnalyzer:
+    """Bootstrap confidence analysis for causal relationships"""
+    
+    def __init__(self, config: ResidueAnalysisConfig):
+        self.config = config
+    
+    def analyze(self,
+                top_pairs: List[Tuple[int, int, float]],
+                anomaly_scores: Dict[int, np.ndarray]) -> List[ConfidenceResult]:
+        """Perform bootstrap confidence analysis"""
+        
+        print("\n🎲 Computing Bootstrap Confidence Intervals...")
+        print(f"   Bootstrap iterations: {self.config.n_bootstrap}")
+        print(f"   Confidence level: {self.config.confidence_level*100:.0f}%")
+        
+        results = []
+        
+        for res_i, res_j, strength in top_pairs:
+            if res_i in anomaly_scores and res_j in anomaly_scores:
+                scores_i = anomaly_scores[res_i]
+                scores_j = anomaly_scores[res_j]
+                
+                # Bootstrap
+                mean_corr, ci_lower, ci_upper = bootstrap_correlation_confidence(
+                    scores_i, scores_j,
+                    self.config.n_bootstrap,
+                    self.config.confidence_level
+                )
+                
+                # Evaluate
+                is_significant = (ci_lower > 0 and ci_upper > 0) or (ci_lower < 0 and ci_upper < 0)
+                ci_width = ci_upper - ci_lower
+                confidence_score = 1.0 - ci_width
+                
+                results.append(ConfidenceResult(
+                    pair=(res_i, res_j),
+                    strength=strength,
+                    mean=mean_corr,
+                    ci_lower=ci_lower,
+                    ci_upper=ci_upper,
+                    ci_width=ci_width,
+                    confidence_score=confidence_score,
+                    significant=is_significant
+                ))
+        
+        # Display summary
+        self._print_summary(results)
+        
+        return results
+    
+    def _print_summary(self, results: List[ConfidenceResult]):
+        """Print confidence analysis summary"""
+        print(f"\n   [Bootstrap Confidence Summary]")
+        print(f"   {'Pair':<12} {'Strength':>8} {'Mean':>8} {'CI_Low':>8} {'CI_High':>8} {'Signif':>8}")
+        print("   " + "-" * 60)
+        
+        significant_count = 0
+        for conf in results[:5]:
+            res_i, res_j = conf.pair
+            signif = "YES" if conf.significant else "NO"
+            if conf.significant:
+                significant_count += 1
+            
+            print(f"   R{res_i+1:<3}-R{res_j+1:<3}     "
+                  f"{conf.strength:>8.3f} {conf.mean:>8.3f} "
+                  f"{conf.ci_lower:>8.3f} {conf.ci_upper:>8.3f} {signif:>8}")
+        
+        print(f"\n   Total significant pairs: {significant_count}/{len(results)}")
+
+# ===============================
+# Core Computational Functions
 # ===============================
 
 @njit
-def compute_residue_adaptive_window(
-    anomaly_scores: np.ndarray,
-    min_window: int = 30,
-    max_window: int = 300,
-    base_window: int = 50
-) -> int:
-    """
-    各residueの活性パターンに基づいてウィンドウサイズを決定
-    """
+def compute_residue_adaptive_window(anomaly_scores: np.ndarray,
+                                  min_window: int = 30,
+                                  max_window: int = 300,
+                                  base_window: int = 50) -> int:
+    """Compute adaptive window size for a residue"""
     if len(anomaly_scores) == 0:
         return base_window
-        
-    # 異常スコアの統計量
+    
+    # Statistics
     n_events = np.sum(anomaly_scores > 1.0)
     event_density = n_events / len(anomaly_scores)
     score_volatility = np.std(anomaly_scores) / (np.mean(anomaly_scores) + 1e-10)
     
-    # スケールファクター計算
+    # Scale factor
     scale_factor = 1.0
     
-    # イベント密度による調整
-    if event_density > 0.1:  # 頻繁にイベントが起きる
+    if event_density > 0.1:
         scale_factor *= 0.7
-    elif event_density < 0.02:  # まれにしか起きない
+    elif event_density < 0.02:
         scale_factor *= 2.0
     
-    # 変動性による調整
-    if score_volatility > 2.0:  # 激しく変動
+    if score_volatility > 2.0:
         scale_factor *= 0.8
-    elif score_volatility < 0.5:  # 安定
+    elif score_volatility < 0.5:
         scale_factor *= 1.3
     
-    # 最終的なウィンドウサイズ
     adaptive_window = int(base_window * scale_factor)
     return max(min_window, min(max_window, adaptive_window))
 
-# ===============================
-# Residue-Level Lambda³ Computation
-# ===============================
-
 @njit
-def compute_residue_com(trajectory: np.ndarray, atom_indices: np.ndarray) -> np.ndarray:
-    """Compute center of mass for a residue across trajectory."""
-    n_frames = trajectory.shape[0]
-    com = np.zeros((n_frames, 3))
+def calculate_structural_causality(anomaly_i: np.ndarray,
+                                 anomaly_j: np.ndarray,
+                                 lag_window: int = 200,
+                                 event_threshold: float = 1.0) -> Tuple[np.ndarray, float, int]:
+    """Calculate structural causality between residues"""
+    n_lags = lag_window
+    causality_profile = np.zeros(n_lags)
     
-    for frame in range(n_frames):
-        for atom_idx in atom_indices:
-            com[frame] += trajectory[frame, atom_idx]
-        com[frame] /= len(atom_indices)
+    # Event detection
+    events_i = (anomaly_i > event_threshold).astype(np.float64)
+    events_j = (anomaly_j > event_threshold).astype(np.float64)
     
-    return com
-
-def compute_residue_lambda_structures(
-    trajectory: np.ndarray,
-    start_frame: int,
-    end_frame: int,
-    residue_atoms: Dict[int, List[int]],
-    window_size: int = 50
-) -> Dict[str, np.ndarray]:
-    """
-    Compute Lambda³ structures at residue level for a specific time window.
-    """
-    print(f"\n🔬 Computing residue-level Lambda³ for frames {start_frame}-{end_frame}")
-    
-    n_residues = len(residue_atoms)
-    n_frames = end_frame - start_frame
-    
-    # Initialize arrays
-    residue_lambda_f = np.zeros((n_frames-1, n_residues, 3))
-    residue_lambda_f_mag = np.zeros((n_frames-1, n_residues))
-    residue_rho_t = np.zeros((n_frames, n_residues))
-    residue_coupling = np.zeros((n_frames, n_residues, n_residues))
-    
-    # Compute residue COMs
-    residue_coms = np.zeros((n_frames, n_residues, 3))
-    for res_id, atoms in residue_atoms.items():
-        residue_coms[:, res_id] = compute_residue_com(
-            trajectory[start_frame:end_frame], 
-            np.array(atoms)
-        )
-    
-    # 1. Residue-level ΛF
-    for frame in range(n_frames-1):
-        residue_lambda_f[frame] = residue_coms[frame+1] - residue_coms[frame]
-        residue_lambda_f_mag[frame] = np.linalg.norm(residue_lambda_f[frame], axis=1)
-    
-    # 2. Residue-level ρT (local tension)
-    for frame in range(n_frames):
-        for res_id in range(n_residues):
-            # Local window
-            local_start = max(0, frame - window_size//2)
-            local_end = min(n_frames, frame + window_size//2)
+    for lag in range(1, n_lags):
+        if lag < len(events_i):
+            cause = events_i[:-lag]
+            effect = events_j[lag:]
             
-            # Local COM variance
-            local_coms = residue_coms[local_start:local_end, res_id]
-            if len(local_coms) > 1:
-                cov = np.cov(local_coms.T)
-                residue_rho_t[frame, res_id] = np.trace(cov)
+            # Conditional probability P(effect|cause)
+            cause_mask = cause > 0
+            if np.sum(cause_mask) > 0:
+                causality_profile[lag] = np.mean(effect[cause_mask])
     
-    # 3. Residue-residue coupling (simplified)
-    for frame in range(n_frames):
-        for res_i in range(n_residues):
-            for res_j in range(res_i+1, n_residues):
-                # Distance-based coupling
-                dist = np.linalg.norm(residue_coms[frame, res_i] - residue_coms[frame, res_j])
-                residue_coupling[frame, res_i, res_j] = 1.0 / (1.0 + dist)
-                residue_coupling[frame, res_j, res_i] = residue_coupling[frame, res_i, res_j]
+    # Find maximum
+    max_causality = np.max(causality_profile)
+    optimal_lag = np.argmax(causality_profile)
     
-    return {
-        'residue_lambda_f': residue_lambda_f,
-        'residue_lambda_f_mag': residue_lambda_f_mag,
-        'residue_rho_t': residue_rho_t,
-        'residue_coupling': residue_coupling,
-        'residue_coms': residue_coms
-    }
-
-# ===============================
-# Enhanced Anomaly Detection
-# ===============================
-
-def detect_residue_anomalies(
-    residue_structures: Dict[str, np.ndarray],
-    sensitivity: float = 1.0  # より低い閾値
-) -> Dict[int, np.ndarray]:
-    """
-    Detect anomalies for each residue with adaptive sensitivity.
-    """
-    n_frames, n_residues = residue_structures['residue_rho_t'].shape
-    residue_anomaly_scores = {}
-    
-    for res_id in range(n_residues):
-        # ΛF magnitude anomalies (already n_frames-1)
-        lambda_f_anomaly = detect_local_anomalies(
-            residue_structures['residue_lambda_f_mag'][:, res_id],
-            window=50
-        )
-        
-        # ρT anomalies (n_frames)
-        rho_t_anomaly = detect_local_anomalies(
-            residue_structures['residue_rho_t'][:, res_id],
-            window=50
-        )
-        
-        # Combined score - align sizes correctly
-        min_len = min(len(lambda_f_anomaly), len(rho_t_anomaly))
-        combined = (lambda_f_anomaly[:min_len] + rho_t_anomaly[:min_len]) / 2
-        
-        # Adaptive sensitivity based on residue activity
-        residue_activity = np.mean(combined)
-        adaptive_sensitivity = sensitivity * (1 + 0.5 * residue_activity)
-        
-        # Find significant anomalies
-        if np.max(combined) > adaptive_sensitivity:
-            residue_anomaly_scores[res_id] = combined
-    
-    return residue_anomaly_scores
-
-# ===============================
-# Bootstrap Confidence Estimation
-# ===============================
+    return causality_profile, max_causality, optimal_lag
 
 @njit
-def bootstrap_correlation_confidence(
-    series_i: np.ndarray,
-    series_j: np.ndarray,
-    n_bootstrap: int = 100,
-    confidence_level: float = 0.95
-) -> Tuple[float, float, float]:
-    """
-    ブートストラップ法で相関の信頼区間を計算（軽量版）
-    """
+def bootstrap_correlation_confidence(series_i: np.ndarray,
+                                   series_j: np.ndarray,
+                                   n_bootstrap: int = 100,
+                                   confidence_level: float = 0.95) -> Tuple[float, float, float]:
+    """Compute bootstrap confidence intervals for correlation"""
     n = len(series_i)
-    if n < 10:  # Too few samples
+    if n < 10:
         return 0.0, 0.0, 0.0
-        
-    correlations = np.empty(n_bootstrap)
     
-    # Set seed for reproducibility
+    correlations = np.empty(n_bootstrap)
     np.random.seed(42)
     
     for b in range(n_bootstrap):
-        # リサンプリング
+        # Resample
         indices = np.random.randint(0, n, size=n)
         resampled_i = series_i[indices]
         resampled_j = series_j[indices]
         
-        # 相関計算
+        # Correlation
         mean_i = np.mean(resampled_i)
         mean_j = np.mean(resampled_j)
         std_i = np.std(resampled_i)
         std_j = np.std(resampled_j)
         
         if std_i > 1e-10 and std_j > 1e-10:
-            # Manual correlation calculation for numba
             cov = np.mean((resampled_i - mean_i) * (resampled_j - mean_j))
             correlations[b] = cov / (std_i * std_j)
         else:
             correlations[b] = 0.0
     
-    # 信頼区間
+    # Confidence interval
     alpha = 1 - confidence_level
     lower_idx = int((alpha/2) * n_bootstrap)
     upper_idx = int((1-alpha/2) * n_bootstrap)
@@ -318,516 +1045,95 @@ def bootstrap_correlation_confidence(
     return mean_corr, lower, upper
 
 # ===============================
-# Advanced Causality Detection
+# Demo Function
 # ===============================
 
-@njit
-def calculate_structural_causality(
-    anomaly_i: np.ndarray,
-    anomaly_j: np.ndarray,
-    lag_window: int = 200,
-    event_threshold: float = 1.0
-) -> Tuple[np.ndarray, float, int]:
+def demo_two_stage_analysis():
     """
-    構造的因果関係の計算（同期に依存しない）
-    Lambda³理論：ΔΛCの伝播パターン
+    Demo two-stage analysis on 100k lysozyme trajectory.
+    Enhanced version with adaptive windows, async bonds, and bootstrap confidence.
     """
-    n_lags = lag_window
-    causality_profile = np.zeros(n_lags)
+    print("🔬 Lambda³ Two-Stage Analysis Demo v3.0 (Refactored)")
+    print("Stage 1: Macro events (✓ Complete)")
+    print("Stage 2: Residue-level causality with confidence analysis (Starting...)")
     
-    # イベント検出
-    events_i = (anomaly_i > event_threshold).astype(np.float64)
-    events_j = (anomaly_j > event_threshold).astype(np.float64)
-    
-    for lag in range(1, n_lags):
-        if lag < len(events_i):
-            # 構造変化の伝播確率
-            cause = events_i[:-lag]
-            effect = events_j[lag:]
-            
-            # 条件付き確率 P(effect|cause)
-            cause_mask = cause > 0
-            if np.sum(cause_mask) > 0:
-                causality_profile[lag] = np.mean(effect[cause_mask])
-    
-    # 最大因果強度とその遅延
-    max_causality = np.max(causality_profile)
-    optimal_lag = np.argmax(causality_profile)
-    
-    return causality_profile, max_causality, optimal_lag
-
-def detect_residue_network_enhanced(
-    residue_anomaly_scores: Dict[int, np.ndarray],
-    residue_coupling: np.ndarray,
-    base_lag_window: int = 100,
-    causality_threshold: float = 0.15,
-    sync_threshold: float = 0.2,
-    max_causal_links: int = 500,  # 追加: 最大リンク数制限
-    min_causality_strength: float = 0.2  # 追加: 最小因果強度
-) -> Dict[str, any]:
-    """
-    拡張版：同期と因果を分離したネットワーク検出
-    メモリ爆発を防ぐための制限付き
-    """
-    residue_ids = sorted(residue_anomaly_scores.keys())
-    n_residues = len(residue_ids)
-    
-    # 結果格納
-    causal_network = []
-    sync_network = []
-    async_strong_bonds = []  # 同期なき強い結びつき！
-    
-    # 追加: 候補リストで事前フィルタリング
-    causal_candidates = []
-    
-    # 各residueのアダプティブウィンドウを計算
-    adaptive_windows = {}
-    for res_id, scores in residue_anomaly_scores.items():
-        adaptive_windows[res_id] = compute_residue_adaptive_window(scores)
-    
-    print(f"\n🎯 Adaptive Windows for top residues:")
-    for res_id, window in list(adaptive_windows.items())[:5]:
-        print(f"   Residue {res_id+1}: {window} frames")
-    
-    # 追加: ペア数が多すぎる場合の警告
-    total_pairs = n_residues * (n_residues - 1) // 2
-    if total_pairs > 1000:
-        print(f"\n⚠️  Warning: {total_pairs} residue pairs to analyze!")
-        print(f"   Applying stricter filtering to prevent memory explosion...")
-    
-    for i, res_i in enumerate(residue_ids):
-        for j, res_j in enumerate(residue_ids[i+1:], i+1):
-            scores_i = residue_anomaly_scores[res_i]
-            scores_j = residue_anomaly_scores[res_j]
-            
-            # ペアに最適なウィンドウサイズを決定
-            pair_window = int((adaptive_windows[res_i] + adaptive_windows[res_j]) / 2)
-            
-            # 1. 構造的因果関係（時間遅れOK）
-            causality_ij, max_caus_ij, lag_ij = calculate_structural_causality(
-                scores_i, scores_j, pair_window
-            )
-            causality_ji, max_caus_ji, lag_ji = calculate_structural_causality(
-                scores_j, scores_i, pair_window
-            )
-            
-            # 2. 即時同期率（lag=0での相関）
-            if len(scores_i) > 10 and len(scores_j) > 10:
-                sync_rate = np.corrcoef(scores_i, scores_j)[0, 1]
-            else:
-                sync_rate = 0.0
-            
-            # 3. 空間的結合（距離ベース）
-            avg_coupling = np.mean(residue_coupling[:, res_i, res_j])
-            
-            # 動的閾値（residueの活性度に応じて調整）
-            activity_i = np.mean(scores_i > 1.0)
-            activity_j = np.mean(scores_j > 1.0)
-            dynamic_causality_threshold = causality_threshold * (1 - 0.3 * min(activity_i, activity_j))
-            
-            # ネットワーク分類
-            max_causality = max(max_caus_ij, max_caus_ji)
-            has_causality = max_causality > dynamic_causality_threshold
-            has_sync = abs(sync_rate) > sync_threshold
-            
-            # 追加: 強度フィルタリング
-            if has_causality and max_causality > min_causality_strength:
-                # 候補として保存
-                if max_caus_ij > max_caus_ji:
-                    causal_candidates.append({
-                        'from': res_i,
-                        'to': res_j,
-                        'strength': max_caus_ij,
-                        'lag': lag_ij,
-                        'type': 'causal',
-                        'window_used': pair_window,
-                        'sync_rate': sync_rate,
-                        'coupling': avg_coupling
-                    })
-                else:
-                    causal_candidates.append({
-                        'from': res_j,
-                        'to': res_i,
-                        'strength': max_caus_ji,
-                        'lag': lag_ji,
-                        'type': 'causal',
-                        'window_used': pair_window,
-                        'sync_rate': sync_rate,
-                        'coupling': avg_coupling
-                    })
-            
-            if has_sync:
-                # 同期ネットワークに追加（こちらは制限なし）
-                sync_network.append({
-                    'residue_pair': (res_i, res_j),
-                    'sync_strength': abs(sync_rate),
-                    'type': 'synchronous'
-                })
-    
-    # 因果候補を強度でソート
-    causal_candidates.sort(key=lambda x: x['strength'], reverse=True)
-    
-    # 上位N個のみを採用
-    if len(causal_candidates) > max_causal_links:
-        print(f"\n📊 Filtering causality network:")
-        print(f"   Total candidates: {len(causal_candidates)}")
-        print(f"   Keeping top {max_causal_links} links")
-        causal_candidates = causal_candidates[:max_causal_links]
-    
-    # 最終的なネットワークを構築
-    for candidate in causal_candidates:
-        causal_network.append({
-            'from': candidate['from'],
-            'to': candidate['to'],
-            'strength': candidate['strength'],
-            'lag': candidate['lag'],
-            'type': candidate['type'],
-            'window_used': candidate['window_used']
-        })
+    # Load trajectory
+    try:
+        trajectory = np.load('lysozyme_100k_final_challenge.npy')
+        print(f"\n✓ Loaded trajectory: {trajectory.shape}")
         
-        # 同期なき強い結びつきの検出
-        if abs(candidate['sync_rate']) <= sync_threshold:
-            async_strong_bonds.append({
-                'residue_pair': (candidate['from'], candidate['to']),
-                'causality': candidate['strength'],
-                'sync_rate': candidate['sync_rate'],
-                'optimal_lag': candidate['lag'],
-                'coupling': candidate['coupling'],
-                'window': candidate['window_used']
-            })
-    
-    # 統計情報の出力
-    if len(causal_candidates) > 100:
-        print(f"\n📈 Causality strength distribution:")
-        print(f"   Top 10%: > {causal_candidates[int(len(causal_candidates)*0.1)]['strength']:.3f}")
-        print(f"   Top 25%: > {causal_candidates[int(len(causal_candidates)*0.25)]['strength']:.3f}")
-        print(f"   Median:    {causal_candidates[len(causal_candidates)//2]['strength']:.3f}")
-    
-    return {
-        'causal_network': causal_network,
-        'sync_network': sync_network,
-        'async_strong_bonds': async_strong_bonds,
-        'n_causal_links': len(causal_network),
-        'n_sync_links': len(sync_network),
-        'n_async_bonds': len(async_strong_bonds),
-        'adaptive_windows': adaptive_windows
-    }
-
-# ===============================
-# Event Analysis Functions
-# ===============================
-
-def analyze_macro_event(
-    trajectory: np.ndarray,
-    event_name: str,
-    start_frame: int,
-    end_frame: int,
-    residue_atoms: Dict[int, List[int]],
-    residue_names: Dict[int, str],
-    sensitivity: float = 1.0,  # 下げた
-    correlation_threshold: float = 0.15,  # 下げた
-    use_confidence: bool = True,  # 新規追加！
-    n_bootstrap: int = 50,  # 軽量化のため少なめ
-    confidence_level: float = 0.95
-) -> ResidueLevelAnalysis:
-    """
-    Perform detailed residue-level analysis for a single macro event.
-    Enhanced with adaptive windows and async bond detection.
-    """
-    print(f"\n🎯 Analyzing {event_name} at residue level...")
-    
-    # Compute residue-level Lambda structures
-    residue_structures = compute_residue_lambda_structures(
-        trajectory, start_frame, end_frame, residue_atoms
-    )
-    
-    # Detect anomalies per residue
-    residue_anomaly_scores = detect_residue_anomalies(residue_structures, sensitivity)
-    
-    # Enhanced network detection with adaptive windows
-    print("\n🔬 Enhanced Network Detection with Adaptive Windows...")
-    network_results = detect_residue_network_enhanced(
-        residue_anomaly_scores,
-        residue_structures['residue_coupling'],
-        base_lag_window=100,
-        causality_threshold=correlation_threshold,
-        sync_threshold=0.2
-    )
-    
-    print(f"   Found {network_results['n_causal_links']} causal links")
-    print(f"   Found {network_results['n_sync_links']} synchronous links")
-    print(f"   Found {network_results['n_async_bonds']} async strong bonds! ✨")
-    
-    # Show async strong bonds
-    if network_results['async_strong_bonds']:
-        print("\n   🔥 Top Async Strong Bonds:")
-        for bond in network_results['async_strong_bonds'][:3]:
-            print(f"      R{bond['residue_pair'][0]+1} ⟷ R{bond['residue_pair'][1]+1}: "
-                  f"causality={bond['causality']:.3f}, sync={bond['sync_rate']:.3f}, "
-                  f"lag={bond['optimal_lag']} frames, window={bond['window']}")
-    
-    # Find initiator residues (earliest anomalies)
-    initiators = []
-    residue_events = []
-    
-    for res_id, scores in residue_anomaly_scores.items():
-        # Find first significant peak
-        peaks, properties = find_peaks(scores, height=sensitivity, distance=50)
+        # Key events for analysis
+        key_events = [
+            (40000, 45000, 'domain_shift'),
+            (50000, 53000, 'rapid_partial_unfold'),
+            (85000, 95000, 'aggregation_onset')
+        ]
         
-        if len(peaks) > 0:
-            first_peak = peaks[0]
-            peak_height = properties['peak_heights'][0]
-            
-            event = ResidueEvent(
-                residue_id=res_id,
-                residue_name=residue_names.get(res_id, f"RES{res_id}"),
-                start_frame=start_frame + first_peak,
-                end_frame=start_frame + min(first_peak + 100, len(scores)),
-                peak_lambda_f=float(peak_height),
-                propagation_delay=first_peak,
-                role='initiator' if first_peak < 50 else 'propagator',
-                adaptive_window=network_results['adaptive_windows'].get(res_id, 100)
-            )
-            residue_events.append(event)
-            
-            if first_peak < 50:  # Early responders
-                initiators.append(res_id)
-    
-    # Convert network results to causality chains
-    causality_chains = [
-        (link['from'], link['to'], link['strength'])
-        for link in network_results['causal_network']
-    ]
-    
-    # Build propagation paths
-    propagation_paths = build_propagation_paths(initiators, causality_chains)
-    
-    print(f"   Found {len(initiators)} initiator residues")
-    print(f"   Detected {len(causality_chains)} causal relationships")
-    
-    # Confidence estimation for top causal relationships
-    confidence_results = []
-    if use_confidence and len(causality_chains) > 0:
-        print("\n🎲 Computing Bootstrap Confidence Intervals...")
-        print(f"   Bootstrap iterations: {n_bootstrap}")
-        print(f"   Confidence level: {confidence_level*100:.0f}%")
+        # Placeholder for macro_result
+        macro_result = None
         
-        # Analyze top causal relationships
-        top_pairs = causality_chains[:min(10, len(causality_chains))]  # Top 10
-        
-        for res_i, res_j, strength in top_pairs:
-            if res_i in residue_anomaly_scores and res_j in residue_anomaly_scores:
-                scores_i = residue_anomaly_scores[res_i]
-                scores_j = residue_anomaly_scores[res_j]
-                
-                # Bootstrap confidence intervals
-                mean_corr, ci_lower, ci_upper = bootstrap_correlation_confidence(
-                    scores_i, scores_j, n_bootstrap, confidence_level
-                )
-                
-                # Check significance
-                is_significant = (ci_lower > 0 and ci_upper > 0) or (ci_lower < 0 and ci_upper < 0)
-                ci_width = ci_upper - ci_lower
-                confidence_score = 1.0 - ci_width  # Narrower CI = higher confidence
-                
-                confidence_results.append({
-                    'pair': (res_i, res_j),
-                    'strength': strength,
-                    'mean': mean_corr,
-                    'ci_lower': ci_lower,
-                    'ci_upper': ci_upper,
-                    'ci_width': ci_width,
-                    'confidence_score': confidence_score,
-                    'significant': is_significant
-                })
-        
-        # Display confidence summary
-        print(f"\n   [Bootstrap Confidence Summary]")
-        print(f"   {'Pair':<12} {'Strength':>8} {'Mean':>8} {'CI_Low':>8} {'CI_High':>8} {'Signif':>8}")
-        print("   " + "-" * 60)
-        
-        significant_count = 0
-        for conf in confidence_results[:5]:  # Show top 5
-            res_i, res_j = conf['pair']
-            signif = "YES" if conf['significant'] else "NO"
-            if conf['significant']:
-                significant_count += 1
-            
-            print(f"   R{res_i+1:<3}-R{res_j+1:<3}     "
-                  f"{conf['strength']:>8.3f} {conf['mean']:>8.3f} "
-                  f"{conf['ci_lower']:>8.3f} {conf['ci_upper']:>8.3f} {signif:>8}")
-        
-        print(f"\n   Total significant pairs: {significant_count}/{len(confidence_results)}")
-    
-    return ResidueLevelAnalysis(
-        event_name=event_name,
-        macro_start=start_frame,
-        macro_end=end_frame,
-        residue_events=residue_events,
-        causality_chain=causality_chains,
-        initiator_residues=initiators,
-        key_propagation_paths=propagation_paths[:5],  # Top 5 paths
-        async_strong_bonds=network_results['async_strong_bonds'],
-        sync_network=network_results['sync_network'],
-        network_stats={
-            'n_causal': network_results['n_causal_links'],
-            'n_sync': network_results['n_sync_links'],
-            'n_async': network_results['n_async_bonds'],
-            'mean_adaptive_window': np.mean(list(network_results['adaptive_windows'].values()))
-        },
-        confidence_results=confidence_results
-    )
-
-def build_propagation_paths(
-    initiators: List[int],
-    causality_chains: List[Tuple[int, int, float]],
-    max_depth: int = 5
-) -> List[List[int]]:
-    """
-    Build propagation paths from initiator residues.
-    """
-    # Build adjacency graph
-    graph = {}
-    for res1, res2, weight in causality_chains:
-        if res1 not in graph:
-            graph[res1] = []
-        graph[res1].append((res2, weight))
-    
-    paths = []
-    
-    def dfs(current: int, path: List[int], depth: int):
-        if depth >= max_depth:
-            paths.append(path.copy())
-            return
-        
-        if current in graph:
-            for neighbor, weight in graph[current]:
-                if neighbor not in path:  # Avoid cycles
-                    path.append(neighbor)
-                    dfs(neighbor, path, depth + 1)
-                    path.pop()
-        else:
-            paths.append(path.copy())
-    
-    # Start from each initiator
-    for initiator in initiators:
-        dfs(initiator, [initiator], 0)
-    
-    # Sort by path length and uniqueness
-    unique_paths = []
-    seen = set()
-    for path in sorted(paths, key=len, reverse=True):
-        path_tuple = tuple(path)
-        if path_tuple not in seen and len(path) > 1:
-            seen.add(path_tuple)
-            unique_paths.append(path)
-    
-    return unique_paths
-
-# ===============================
-# Two-Stage Analysis Pipeline
-# ===============================
-
-def perform_two_stage_analysis(
-    trajectory: np.ndarray,
-    macro_result: 'MDLambda3Result',
-    detected_events: List[Tuple[int, int, str]],
-    n_residues: int = 129,
-    sensitivity: float = 1.0,  # 下げた
-    correlation_threshold: float = 0.15,  # 下げた
-    use_confidence: bool = True  # 新規追加！
-) -> TwoStageLambda3Result:
-    """
-    Perform two-stage analysis: macro events → residue-level causality.
-    Enhanced with adaptive windows and network statistics.
-    """
-    print("\n" + "="*60)
-    print("=== Two-Stage Lambda³ Analysis (v3.0) ===")
-    print("="*60)
-    
-    # Create residue mapping
-    residue_atoms = create_residue_mapping(trajectory.shape[1], n_residues)
-    residue_names = get_residue_names()
-    
-    # Analyze each detected macro event
-    residue_analyses = {}
-    all_important_residues = {}
-    global_async_bonds = []
-    
-    for start, end, event_name in detected_events:
-        print(f"\n📍 Processing {event_name}...")
-        
-        analysis = analyze_macro_event(
+        # Perform two-stage analysis with enhanced parameters
+        result = perform_two_stage_analysis(
             trajectory,
-            event_name,
-            start,
-            end,
-            residue_atoms,
-            residue_names,
-            sensitivity=sensitivity,
-            correlation_threshold=correlation_threshold,
-            use_confidence=use_confidence
+            macro_result,
+            key_events,
+            n_residues=129,
+            sensitivity=1.0,
+            correlation_threshold=0.15
         )
         
-        residue_analyses[event_name] = analysis
+        # Generate report
+        report = create_intervention_report(result, "lambda3_intervention_report_v3.txt")
+        print("\n" + report[:500] + "...")  # Print first 500 chars
         
-        # Collect async bonds
-        global_async_bonds.extend(analysis.async_strong_bonds)
+        # Visualize key event
+        if 'domain_shift' in result.residue_analyses:
+            fig = visualize_residue_causality(
+                result.residue_analyses['domain_shift'],
+                "domain_shift_causality_v3.png"
+            )
+            plt.show()
         
-        # Track globally important residues
-        for event in analysis.residue_events:
-            res_id = event.residue_id
-            if res_id not in all_important_residues:
-                all_important_residues[res_id] = 0
-            # Weight by both peak intensity and adaptive window
-            importance = event.peak_lambda_f * (1 + 0.1 * (100 / event.adaptive_window))
-            all_important_residues[res_id] += importance
+        # ALS-specific analysis
+        agg_analysis = analyze_aggregation_pathway(result)
+        if agg_analysis:
+            print("\n🧬 ALS Aggregation Analysis:")
+            print(f"   Exposed hydrophobic residues: {agg_analysis['exposed_hydrophobic_count']}")
+            print(f"   Hydrophobic async bonds: {agg_analysis['hydrophobic_async_bonds']}")
+            print(f"   Intervention window: frames {agg_analysis['intervention_window'][0]}-"
+                  f"{agg_analysis['intervention_window'][1]}")
+        
+        return result
+        
+    except FileNotFoundError:
+        print("❌ Error: Trajectory file not found!")
+        print("Please run the main Lambda³ analysis first.")
+        return None
+
+if __name__ == "__main__":
+    print("\n🚀 Lambda³ Residue-Level Focus Extension v3.0 (Refactored)")
+    print("Enhanced with Adaptive Windows, Async Strong Bonds & Bootstrap Confidence")
+    print("Clean, modular, and ready for production!")
     
-    # Identify key intervention points
-    sorted_residues = sorted(all_important_residues.items(), 
-                           key=lambda x: x[1], reverse=True)
-    intervention_points = [res_id for res_id, score in sorted_residues[:10]]
+    result = demo_two_stage_analysis()
     
-    # Global network statistics
-    total_causal_links = sum(a.network_stats['n_causal'] for a in residue_analyses.values())
-    total_sync_links = sum(a.network_stats['n_sync'] for a in residue_analyses.values())
-    total_async_bonds = sum(a.network_stats['n_async'] for a in residue_analyses.values())
-    
-    global_network_stats = {
-        'total_causal_links': total_causal_links,
-        'total_sync_links': total_sync_links,
-        'total_async_bonds': total_async_bonds,
-        'async_to_causal_ratio': total_async_bonds / (total_causal_links + 1e-10),
-        'mean_adaptive_window': np.mean([a.network_stats['mean_adaptive_window'] 
-                                       for a in residue_analyses.values()])
-    }
-    
-    print("\n🎯 Global Analysis Complete!")
-    print(f"   Key residues identified: {len(all_important_residues)}")
-    print(f"   Total causal links: {total_causal_links}")
-    print(f"   Total async strong bonds: {total_async_bonds} ({global_network_stats['async_to_causal_ratio']:.1%})")
-    print(f"   Mean adaptive window: {global_network_stats['mean_adaptive_window']:.1f} frames")
-    print(f"   Suggested intervention points: {intervention_points[:5]}")
-    
-    return TwoStageLambda3Result(
-        macro_result=macro_result,
-        residue_analyses=residue_analyses,
-        global_residue_importance=all_important_residues,
-        suggested_intervention_points=intervention_points,
-        global_network_stats=global_network_stats
-    )
+    if result:
+        print("\n✨ Two-stage analysis complete!")
+        print("Features:")
+        print("  ✓ Adaptive window sizing per residue")
+        print("  ✓ Async strong bond detection")
+        print("  ✓ Bootstrap confidence intervals (95% CI)")
+        print("  ✓ Statistical significance testing")
+        print("  ✓ ALS-specific pathway analysis")
+        print("  ✓ Clean, maintainable code structure")
 
 # ===============================
-# Enhanced Visualization Functions
+# Visualization
 # ===============================
 
-def visualize_residue_causality(
-    analysis: ResidueLevelAnalysis,
-    save_path: Optional[str] = None
-) -> plt.Figure:
-    """
-    Enhanced visualization with async bonds, adaptive windows, and confidence intervals.
-    """
+def visualize_residue_causality(analysis: ResidueLevelAnalysis,
+                              save_path: Optional[str] = None) -> plt.Figure:
+    """Enhanced visualization with async bonds, adaptive windows, and confidence intervals"""
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
     # 1. Timeline of residue events with adaptive windows
@@ -839,22 +1145,15 @@ def visualize_residue_causality(
     for event in analysis.residue_events:
         color = 'red' if event.role == 'initiator' else 'blue'
         width = event.end_frame - event.start_frame
+        height = 0.4 + 0.4 * (100 / event.adaptive_window)
         
-        # Show adaptive window size by bar thickness
-        height = 0.4 + 0.4 * (100 / event.adaptive_window)  # Inverse: smaller window = thicker bar
-        
-        ax1.barh(event.residue_id, 
-                width,
-                left=event.start_frame,
-                height=height,
-                color=color,
-                alpha=0.7)
+        ax1.barh(event.residue_id, width, left=event.start_frame,
+                height=height, color=color, alpha=0.7)
     
     # 2. Causality network
     ax2 = axes[0, 1]
     ax2.set_title("Causality Network")
     
-    # Simple network visualization
     if analysis.key_propagation_paths:
         for i, path in enumerate(analysis.key_propagation_paths[:3]):
             y_offset = i * 0.3
@@ -864,7 +1163,6 @@ def visualize_residue_causality(
                          fc=f'C{i}', ec=f'C{i}')
                 ax2.text(j, y_offset + 0.15, f"R{path[j]+1}", 
                         ha='center', fontsize=10)
-            # Last residue
             ax2.text(len(path)-1, y_offset + 0.15, f"R{path[-1]+1}", 
                     ha='center', fontsize=10)
     
@@ -878,7 +1176,7 @@ def visualize_residue_causality(
     
     if analysis.async_strong_bonds:
         bond_data = []
-        for bond in analysis.async_strong_bonds[:10]:  # Top 10
+        for bond in analysis.async_strong_bonds[:10]:
             res1, res2 = bond['residue_pair']
             bond_data.append({
                 'pair': f"R{res1+1}-R{res2+1}",
@@ -887,14 +1185,12 @@ def visualize_residue_causality(
                 'lag': bond['optimal_lag']
             })
         
-        # Plot as scatter
         x = [b['sync'] for b in bond_data]
         y = [b['causality'] for b in bond_data]
         colors = [b['lag'] for b in bond_data]
         
         scatter = ax3.scatter(x, y, c=colors, cmap='viridis', s=100, alpha=0.7)
         
-        # Add labels for top bonds
         for i, b in enumerate(bond_data[:5]):
             ax3.annotate(b['pair'], (x[i], y[i]), xytext=(5, 5), 
                         textcoords='offset points', fontsize=8)
@@ -905,7 +1201,6 @@ def visualize_residue_causality(
         ax3.axhline(y=0.15, color='b', linestyle='--', alpha=0.5, label='Causality threshold')
         ax3.legend()
         
-        # Add colorbar
         cbar = plt.colorbar(scatter, ax=ax3)
         cbar.set_label('Optimal Lag (frames)')
     
@@ -930,22 +1225,20 @@ def visualize_residue_causality(
     ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, 
             fontsize=11, verticalalignment='top', fontfamily='monospace')
     
-    # 5. Confidence Intervals (NEW!)
+    # 5. Confidence Intervals
     ax5 = axes[1, 1]
     ax5.set_title("Bootstrap Confidence Intervals")
     
     if analysis.confidence_results:
-        # Show confidence intervals for significant pairs
-        significant_pairs = [c for c in analysis.confidence_results if c['significant']][:8]
+        significant_pairs = [c for c in analysis.confidence_results if c.significant][:8]
         
         if significant_pairs:
             y_pos = np.arange(len(significant_pairs))
             
             for i, conf in enumerate(significant_pairs):
-                res_i, res_j = conf['pair']
-                # Plot confidence interval
-                ax5.plot([conf['ci_lower'], conf['ci_upper']], [i, i], 'b-', linewidth=2)
-                ax5.plot(conf['mean'], i, 'ro', markersize=8)
+                res_i, res_j = conf.pair
+                ax5.plot([conf.ci_lower, conf.ci_upper], [i, i], 'b-', linewidth=2)
+                ax5.plot(conf.mean, i, 'ro', markersize=8)
                 ax5.text(-0.15, i, f"R{res_i+1}-R{res_j+1}", ha='right', va='center', fontsize=9)
             
             ax5.axvline(x=0, color='gray', linestyle='--', alpha=0.5)
@@ -969,8 +1262,8 @@ def visualize_residue_causality(
     
     if analysis.confidence_results:
         n_total = len(analysis.confidence_results)
-        n_significant = sum(1 for c in analysis.confidence_results if c['significant'])
-        mean_width = np.mean([c['ci_width'] for c in analysis.confidence_results])
+        n_significant = sum(1 for c in analysis.confidence_results if c.significant)
+        mean_width = np.mean([c.ci_width for c in analysis.confidence_results])
         
         summary_text = f"""
 Bootstrap Analysis Summary:
@@ -980,14 +1273,13 @@ Bootstrap Analysis Summary:
 
 Top Confident Pairs:
 """
-        # Sort by confidence score
         sorted_conf = sorted(analysis.confidence_results, 
-                           key=lambda x: x['confidence_score'], reverse=True)
+                           key=lambda x: x.confidence_score, reverse=True)
         
         for i, conf in enumerate(sorted_conf[:5]):
-            res_i, res_j = conf['pair']
+            res_i, res_j = conf.pair
             summary_text += f"\n{i+1}. R{res_i+1}-R{res_j+1}: "
-            summary_text += f"[{conf['ci_lower']:.3f}, {conf['ci_upper']:.3f}]"
+            summary_text += f"[{conf.ci_lower:.3f}, {conf.ci_upper:.3f}]"
         
         ax6.text(0.1, 0.9, summary_text, transform=ax6.transAxes,
                 fontsize=10, verticalalignment='top', fontfamily='monospace')
@@ -999,13 +1291,9 @@ Top Confident Pairs:
     
     return fig
 
-def create_intervention_report(
-    two_stage_result: TwoStageLambda3Result,
-    save_path: Optional[str] = None
-) -> str:
-    """
-    Create an enhanced report with network insights.
-    """
+def create_intervention_report(result: TwoStageLambda3Result,
+                             save_path: Optional[str] = None) -> str:
+    """Create an enhanced report with network insights"""
     report = []
     report.append("="*60)
     report.append("Lambda³ Two-Stage Analysis Report (v3.0)")
@@ -1016,7 +1304,7 @@ def create_intervention_report(
     # Network summary
     report.append("🌐 NETWORK SUMMARY")
     report.append("-"*30)
-    stats = two_stage_result.global_network_stats
+    stats = result.global_network_stats
     report.append(f"Total Causal Links: {stats['total_causal_links']}")
     report.append(f"Total Sync Links: {stats['total_sync_links']}")
     report.append(f"Total Async Strong Bonds: {stats['total_async_bonds']}")
@@ -1028,13 +1316,13 @@ def create_intervention_report(
     report.append("🎯 TOP INTERVENTION TARGETS")
     report.append("-"*30)
     
-    for i, res_id in enumerate(two_stage_result.suggested_intervention_points[:5]):
-        importance = two_stage_result.global_residue_importance[res_id]
+    for i, res_id in enumerate(result.suggested_intervention_points[:5]):
+        importance = result.global_residue_importance[res_id]
         report.append(f"{i+1}. Residue {res_id+1}: Score = {importance:.2f}")
         
         # Find which events this residue participates in
         events_involved = []
-        for event_name, analysis in two_stage_result.residue_analyses.items():
+        for event_name, analysis in result.residue_analyses.items():
             for res_event in analysis.residue_events:
                 if res_event.residue_id == res_id:
                     events_involved.append(event_name)
@@ -1045,7 +1333,7 @@ def create_intervention_report(
             
         # Check if involved in async bonds
         async_bonds = []
-        for event_name, analysis in two_stage_result.residue_analyses.items():
+        for event_name, analysis in result.residue_analyses.items():
             for bond in analysis.async_strong_bonds:
                 if res_id in bond['residue_pair']:
                     async_bonds.append(bond)
@@ -1058,7 +1346,7 @@ def create_intervention_report(
     report.append("-"*30)
     
     # Key findings per event
-    for event_name, analysis in two_stage_result.residue_analyses.items():
+    for event_name, analysis in result.residue_analyses.items():
         report.append(f"\n{event_name}:")
         
         if analysis.initiator_residues:
@@ -1081,28 +1369,26 @@ def create_intervention_report(
     
     # Collect all confidence results
     all_confidence_results = []
-    for analysis in two_stage_result.residue_analyses.values():
+    for analysis in result.residue_analyses.values():
         if analysis.confidence_results:
             all_confidence_results.extend(analysis.confidence_results)
     
     if all_confidence_results:
-        # Overall statistics
         n_total_pairs = len(all_confidence_results)
-        n_significant = sum(1 for c in all_confidence_results if c['significant'])
+        n_significant = sum(1 for c in all_confidence_results if c.significant)
         
         report.append(f"Total pairs analyzed: {n_total_pairs}")
         report.append(f"Statistically significant: {n_significant} ({n_significant/n_total_pairs*100:.1f}%)")
         
-        # Top confident pairs
         sorted_by_confidence = sorted(all_confidence_results, 
-                                    key=lambda x: x['confidence_score'], reverse=True)
+                                    key=lambda x: x.confidence_score, reverse=True)
         
         report.append("\nMost Confident Causal Relationships:")
         for i, conf in enumerate(sorted_by_confidence[:5]):
-            res_i, res_j = conf['pair']
+            res_i, res_j = conf.pair
             report.append(f"{i+1}. R{res_i+1} → R{res_j+1}:")
-            report.append(f"   95% CI: [{conf['ci_lower']:.3f}, {conf['ci_upper']:.3f}]")
-            report.append(f"   Confidence score: {conf['confidence_score']:.3f}")
+            report.append(f"   95% CI: [{conf.ci_lower:.3f}, {conf.ci_upper:.3f}]")
+            report.append(f"   Confidence score: {conf.confidence_score:.3f}")
     else:
         report.append("No confidence analysis performed")
     
@@ -1112,7 +1398,7 @@ def create_intervention_report(
     
     # Collect all async bonds
     all_async_bonds = []
-    for analysis in two_stage_result.residue_analyses.values():
+    for analysis in result.residue_analyses.values():
         all_async_bonds.extend(analysis.async_strong_bonds)
     
     # Sort by causality strength
@@ -1142,13 +1428,11 @@ def create_intervention_report(
     return report_text
 
 # ===============================
-# ALS-Specific Analysis Functions
+# ALS-Specific Analysis
 # ===============================
 
-def analyze_aggregation_pathway(
-    two_stage_result: TwoStageLambda3Result,
-    aggregation_event_name: str = 'aggregation_onset'
-) -> Dict[str, any]:
+def analyze_aggregation_pathway(two_stage_result: TwoStageLambda3Result,
+                               aggregation_event_name: str = 'aggregation_onset') -> Dict[str, any]:
     """
     Detailed analysis of aggregation pathway for ALS research.
     Enhanced with async bond detection.
@@ -1194,63 +1478,6 @@ def analyze_aggregation_pathway(
         'hydrophobic_async_bonds': len(hydrophobic_async_bonds),
         'mean_adaptive_window': np.mean([e.adaptive_window for e in exposed_hydrophobic]) if exposed_hydrophobic else 0
     }
-
-# ===============================
-# Main Demo Function
-# ===============================
-
-def demo_two_stage_analysis():
-    """
-    Demo two-stage analysis on 100k lysozyme trajectory.
-    Enhanced version with adaptive windows, async bonds, and bootstrap confidence.
-    """
-    print("🔬 Lambda³ Two-Stage Analysis Demo v3.0")
-    print("Stage 1: Macro events (✓ Complete)")
-    print("Stage 2: Residue-level causality with confidence analysis (Starting...)")
-    
-    # Load trajectory
-    try:
-        trajectory = np.load('lysozyme_100k_final_challenge.npy')
-        print(f"\n✓ Loaded trajectory: {trajectory.shape}")
-        
-        # Key events for analysis
-        key_events = [
-            (40000, 45000, 'domain_shift'),
-            (50000, 53000, 'rapid_partial_unfold'),
-            (85000, 95000, 'aggregation_onset')
-        ]
-        
-        # Placeholder for macro_result
-        macro_result = None
-        
-        # Perform two-stage analysis with enhanced parameters
-        result = perform_two_stage_analysis(
-            trajectory,
-            macro_result,
-            key_events,
-            n_residues=129,
-            sensitivity=1.0,  # Lower sensitivity
-            correlation_threshold=0.15  # Lower threshold
-        )
-        
-        # Generate report
-        report = create_intervention_report(result, "lambda3_intervention_report_v2.txt")
-        print("\n" + report)
-        
-        # Visualize key event
-        if 'domain_shift' in result.residue_analyses:
-            fig = visualize_residue_causality(
-                result.residue_analyses['domain_shift'],
-                "domain_shift_causality_v2.png"
-            )
-            plt.show()
-        
-        return result
-        
-    except FileNotFoundError:
-        print("❌ Error: Trajectory file not found!")
-        print("Please run the main Lambda³ analysis first.")
-        return None
 
 if __name__ == "__main__":
     print("\n🚀 Lambda³ Residue-Level Focus Extension v3.0")
