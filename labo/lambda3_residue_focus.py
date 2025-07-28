@@ -207,7 +207,7 @@ class Lambda3ResidueAnalyzer:
         # Parallel or sequential processing
         if HAS_JOBLIB and len(detected_events) > 1:
             print("\n📍 Processing events in parallel...")
-            analyses = Parallel(n_jobs=-1)(
+            analyses = Parallel(n_jobs=-1, backend='threading')(
                 delayed(self._analyze_single_event)(
                     trajectory, event_name, start, end, residue_atoms, residue_names
                 ) for start, end, event_name in detected_events
