@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "lambda3-detector"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lambda³ Zero-Shot Anomaly Detection — physics-based, training-free anomaly detection via ΔΛC jumps and topological invariants."
 readme = "README.md"
 license = { file = "LICENSE" }
