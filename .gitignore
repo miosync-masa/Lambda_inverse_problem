@@ -1,0 +1,20 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.ipynb_checkpoints/
+
+# External datasets (clone separately, see README)
+NAB/
+
+# Virtualenv / build
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
