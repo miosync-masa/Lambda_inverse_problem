@@ -96,9 +96,29 @@ def test_check_grad():
 
     rng = np.random.default_rng(0)
     x0 = rng.normal(0, 0.1, n_paths * n_events).astype(np.float64)
-    err = check_grad(f, g, x0, epsilon=1e-4)
-    print(f"  check_grad error (no-topo): {err:.6f}  (||grad|| order; <1e-1 で OK)")
-    assert err < 1.0, f"Gradient check failed: error={err}"
+
+    # 診断: analytic / numerical grad の規模を見比べる
+    a_grad = g(x0)
+    f0 = f(x0)
+    eps_fd = 1e-4
+    n_grad = np.zeros_like(x0)
+    for i in range(len(x0)):
+        x_pert = x0.copy(); x_pert[i] += eps_fd
+        n_grad[i] = (f(x_pert) - f0) / eps_fd
+    abs_diff = np.abs(a_grad - n_grad)
+    rel = abs_diff / (np.abs(a_grad) + 1e-8)
+    print(f"  ||analytic||={np.linalg.norm(a_grad):.3f}  "
+          f"||numerical||={np.linalg.norm(n_grad):.3f}  "
+          f"||a-n||={np.linalg.norm(a_grad - n_grad):.4f}")
+    print(f"  max abs diff: {abs_diff.max():.6f}  "
+          f"median rel diff: {np.median(rel):.6f}")
+
+    err = check_grad(f, g, x0, epsilon=eps_fd)
+    grad_norm = float(np.linalg.norm(a_grad))
+    rel_err = err / (grad_norm + 1e-8)
+    print(f"  check_grad error (no-topo): {err:.6f}  (||grad||={grad_norm:.3f}, rel={rel_err:.4f})")
+    # float32 reduce + forward-diff の数値雑音耐性として、相対基準で判定
+    assert rel_err < 0.05, f"Gradient relative error too large: rel={rel_err:.4f}"
 
     # with topo
     def f_to(x):
@@ -118,8 +138,12 @@ def test_check_grad():
         return to_cpu(gr).astype(np.float64).ravel()
 
     err_to = check_grad(f_to, g_to, x0, epsilon=1e-4)
-    print(f"  check_grad error (with-topo): {err_to:.6f}")
-    assert err_to < 2.0, f"Gradient check failed (topo): error={err_to}"
+    a_grad_to = g_to(x0)
+    grad_to_norm = float(np.linalg.norm(a_grad_to))
+    rel_to = err_to / (grad_to_norm + 1e-8)
+    print(f"  check_grad error (with-topo): {err_to:.6f}  "
+          f"(||grad||={grad_to_norm:.3f}, rel={rel_to:.4f})")
+    assert rel_to < 0.10, f"Gradient relative error too large (topo): rel={rel_to:.4f}"
     print("✓ test_check_grad passed")
 
 

@@ -110,9 +110,11 @@ def _data_fit_obj_grad(
     # recon_pairs[k] = <Λ[:, pair_i[k]], Λ[:, pair_j[k]]>
     recon_pairs = cp.sum(
         Lambda[:, pair_i] * Lambda[:, pair_j], axis=0
-    )  # (n_pairs,)
+    )  # (n_pairs,) float32
     e_pairs = G_pairs - recon_pairs
-    data_fit = float(cp.sum(e_pairs * e_pairs))
+    # objective は float64 で reduce（float32 の合算で生じる ULP ノイズが
+    # check_grad の数値勾配を埋めてしまうのを防ぐ）
+    data_fit = float(cp.sum((e_pairs.astype(cp.float64)) ** 2))
 
     # grad scatter
     block = 256
@@ -138,7 +140,7 @@ def _tv_obj_grad(Lambda: "cp.ndarray", alpha: float,
         return 0.0
     # vertical (paths 方向)
     dv = Lambda[1:, :] - Lambda[:-1, :]
-    abs_dv_sum = float(cp.sum(cp.abs(dv)))
+    abs_dv_sum = float(cp.sum(cp.abs(dv).astype(cp.float64)))
     sgn_dv = _smooth_sign(dv)  # (n_paths-1, n_events)
     # grad[p, j] += α·sign(Λ[p,j]-Λ[p-1,j]) (p>0) - α·sign(Λ[p+1,j]-Λ[p,j]) (p<n_p-1)
     grad[1:, :] += alpha * sgn_dv
@@ -146,7 +148,7 @@ def _tv_obj_grad(Lambda: "cp.ndarray", alpha: float,
 
     # horizontal (time 方向)
     dh = Lambda[:, 1:] - Lambda[:, :-1]
-    abs_dh_sum = float(cp.sum(cp.abs(dh)))
+    abs_dh_sum = float(cp.sum(cp.abs(dh).astype(cp.float64)))
     sgn_dh = _smooth_sign(dh)  # (n_paths, n_events-1)
     grad[:, 1:] += alpha * sgn_dh
     grad[:, :-1] -= alpha * sgn_dh
@@ -159,7 +161,7 @@ def _l1_obj_grad(Lambda: "cp.ndarray", beta: float,
     """L1 = β·Σ|Λ| の値と grad。"""
     if beta == 0.0:
         return 0.0
-    val = float(cp.sum(cp.abs(Lambda)))
+    val = float(cp.sum(cp.abs(Lambda).astype(cp.float64)))
     grad += beta * _smooth_sign(Lambda)
     return beta * val
 
@@ -185,7 +187,9 @@ def _jump_reg_obj_grad(
     thr = mean_d + 2.5 * std_d                 # (n_paths, 1)
 
     mask = ad > thr                            # (n_paths, n_events-1) bool
-    total = float(cp.sum(ad * mask.astype(ad.dtype))) * jump_weight
+    total = float(
+        cp.sum((ad * mask.astype(ad.dtype)).astype(cp.float64))
+    ) * jump_weight
 
     # 勾配: 越えてる箇所の |d| の subgrad = sign(d)
     contrib = jump_weight * _smooth_sign(d) * mask.astype(d.dtype)
@@ -219,7 +223,7 @@ def _jump_consistency_obj_grad(
     # 各 i のスカラー係数 c_i: jump_mask==1 → -jw[i], それ以外 → +0.1
     c = cp.where(jm > 0.5, -jw, 0.1 * cp.ones_like(jw))  # (n_e-1,)
 
-    val = float(cp.sum(c[None, :] * ad))  # broadcast
+    val = float(cp.sum((c[None, :] * ad).astype(cp.float64)))  # broadcast
 
     # ∂/∂d = c · sign(d)
     contrib = c[None, :] * _smooth_sign(d)  # (n_p, n_e-1)
@@ -250,7 +254,7 @@ def _topo_reg_obj_grad(
     raw_q = phase[:, 1:] - phase[:, :-1]   # (n_p, n_e-2)
     # wrap to (-π, π]
     q = raw_q - cp.round(raw_q / (2.0 * np.pi)) * (2.0 * np.pi)
-    val = topo_weight * float(cp.sum(q * q))
+    val = topo_weight * float(cp.sum((q * q).astype(cp.float64)))
 
     # ∂topo/∂phase[i]:
     #   phase[i] が q[m] = phase[m+1] - phase[m] に現れるのは m = i-1 (+) と m = i (-)
