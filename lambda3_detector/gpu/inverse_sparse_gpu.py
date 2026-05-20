@@ -52,14 +52,21 @@ void data_fit_grad_kernel(
     const int n_events,
     const int n_pairs)
 {
+    // 各ペア (i, j) のスカラー項 (G_ij - <Λ_i, Λ_j>)^2 の勾配は
+    //   ∂/∂Λ[p, i] += -2 e_ij Λ[p, j]
+    //   ∂/∂Λ[p, j] += -2 e_ij Λ[p, i]
+    // の両方に乗る。対角 (i == j) は同じアドレスに 2 回加算され、
+    // ∂(G_ii - Σ Λ_ki^2)^2/∂Λ[p, i] = -4 e_ii Λ[p, i] が自動的に再現される。
     int k = blockIdx.x * blockDim.x + threadIdx.x;
     if (k >= n_pairs) return;
     int i = (int)pair_i[k];
     int j = (int)pair_j[k];
-    float e = e_pairs[k];
-    float scale = -2.0f * e;
+    float scale = -2.0f * e_pairs[k];
     for (int p = 0; p < n_paths; ++p) {
-        atomicAdd(&grad[p * n_events + i], scale * Lambda[p * n_events + j]);
+        float Lpi = Lambda[p * n_events + i];
+        float Lpj = Lambda[p * n_events + j];
+        atomicAdd(&grad[p * n_events + i], scale * Lpj);
+        atomicAdd(&grad[p * n_events + j], scale * Lpi);
     }
 }
 """
