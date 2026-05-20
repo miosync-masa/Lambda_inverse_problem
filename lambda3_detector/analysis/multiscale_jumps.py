@@ -193,13 +193,19 @@ def integrate_cross_feature_jumps(feature_jumps: Dict) -> Dict:
     # ジャンプクラスター検出
     jump_clusters = detect_jump_clusters(unified_jumps, jump_importance)
 
+    # n_features=1 だと triu_indices(1, k=1) が空配列 → max が空に失敗
+    if n_features >= 2:
+        max_sync_val = float(np.max(sync_matrix[np.triu_indices(n_features, k=1)]))
+    else:
+        max_sync_val = 0.0  # 単変量では「特徴量間 sync」は定義されない
+
     return {
         'unified_jumps': unified_jumps,
         'jump_importance': jump_importance / n_features,  # 正規化
         'sync_matrix': sync_matrix,
         'jump_clusters': jump_clusters,
         'n_total_jumps': np.sum(unified_jumps),
-        'max_sync': np.max(sync_matrix[np.triu_indices(n_features, k=1)])
+        'max_sync': max_sync_val,
     }
 
 

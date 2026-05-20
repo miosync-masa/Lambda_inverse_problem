@@ -47,8 +47,15 @@ def compute_adaptive_window_size(
     temporal_volatility = np.mean(np.std(temporal_changes, axis=0))
 
     # 3. 特徴量間の相関構造の複雑さ
-    correlation_matrix = np.corrcoef(events.T)
-    correlation_complexity = 1.0 - np.mean(np.abs(correlation_matrix[np.triu_indices(n_features, k=1)]))
+    # n_features=1 のとき corrcoef はスカラー (=1.0) になり triu_indices できない
+    # → 単変量は「特徴量間相関」自体が未定義なので 0.0 (中立) を返す
+    if n_features >= 2:
+        correlation_matrix = np.corrcoef(events.T)
+        correlation_complexity = 1.0 - np.mean(
+            np.abs(correlation_matrix[np.triu_indices(n_features, k=1)])
+        )
+    else:
+        correlation_complexity = 0.0
 
     # 4. 局所的な変動パターンの検出
     local_volatilities = []
