@@ -52,17 +52,19 @@ def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
                           GPU 可 (kernel_anomaly_scores_auto_gpu)。
         'both'         : poly と auto の両方を返す。non-kernel scorer は共有計算。
                           dict に 'kernel' (poly) と 'kernel_auto' の両方が入る。
+
+    注: scorer 呼び出し順は jump → hybrid → kernel(s) → struct → drift。
+    過去 commit でこの順序の方が良いスコアを出した実績があり、また経験的に
+    順序を変えると kernel 出力が縮退するファイルがある (struct/drift 自体は
+    paths を変更しないが、GPU L-BFGS-B の非凸最適化が float32 で非決定的に
+    なるため、run-to-run の数値順序差が paths に伝播する可能性がある)。
     """
     np.random.seed(0); jump   = JumpScorer().score(events, result)
     np.random.seed(0); hybrid = HybridScorer().score(events, result)
-    np.random.seed(0); struct = StructuralScorer().score(events, result)
-    np.random.seed(0); drift  = DriftScorer().score(events, result)
 
-    out: Dict[str, np.ndarray] = {
-        'jump': jump, 'hybrid': hybrid,
-        'structural': struct, 'drift': drift,
-    }
+    out: Dict[str, np.ndarray] = {'jump': jump, 'hybrid': hybrid}
 
+    # === Kernel(s) — struct/drift より前に置く ===
     if kernel_mode == 'both':
         np.random.seed(0)
         out['kernel'] = KernelScorer(
@@ -82,6 +84,9 @@ def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
         out['kernel'] = KernelScorer(
             kernel_type=1, degree=7, coef0=1.0, use_gpu=use_gpu,
         ).score(events, result)
+
+    np.random.seed(0); out['structural'] = StructuralScorer().score(events, result)
+    np.random.seed(0); out['drift']      = DriftScorer().score(events, result)
     return out
 
 
