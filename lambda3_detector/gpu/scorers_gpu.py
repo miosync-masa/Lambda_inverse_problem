@@ -78,6 +78,13 @@ def compute_kernel_gram_matrix_gpu(
     elif kernel_type == 1:  # Polynomial — float64 で計算 (overflow 回避)
         G = X64 @ X64.T
         K = (G + coef0) ** degree
+        # 入力 features の magnitude (NAB nyc_taxi で 30k 級) で K が
+        # float32 max を簡単に超えるので、max-abs で正規化して [-1, 1] に。
+        # 下流 (kernel_anomaly_scores_gpu) で Frobenius 正規化するため、
+        # K の絶対スケールはスコアに影響しない (shape のみ重要)。
+        K_absmax = float(cp.max(cp.abs(K)))
+        if K_absmax > 1e-12:
+            K = K / K_absmax
     elif kernel_type == 2:  # Sigmoid — alpha * <x,y> が大きいと tanh 飽和、念のため float64
         G = X64 @ X64.T
         K = cp.tanh(alpha * G + coef0)
@@ -102,9 +109,14 @@ def compute_kernel_gram_matrix_gpu(
 
     # 対称化（数値誤差吸収）
     K = 0.5 * (K + K.T)
-    # 非有限を 0 に押し戻す (極端な kernel_type=1 で overflow の救済)
+    # float64 段階での非有限を 0 化
     K = cp.where(cp.isfinite(K), K, 0.0)
-    return K.astype(DEFAULT_DTYPE)
+    # float32 へキャスト
+    K = K.astype(DEFAULT_DTYPE)
+    # float64→float32 キャストで巨大値が inf 化することがあるので再度クリーンアップ
+    # (NAB nyc_taxi で polynomial degree=7 が float32 max 3.4e38 を超える)
+    K = cp.where(cp.isfinite(K), K, 0.0)
+    return K
 
 
 # =============================================================================
