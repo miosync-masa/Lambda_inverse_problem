@@ -164,6 +164,30 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
     if ensemble:
         prod_auto_raw = _combine(components['kernel_auto'], symmetric=False)
         prod_auto_mixed = _combine(components['kernel_auto'], symmetric=True)
+
+        # === DEBUG: ensemble 配列が本当に別物か診断 ===
+        k_poly = components['kernel']
+        k_auto = components['kernel_auto']
+        print(f"  [DEBUG] kernel arrays:")
+        print(f"    id(poly)={id(k_poly)}  id(auto)={id(k_auto)}  "
+              f"same_obj={k_poly is k_auto}")
+        print(f"    poly: shape={k_poly.shape} dtype={k_poly.dtype} "
+              f"mean={float(np.mean(k_poly)):.4f} std={float(np.std(k_poly)):.4f} "
+              f"min={float(np.min(k_poly)):.4f} max={float(np.max(k_poly)):.4f}")
+        print(f"    auto: shape={k_auto.shape} dtype={k_auto.dtype} "
+              f"mean={float(np.mean(k_auto)):.4f} std={float(np.std(k_auto)):.4f} "
+              f"min={float(np.min(k_auto)):.4f} max={float(np.max(k_auto)):.4f}")
+        print(f"    array_equal={np.array_equal(k_poly, k_auto)}  "
+              f"max_abs_diff={float(np.max(np.abs(k_poly - k_auto))):.6e}")
+        print(f"  [DEBUG] production arrays:")
+        print(f"    prod_raw: mean={float(np.mean(prod_raw)):.4f} "
+              f"std={float(np.std(prod_raw)):.4f} "
+              f"min={float(np.min(prod_raw)):.4f} max={float(np.max(prod_raw)):.4f}")
+        print(f"    prod_auto_raw: mean={float(np.mean(prod_auto_raw)):.4f} "
+              f"std={float(np.std(prod_auto_raw)):.4f} "
+              f"min={float(np.min(prod_auto_raw)):.4f} max={float(np.max(prod_auto_raw)):.4f}")
+        print(f"    prod_raw == prod_auto_raw: {np.array_equal(prod_raw, prod_auto_raw)}")
+
         # max of z-normalized (calibration window 基準)
         prod_ens_raw = np.maximum(
             _zn_cal(prod_raw, cal_frames),
