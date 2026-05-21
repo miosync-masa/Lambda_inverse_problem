@@ -254,9 +254,8 @@ class KernelScorer(AnomalyScorer):
     ``kernel_type=-1`` で全カーネル探索（自動選択）、それ以外は固定の
     カーネル種別＋パラメータを使う。
 
-    ``use_gpu=True`` で固定カーネル経路（kernel_type != -1）を CuPy 版に切替。
-    自動選択経路 (kernel_type=-1) は CPU のまま（多数候補の sweep ロジックは
-    まだ CPU 維持）。
+    ``use_gpu=True`` で固定カーネル経路（kernel_type != -1）も自動選択経路
+    （kernel_type == -1）も CuPy 版にディスパッチする。
     """
 
     def __init__(self, kernel_type: int = -1, use_gpu: bool = False, **kernel_params):
@@ -266,6 +265,11 @@ class KernelScorer(AnomalyScorer):
 
     def score(self, events: np.ndarray, lambda3_result: Lambda3Result) -> np.ndarray:
         if self.kernel_type == -1:
+            if self.use_gpu:
+                from ..gpu import kernel_anomaly_scores_auto_gpu
+                return kernel_anomaly_scores_auto_gpu(
+                    events, lambda3_result.paths,
+                )
             return compute_kernel_anomaly_scores_optimized(events, lambda3_result)
         if self.use_gpu:
             from ..gpu import kernel_anomaly_scores_gpu

@@ -56,7 +56,8 @@ def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
     np.random.seed(0)
     if kernel_mode == 'auto':
         # 自動カーネル選択 (RBF / Polynomial / Sigmoid / Laplacian / Periodic を網羅 sweep)
-        kernel = KernelScorer(kernel_type=-1).score(events, result)
+        # use_gpu=True で kernel_anomaly_scores_auto_gpu (CuPy) にディスパッチ
+        kernel = KernelScorer(kernel_type=-1, use_gpu=use_gpu).score(events, result)
     else:
         kernel = KernelScorer(
             kernel_type=1, degree=7, coef0=1.0, use_gpu=use_gpu,

@@ -15,7 +15,11 @@ from .backend import (
     device_info,
 )
 from .inverse_sparse_gpu import solve_inverse_problem_sparse_gpu
-from .scorers_gpu import compute_kernel_gram_matrix_gpu, kernel_anomaly_scores_gpu
+from .scorers_gpu import (
+    compute_kernel_gram_matrix_gpu,
+    kernel_anomaly_scores_gpu,
+    kernel_anomaly_scores_auto_gpu,
+)
 
 __all__ = [
     'cp',
@@ -26,4 +30,5 @@ __all__ = [
     'solve_inverse_problem_sparse_gpu',
     'compute_kernel_gram_matrix_gpu',
     'kernel_anomaly_scores_gpu',
+    'kernel_anomaly_scores_auto_gpu',
 ]
