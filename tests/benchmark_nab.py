@@ -25,6 +25,7 @@ import numpy as np
 from lambda3_detector import L3Config, Lambda3ZeroShotDetector
 from lambda3_detector.scorers import (
     DriftScorer,
+    GradualTransitionScorer,
     HybridScorer,
     JumpScorer,
     KernelScorer,
@@ -39,7 +40,12 @@ from tests.nab_features import expand_to_5d, expand_to_6d
 from tests.nab_metrics import NABScore, format_nab_score, score_all_profiles
 
 
-PROD_WEIGHTS = {'jump': 0.20, 'hybrid': 0.35, 'kernel': 0.30, 'structural': 0.15}
+PROD_WEIGHTS = {
+    'jump': 0.20, 'hybrid': 0.35, 'kernel': 0.30, 'structural': 0.15,
+    # gradual: multi-scale gradual transition (getter-one extended_detector port)
+    # 緩やかな状態異常 (machine_temp の前兆、ambient_temp の遷延的異常) を catch。
+    'gradual': 0.20,
+}
 SYM_COMPONENTS = ['hybrid', 'kernel']
 
 
@@ -99,6 +105,9 @@ def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
 
     np.random.seed(0); out['structural'] = StructuralScorer().score(events, result)
     np.random.seed(0); out['drift']      = DriftScorer().score(events, result)
+    # gradual transition (getter-one extended_detector port)。
+    # CPU 軽量 (scipy gaussian_filter1d だけ)。
+    np.random.seed(0); out['gradual']    = GradualTransitionScorer().score(events, result)
     return out
 
 
@@ -182,8 +191,10 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
             'hybrid': components['hybrid'],
             'kernel': kernel_arr,
             'structural': components['structural'],
+            'gradual': components.get('gradual'),
         }
-        comp_subset = {k: v for k, v in comp_full.items() if k in scorers}
+        comp_subset = {k: v for k, v in comp_full.items()
+                       if k in scorers and v is not None}
         if symmetric and sym_eff:
             return ScoreIntegrator(
                 default_weights=weights_eff,
@@ -196,7 +207,7 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
     prod_mixed = _combine(components.get('kernel'), symmetric=True)
 
     # kernel 抜き構成 (3-scorer) で ensemble 指定は意味ないので無効化
-    do_ensemble = do_ensemble
+    do_ensemble = ensemble and use_kernel_in_prod
     if do_ensemble:
         prod_auto_raw = _combine(components['kernel_auto'], symmetric=False)
         prod_auto_mixed = _combine(components['kernel_auto'], symmetric=True)
@@ -343,7 +354,7 @@ def main():
 
     # --scorers パース
     scorers_list = [s.strip() for s in args.scorers.split(',') if s.strip()]
-    valid_scorers = {'jump', 'hybrid', 'kernel', 'structural'}
+    valid_scorers = {'jump', 'hybrid', 'kernel', 'structural', 'gradual'}
     invalid = [s for s in scorers_list if s not in valid_scorers]
     if invalid:
         raise SystemExit(f"unknown scorer(s): {invalid}, valid={valid_scorers}")
