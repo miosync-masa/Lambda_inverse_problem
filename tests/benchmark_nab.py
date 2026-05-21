@@ -35,7 +35,7 @@ from lambda3_detector.scorers import (
 from tests.changepoint_datasets import ChangePointInfo
 from tests.changepoint_metrics import evaluate_changepoint
 from tests.nab_datasets import iter_category
-from tests.nab_features import expand_to_5d
+from tests.nab_features import expand_to_5d, expand_to_6d
 from tests.nab_metrics import NABScore, format_nab_score, score_all_profiles
 
 
@@ -43,13 +43,24 @@ PROD_WEIGHTS = {'jump': 0.20, 'hybrid': 0.35, 'kernel': 0.30, 'structural': 0.15
 SYM_COMPONENTS = ['hybrid', 'kernel']
 
 
-def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False) -> Dict[str, np.ndarray]:
+def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
+                            kernel_mode: str = 'poly') -> Dict[str, np.ndarray]:
+    """
+    kernel_mode:
+        'poly' (default): polynomial kernel 固定 (degree=7, coef0=1.0)、GPU 可
+        'auto'         : kernel_type=-1 で 90+ candidate を sweep（periodic 含む）。
+                          周期データ向けだが重い (CPU only)。GPU フラグは無視。
+    """
     np.random.seed(0); jump   = JumpScorer().score(events, result)
     np.random.seed(0); hybrid = HybridScorer().score(events, result)
     np.random.seed(0)
-    kernel = KernelScorer(
-        kernel_type=1, degree=7, coef0=1.0, use_gpu=use_gpu,
-    ).score(events, result)
+    if kernel_mode == 'auto':
+        # 自動カーネル選択 (RBF / Polynomial / Sigmoid / Laplacian / Periodic を網羅 sweep)
+        kernel = KernelScorer(kernel_type=-1).score(events, result)
+    else:
+        kernel = KernelScorer(
+            kernel_type=1, degree=7, coef0=1.0, use_gpu=use_gpu,
+        ).score(events, result)
     np.random.seed(0); struct = StructuralScorer().score(events, result)
     np.random.seed(0); drift  = DriftScorer().score(events, result)
     return {
@@ -78,14 +89,16 @@ def _build_cp_info(sample) -> ChangePointInfo:
 
 
 def run_one(sample, n_features: int = 5, feature_window: int = 30,
-            use_gpu: bool = False) -> Dict:
+            use_gpu: bool = False, kernel_mode: str = 'poly') -> Dict:
     print(f"\n■ {sample.name}  n={sample.n}  #windows={len(sample.windows_ts)}  "
-          f"features={n_features}  gpu={use_gpu}")
+          f"features={n_features}  gpu={use_gpu}  kernel={kernel_mode}")
 
     if n_features == 1:
         events = sample.values  # (n, 1)
     elif n_features == 5:
         events = expand_to_5d(sample.values, window=feature_window)
+    elif n_features == 6:
+        events = expand_to_6d(sample.values, window=feature_window)
     else:
         raise ValueError(f"unsupported n_features={n_features}")
 
@@ -95,7 +108,8 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
     result = detector.analyze(events)
     t_analyze = time.perf_counter() - t0
 
-    components = compute_scorer_outputs(events, result, use_gpu=use_gpu)
+    components = compute_scorer_outputs(events, result, use_gpu=use_gpu,
+                                         kernel_mode=kernel_mode)
 
     cal_frames = _resolve_calibration_frames(
         sample.n, sample.window_indices[0][0]
@@ -174,23 +188,30 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--category', default='realKnownCause')
     ap.add_argument('--windows-file', default='combined_windows.json')
-    ap.add_argument('--features', type=int, default=5, choices=[1, 5],
-                    help='1=raw univariate, 5=expand to [raw,rmean,rstd,diff2,lag1ac]')
+    ap.add_argument('--features', type=int, default=5, choices=[1, 5, 6],
+                    help='1=raw univariate, '
+                         '5=[raw,rmean,rstd,diff2,lag1ac], '
+                         '6=5次元+stddev_MAD偏差 (signal-absence catch)')
     ap.add_argument('--feature-window', type=int, default=30)
     ap.add_argument('--use-gpu', action='store_true',
                     help='enable CuPy GPU path (Colab 等)')
+    ap.add_argument('--kernel', choices=['poly', 'auto'], default='poly',
+                    help='poly: polynomial degree=7 (GPU可)、'
+                         'auto: 90+ kernels (periodic 含む) sweep (CPU, 重い)')
     args = ap.parse_args()
 
     print("=" * 110)
     print(f"NAB benchmark  category={args.category}  windows={args.windows_file}  "
-          f"features={args.features}  feat_w={args.feature_window}  gpu={args.use_gpu}")
+          f"features={args.features}  feat_w={args.feature_window}  "
+          f"gpu={args.use_gpu}  kernel={args.kernel}")
     print("=" * 110)
 
     rows: List[Dict] = []
     for sample in iter_category(args.category, windows_file=args.windows_file):
         rows.append(run_one(sample, n_features=args.features,
                             feature_window=args.feature_window,
-                            use_gpu=args.use_gpu))
+                            use_gpu=args.use_gpu,
+                            kernel_mode=args.kernel))
 
     if not rows:
         print("\n(no samples matched)")

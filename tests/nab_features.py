@@ -56,3 +56,28 @@ def expand_to_5d(values: np.ndarray, window: int = 30) -> np.ndarray:
     np.clip(f4, -1.0, 1.0, out=f4)
 
     return np.column_stack([f0, f1, f2, f3, f4])
+
+
+def expand_to_6d(values: np.ndarray, window: int = 30) -> np.ndarray:
+    """単変量 → 多変量 (n, 6)。5次元 + signal-absence 検出用 f5。
+
+    f5: rolling_std の MAD (median absolute deviation) 正規化
+        f5[t] = |rolling_std[t] - median(rolling_std)| / MAD(rolling_std)
+
+    rolling_std が極端に上がっても下がっても f5 は大きくなる対称検出。
+    特に「ばらつきが平常時より顕著に下がる signal-absence 型異常」
+    （例: rogue_agent_key_updown のユーザ交代でロボット様に均一化）
+    を Lambda³ の scorer に「正の方向の構造変化」として見せる。
+
+    Returns:
+        (n, 6) float64 配列。列順は
+        [raw, rmean, rstd, diff2, lag1_autocorr, std_dev_mad]。
+    """
+    X5 = expand_to_5d(values, window=window)
+    rolling_std = X5[:, 2]
+    med = float(np.median(rolling_std))
+    mad = float(np.median(np.abs(rolling_std - med))) + 1e-12
+    f5 = np.abs(rolling_std - med) / mad
+    # MAD 正規化は単発の巨大外れ値を作りやすいので clip
+    f5 = np.clip(f5, 0.0, 50.0)
+    return np.column_stack([X5, f5])
