@@ -49,25 +49,49 @@ def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
     kernel_mode:
         'poly' (default): polynomial kernel 固定 (degree=7, coef0=1.0)、GPU 可
         'auto'         : kernel_type=-1 で 90+ candidate を sweep（periodic 含む）。
-                          周期データ向けだが重い (CPU only)。GPU フラグは無視。
+                          GPU 可 (kernel_anomaly_scores_auto_gpu)。
+        'both'         : poly と auto の両方を返す。non-kernel scorer は共有計算。
+                          dict に 'kernel' (poly) と 'kernel_auto' の両方が入る。
     """
     np.random.seed(0); jump   = JumpScorer().score(events, result)
     np.random.seed(0); hybrid = HybridScorer().score(events, result)
-    np.random.seed(0)
-    if kernel_mode == 'auto':
-        # 自動カーネル選択 (RBF / Polynomial / Sigmoid / Laplacian / Periodic を網羅 sweep)
-        # use_gpu=True で kernel_anomaly_scores_auto_gpu (CuPy) にディスパッチ
-        kernel = KernelScorer(kernel_type=-1, use_gpu=use_gpu).score(events, result)
-    else:
-        kernel = KernelScorer(
-            kernel_type=1, degree=7, coef0=1.0, use_gpu=use_gpu,
-        ).score(events, result)
     np.random.seed(0); struct = StructuralScorer().score(events, result)
     np.random.seed(0); drift  = DriftScorer().score(events, result)
-    return {
-        'jump': jump, 'hybrid': hybrid, 'kernel': kernel,
+
+    out: Dict[str, np.ndarray] = {
+        'jump': jump, 'hybrid': hybrid,
         'structural': struct, 'drift': drift,
     }
+
+    if kernel_mode == 'both':
+        np.random.seed(0)
+        out['kernel'] = KernelScorer(
+            kernel_type=1, degree=7, coef0=1.0, use_gpu=use_gpu,
+        ).score(events, result)
+        np.random.seed(0)
+        out['kernel_auto'] = KernelScorer(
+            kernel_type=-1, use_gpu=use_gpu,
+        ).score(events, result)
+    elif kernel_mode == 'auto':
+        np.random.seed(0)
+        out['kernel'] = KernelScorer(
+            kernel_type=-1, use_gpu=use_gpu,
+        ).score(events, result)
+    else:  # 'poly'
+        np.random.seed(0)
+        out['kernel'] = KernelScorer(
+            kernel_type=1, degree=7, coef0=1.0, use_gpu=use_gpu,
+        ).score(events, result)
+    return out
+
+
+def _zn_cal(scores: np.ndarray, cal_frames: int, eps: float = 1e-12) -> np.ndarray:
+    """calibration 窓内の平均・標準偏差で z-norm。複数 production score の
+    ensemble 合成前にスケールを揃える。"""
+    cal = scores[:cal_frames]
+    mu = float(np.mean(cal))
+    sd = float(np.std(cal)) + eps
+    return (scores - mu) / sd
 
 
 def _resolve_calibration_frames(n: int, first_window_start: int) -> int:
@@ -90,9 +114,12 @@ def _build_cp_info(sample) -> ChangePointInfo:
 
 
 def run_one(sample, n_features: int = 5, feature_window: int = 30,
-            use_gpu: bool = False, kernel_mode: str = 'poly') -> Dict:
+            use_gpu: bool = False, kernel_mode: str = 'poly',
+            ensemble: bool = False) -> Dict:
+    eff_kernel = 'both' if ensemble else kernel_mode
     print(f"\n■ {sample.name}  n={sample.n}  #windows={len(sample.windows_ts)}  "
-          f"features={n_features}  gpu={use_gpu}  kernel={kernel_mode}")
+          f"features={n_features}  gpu={use_gpu}  kernel={eff_kernel}"
+          f"{'  [ENSEMBLE]' if ensemble else ''}")
 
     if n_features == 1:
         events = sample.values  # (n, 1)
@@ -110,37 +137,78 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
     t_analyze = time.perf_counter() - t0
 
     components = compute_scorer_outputs(events, result, use_gpu=use_gpu,
-                                         kernel_mode=kernel_mode)
+                                         kernel_mode=eff_kernel)
 
     cal_frames = _resolve_calibration_frames(
         sample.n, sample.window_indices[0][0]
     )
 
-    # raw
-    prod_raw = ScoreIntegrator(default_weights=PROD_WEIGHTS).combine(
-        {k: v for k, v in components.items() if k in PROD_WEIGHTS}
-    )
+    # === production score 構築 ===
+    def _combine(kernel_arr, symmetric: bool):
+        comp_subset = {
+            'jump': components['jump'],
+            'hybrid': components['hybrid'],
+            'kernel': kernel_arr,
+            'structural': components['structural'],
+        }
+        if symmetric:
+            return ScoreIntegrator(
+                default_weights=PROD_WEIGHTS,
+                symmetric_components=SYM_COMPONENTS,
+            ).combine(comp_subset, calibration_frames=cal_frames)
+        return ScoreIntegrator(default_weights=PROD_WEIGHTS).combine(comp_subset)
 
-    # mixed: hybrid + kernel symmetric
-    prod_mixed = ScoreIntegrator(
-        default_weights=PROD_WEIGHTS,
-        symmetric_components=SYM_COMPONENTS,
-    ).combine(
-        {k: v for k, v in components.items() if k in PROD_WEIGHTS},
-        calibration_frames=cal_frames,
-    )
+    prod_raw = _combine(components['kernel'], symmetric=False)
+    prod_mixed = _combine(components['kernel'], symmetric=True)
 
-    # === NAB Sweeper (3 profile) ===
+    if ensemble:
+        prod_auto_raw = _combine(components['kernel_auto'], symmetric=False)
+        prod_auto_mixed = _combine(components['kernel_auto'], symmetric=True)
+        # max of z-normalized (calibration window 基準)
+        prod_ens_raw = np.maximum(
+            _zn_cal(prod_raw, cal_frames),
+            _zn_cal(prod_auto_raw, cal_frames),
+        )
+        prod_ens_mixed = np.maximum(
+            _zn_cal(prod_mixed, cal_frames),
+            _zn_cal(prod_auto_mixed, cal_frames),
+        )
+    else:
+        prod_auto_raw = prod_auto_mixed = None
+        prod_ens_raw = prod_ens_mixed = None
+
+    # === NAB Sweeper ===
     nab_raw   = score_all_profiles(sample, prod_raw)
     nab_mixed = score_all_profiles(sample, prod_mixed)
+    if ensemble:
+        nab_auto_raw   = score_all_profiles(sample, prod_auto_raw)
+        nab_auto_mixed = score_all_profiles(sample, prod_auto_mixed)
+        nab_ens_raw    = score_all_profiles(sample, prod_ens_raw)
+        nab_ens_mixed  = score_all_profiles(sample, prod_ens_mixed)
+    else:
+        nab_auto_raw = nab_auto_mixed = None
+        nab_ens_raw = nab_ens_mixed = None
 
     print(f"  analyze={t_analyze:.1f}s  cal_frames={cal_frames}  probation≈{int(0.15 * sample.n)}")
-    print("  -- raw --")
-    for prof, s in nab_raw.items():
-        print(format_nab_score(s, 'production'))
-    print("  -- mixed (hybrid+kernel sym) --")
-    for prof, s in nab_mixed.items():
-        print(format_nab_score(s, 'production'))
+    if ensemble:
+        # ensemble 経路: poly / auto / ensemble を横並びで表示
+        print("  -- raw --")
+        for prof in nab_raw.keys():
+            sp, sa, se = nab_raw[prof], nab_auto_raw[prof], nab_ens_raw[prof]
+            print(f"    {prof:<22}  poly_norm={sp.normalized:+7.2f}  "
+                  f"auto_norm={sa.normalized:+7.2f}  ens_norm={se.normalized:+7.2f}")
+        print("  -- mixed (hybrid+kernel sym) --")
+        for prof in nab_mixed.keys():
+            sp, sa, se = nab_mixed[prof], nab_auto_mixed[prof], nab_ens_mixed[prof]
+            print(f"    {prof:<22}  poly_norm={sp.normalized:+7.2f}  "
+                  f"auto_norm={sa.normalized:+7.2f}  ens_norm={se.normalized:+7.2f}")
+    else:
+        print("  -- raw --")
+        for prof, s in nab_raw.items():
+            print(format_nab_score(s, 'production'))
+        print("  -- mixed (hybrid+kernel sym) --")
+        for prof, s in nab_mixed.items():
+            print(format_nab_score(s, 'production'))
 
     # === changepoint metrics (first window only) ===
     info = _build_cp_info(sample)
@@ -164,6 +232,10 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
         'cal_frames': cal_frames,
         'nab_raw': nab_raw,
         'nab_mixed': nab_mixed,
+        'nab_auto_raw': nab_auto_raw,
+        'nab_auto_mixed': nab_auto_mixed,
+        'nab_ens_raw': nab_ens_raw,
+        'nab_ens_mixed': nab_ens_mixed,
         'cp_raw': cp_raw,
         'cp_mixed': cp_mixed,
     }
@@ -198,13 +270,17 @@ def main():
                     help='enable CuPy GPU path (Colab 等)')
     ap.add_argument('--kernel', choices=['poly', 'auto'], default='poly',
                     help='poly: polynomial degree=7 (GPU可)、'
-                         'auto: 90+ kernels (periodic 含む) sweep (CPU, 重い)')
+                         'auto: 90+ kernels (periodic 含む) sweep (GPU可)')
+    ap.add_argument('--ensemble', action='store_true',
+                    help='poly + auto を両方計算し、cal-window z-norm の '
+                         '要素ごと max を ensemble production score とする')
     args = ap.parse_args()
 
     print("=" * 110)
     print(f"NAB benchmark  category={args.category}  windows={args.windows_file}  "
           f"features={args.features}  feat_w={args.feature_window}  "
-          f"gpu={args.use_gpu}  kernel={args.kernel}")
+          f"gpu={args.use_gpu}  kernel={args.kernel}"
+          f"{'  [ENSEMBLE on]' if args.ensemble else ''}")
     print("=" * 110)
 
     rows: List[Dict] = []
@@ -212,7 +288,8 @@ def main():
         rows.append(run_one(sample, n_features=args.features,
                             feature_window=args.feature_window,
                             use_gpu=args.use_gpu,
-                            kernel_mode=args.kernel))
+                            kernel_mode=args.kernel,
+                            ensemble=args.ensemble))
 
     if not rows:
         print("\n(no samples matched)")
@@ -221,17 +298,49 @@ def main():
     print("\n" + "=" * 110)
     print(f"Aggregated NAB scores across {len(rows)} files ({args.category})")
     print("=" * 110)
-    agg_raw   = _agg_nab(rows, 'nab_raw')
-    agg_mixed = _agg_nab(rows, 'nab_mixed')
 
-    print(f"  {'profile':<22}  {'raw_mean':>9}  {'mix_mean':>9}  {'Δ':>7}  "
-          f"{'raw_min':>8}  {'mix_min':>8}  {'raw_max':>8}  {'mix_max':>8}")
-    print("-" * 110)
-    for prof in agg_raw.keys():
-        r = agg_raw[prof]; m = agg_mixed[prof]
-        delta = m['mean'] - r['mean']
-        print(f"  {prof:<22}  {r['mean']:>9.2f}  {m['mean']:>9.2f}  {delta:>+7.2f}  "
-              f"{r['min']:>8.2f}  {m['min']:>8.2f}  {r['max']:>8.2f}  {m['max']:>8.2f}")
+    if args.ensemble:
+        # poly / auto / ensemble × raw / mixed の 6 系統
+        agg_p_r = _agg_nab(rows, 'nab_raw')
+        agg_a_r = _agg_nab(rows, 'nab_auto_raw')
+        agg_e_r = _agg_nab(rows, 'nab_ens_raw')
+        agg_p_m = _agg_nab(rows, 'nab_mixed')
+        agg_a_m = _agg_nab(rows, 'nab_auto_mixed')
+        agg_e_m = _agg_nab(rows, 'nab_ens_mixed')
+
+        print(f"  {'profile':<22}  "
+              f"{'poly_raw':>8}  {'auto_raw':>8}  {'ens_raw':>8}  "
+              f"{'poly_mix':>8}  {'auto_mix':>8}  {'ens_mix':>8}")
+        print("-" * 110)
+        for prof in agg_p_r.keys():
+            print(f"  {prof:<22}  "
+                  f"{agg_p_r[prof]['mean']:>8.2f}  {agg_a_r[prof]['mean']:>8.2f}  "
+                  f"{agg_e_r[prof]['mean']:>8.2f}  "
+                  f"{agg_p_m[prof]['mean']:>8.2f}  {agg_a_m[prof]['mean']:>8.2f}  "
+                  f"{agg_e_m[prof]['mean']:>8.2f}")
+
+        print("\n  3-profile mean (column):")
+        col_means = {
+            'poly_raw': np.mean([agg_p_r[p]['mean'] for p in agg_p_r]),
+            'auto_raw': np.mean([agg_a_r[p]['mean'] for p in agg_a_r]),
+            'ens_raw':  np.mean([agg_e_r[p]['mean'] for p in agg_e_r]),
+            'poly_mix': np.mean([agg_p_m[p]['mean'] for p in agg_p_m]),
+            'auto_mix': np.mean([agg_a_m[p]['mean'] for p in agg_a_m]),
+            'ens_mix':  np.mean([agg_e_m[p]['mean'] for p in agg_e_m]),
+        }
+        for k, v in col_means.items():
+            print(f"    {k:<10} = {v:6.2f}")
+    else:
+        agg_raw   = _agg_nab(rows, 'nab_raw')
+        agg_mixed = _agg_nab(rows, 'nab_mixed')
+        print(f"  {'profile':<22}  {'raw_mean':>9}  {'mix_mean':>9}  {'Δ':>7}  "
+              f"{'raw_min':>8}  {'mix_min':>8}  {'raw_max':>8}  {'mix_max':>8}")
+        print("-" * 110)
+        for prof in agg_raw.keys():
+            r = agg_raw[prof]; m = agg_mixed[prof]
+            delta = m['mean'] - r['mean']
+            print(f"  {prof:<22}  {r['mean']:>9.2f}  {m['mean']:>9.2f}  {delta:>+7.2f}  "
+                  f"{r['min']:>8.2f}  {m['min']:>8.2f}  {r['max']:>8.2f}  {m['max']:>8.2f}")
 
     # changepoint summary (first window)
     cp_rows = [r for r in rows if r['cp_raw'] is not None]
