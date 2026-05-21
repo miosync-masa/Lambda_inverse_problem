@@ -60,40 +60,50 @@ def compute_kernel_gram_matrix_gpu(
     period: float = 10.0,
     length_scale: float = 1.0,
 ) -> "cp.ndarray":
-    """CPU 版 compute_kernel_gram_matrix と数値的に等価な GPU 実装。"""
-    X = ensure_gpu(data)  # (n, d) float32
-    n = X.shape[0]
+    """CPU 版 compute_kernel_gram_matrix と数値的に等価な GPU 実装。
+
+    注: Polynomial (kernel_type=1) は (G + coef0) ** degree を計算するが、
+    events が大きい値 (NAB nyc_taxi の 1000 台、ec2_disk_write の 数百万) で
+    degree=7 にすると float32 では確実に overflow → NaN。CPU 版 @njit は
+    float64 デフォルトなのでこの問題は起きない。GPU でも float64 で計算し、
+    最後に DEFAULT_DTYPE に落とす。
+    """
+    X32 = ensure_gpu(data)         # float32, 距離計算系で使う
+    X64 = X32.astype(cp.float64)   # 多項式・Sigmoid 等の積系で overflow 防止
+    n = X32.shape[0]
 
     if kernel_type == 0:  # RBF
-        D2 = _pairwise_sq_dist_gpu(X)
+        D2 = _pairwise_sq_dist_gpu(X32)
         K = cp.exp(-gamma * D2)
-    elif kernel_type == 1:  # Polynomial
-        G = X @ X.T
+    elif kernel_type == 1:  # Polynomial — float64 で計算 (overflow 回避)
+        G = X64 @ X64.T
         K = (G + coef0) ** degree
-    elif kernel_type == 2:  # Sigmoid
-        G = X @ X.T
+    elif kernel_type == 2:  # Sigmoid — alpha * <x,y> が大きいと tanh 飽和、念のため float64
+        G = X64 @ X64.T
         K = cp.tanh(alpha * G + coef0)
     elif kernel_type == 3:  # Laplacian
-        D1 = _pairwise_l1_dist_gpu(X)
+        D1 = _pairwise_l1_dist_gpu(X32)
         K = cp.exp(-gamma * D1)
     elif kernel_type == 4:  # Periodic
         # periodic: exp(-2 Σ_d sin²(π|x_id-x_jd|/period) / length_scale²)
-        n_total = X.shape[0]
-        K = cp.empty((n_total, n_total), dtype=X.dtype)
+        n_total = X32.shape[0]
+        K = cp.empty((n_total, n_total), dtype=X32.dtype)
         chunk = 512
         inv_period = float(np.pi / period)
         inv_ls2 = float(1.0 / (length_scale ** 2))
         for s in range(0, n_total, chunk):
             e = min(s + chunk, n_total)
-            diff = cp.abs(X[s:e, None, :] - X[None, :, :])
+            diff = cp.abs(X32[s:e, None, :] - X32[None, :, :])
             sin_term = cp.sin(inv_period * diff)
             K[s:e] = cp.exp(-2.0 * inv_ls2 * cp.sum(sin_term * sin_term, axis=-1))
     else:  # default: Laplacian
-        D1 = _pairwise_l1_dist_gpu(X)
+        D1 = _pairwise_l1_dist_gpu(X32)
         K = cp.exp(-gamma * D1)
 
     # 対称化（数値誤差吸収）
     K = 0.5 * (K + K.T)
+    # 非有限を 0 に押し戻す (極端な kernel_type=1 で overflow の救済)
+    K = cp.where(cp.isfinite(K), K, 0.0)
     return K.astype(DEFAULT_DTYPE)
 
 
