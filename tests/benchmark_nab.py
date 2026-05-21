@@ -43,6 +43,18 @@ PROD_WEIGHTS = {'jump': 0.20, 'hybrid': 0.35, 'kernel': 0.30, 'structural': 0.15
 SYM_COMPONENTS = ['hybrid', 'kernel']
 
 
+def _subset_weights(allowed: list) -> dict:
+    """PROD_WEIGHTS を allowed リストでフィルタし、合計 1.0 に再正規化。
+    例: allowed=['jump','hybrid','structural'] →
+        {'jump': 0.286, 'hybrid': 0.500, 'structural': 0.214}
+    """
+    sub = {k: v for k, v in PROD_WEIGHTS.items() if k in allowed}
+    if not sub:
+        raise ValueError(f"no PROD_WEIGHTS match {allowed}")
+    total = sum(sub.values())
+    return {k: v / total for k, v in sub.items()}
+
+
 def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
                             kernel_mode: str = 'poly') -> Dict[str, np.ndarray]:
     """
@@ -120,10 +132,22 @@ def _build_cp_info(sample) -> ChangePointInfo:
 
 def run_one(sample, n_features: int = 5, feature_window: int = 30,
             use_gpu: bool = False, kernel_mode: str = 'poly',
-            ensemble: bool = False) -> Dict:
+            ensemble: bool = False,
+            scorers: list = None) -> Dict:
+    """
+    scorers: production combined に含める scorer の subset。
+        None or 全部 → 既定 (jump, hybrid, kernel, structural)
+        例: ['jump', 'hybrid', 'structural'] → kernel 抜き 3-scorer
+        weights は PROD_WEIGHTS を subset で再正規化。
+    """
+    if scorers is None:
+        scorers = ['jump', 'hybrid', 'kernel', 'structural']
+    use_kernel_in_prod = ('kernel' in scorers)
+
     eff_kernel = 'both' if ensemble else kernel_mode
     print(f"\n■ {sample.name}  n={sample.n}  #windows={len(sample.windows_ts)}  "
-          f"features={n_features}  gpu={use_gpu}  kernel={eff_kernel}"
+          f"features={n_features}  gpu={use_gpu}  kernel={eff_kernel}  "
+          f"scorers={','.join(scorers)}"
           f"{'  [ENSEMBLE]' if ensemble else ''}")
 
     if n_features == 1:
@@ -149,24 +173,31 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
     )
 
     # === production score 構築 ===
+    weights_eff = _subset_weights(scorers)
+    sym_eff = [c for c in SYM_COMPONENTS if c in scorers]
+
     def _combine(kernel_arr, symmetric: bool):
-        comp_subset = {
+        comp_full = {
             'jump': components['jump'],
             'hybrid': components['hybrid'],
             'kernel': kernel_arr,
             'structural': components['structural'],
         }
-        if symmetric:
+        comp_subset = {k: v for k, v in comp_full.items() if k in scorers}
+        if symmetric and sym_eff:
             return ScoreIntegrator(
-                default_weights=PROD_WEIGHTS,
-                symmetric_components=SYM_COMPONENTS,
+                default_weights=weights_eff,
+                symmetric_components=sym_eff,
             ).combine(comp_subset, calibration_frames=cal_frames)
-        return ScoreIntegrator(default_weights=PROD_WEIGHTS).combine(comp_subset)
+        return ScoreIntegrator(default_weights=weights_eff).combine(comp_subset)
 
-    prod_raw = _combine(components['kernel'], symmetric=False)
-    prod_mixed = _combine(components['kernel'], symmetric=True)
+    # kernel 抜きのときは kernel_arr は使われない (comp_subset に入らない)
+    prod_raw = _combine(components.get('kernel'), symmetric=False)
+    prod_mixed = _combine(components.get('kernel'), symmetric=True)
 
-    if ensemble:
+    # kernel 抜き構成 (3-scorer) で ensemble 指定は意味ないので無効化
+    do_ensemble = do_ensemble
+    if do_ensemble:
         prod_auto_raw = _combine(components['kernel_auto'], symmetric=False)
         prod_auto_mixed = _combine(components['kernel_auto'], symmetric=True)
 
@@ -209,7 +240,7 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
     # === NAB Sweeper ===
     nab_raw   = score_all_profiles(sample, prod_raw)
     nab_mixed = score_all_profiles(sample, prod_mixed)
-    if ensemble:
+    if do_ensemble:
         nab_auto_raw   = score_all_profiles(sample, prod_auto_raw)
         nab_auto_mixed = score_all_profiles(sample, prod_auto_mixed)
         nab_ens_raw    = score_all_profiles(sample, prod_ens_raw)
@@ -219,7 +250,7 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
         nab_ens_raw = nab_ens_mixed = None
 
     print(f"  analyze={t_analyze:.1f}s  cal_frames={cal_frames}  probation≈{int(0.15 * sample.n)}")
-    if ensemble:
+    if do_ensemble:
         # ensemble 経路: poly / auto / ensemble を横並びで表示
         print("  -- raw --")
         for prof in nab_raw.keys():
@@ -303,12 +334,25 @@ def main():
     ap.add_argument('--ensemble', action='store_true',
                     help='poly + auto を両方計算し、cal-window z-norm の '
                          '要素ごと max を ensemble production score とする')
+    ap.add_argument('--scorers', default='jump,hybrid,kernel,structural',
+                    help='production combined に含める scorer の subset '
+                         '(comma-separated)。例: '
+                         '"jump,hybrid,structural" で kernel 抜き 3-scorer。'
+                         'weights は PROD_WEIGHTS から再正規化。')
     args = ap.parse_args()
+
+    # --scorers パース
+    scorers_list = [s.strip() for s in args.scorers.split(',') if s.strip()]
+    valid_scorers = {'jump', 'hybrid', 'kernel', 'structural'}
+    invalid = [s for s in scorers_list if s not in valid_scorers]
+    if invalid:
+        raise SystemExit(f"unknown scorer(s): {invalid}, valid={valid_scorers}")
 
     print("=" * 110)
     print(f"NAB benchmark  category={args.category}  windows={args.windows_file}  "
           f"features={args.features}  feat_w={args.feature_window}  "
-          f"gpu={args.use_gpu}  kernel={args.kernel}"
+          f"gpu={args.use_gpu}  kernel={args.kernel}  "
+          f"scorers={args.scorers}"
           f"{'  [ENSEMBLE on]' if args.ensemble else ''}")
     print("=" * 110)
 
@@ -318,7 +362,8 @@ def main():
                             feature_window=args.feature_window,
                             use_gpu=args.use_gpu,
                             kernel_mode=args.kernel,
-                            ensemble=args.ensemble))
+                            ensemble=args.ensemble,
+                            scorers=scorers_list))
 
     if not rows:
         print("\n(no samples matched)")
@@ -328,7 +373,8 @@ def main():
     print(f"Aggregated NAB scores across {len(rows)} files ({args.category})")
     print("=" * 110)
 
-    if args.ensemble:
+    use_ensemble_table = args.ensemble and ('kernel' in scorers_list)
+    if use_ensemble_table:
         # poly / auto / ensemble × raw / mixed の 6 系統
         agg_p_r = _agg_nab(rows, 'nab_raw')
         agg_a_r = _agg_nab(rows, 'nab_auto_raw')
@@ -370,6 +416,11 @@ def main():
             delta = m['mean'] - r['mean']
             print(f"  {prof:<22}  {r['mean']:>9.2f}  {m['mean']:>9.2f}  {delta:>+7.2f}  "
                   f"{r['min']:>8.2f}  {m['min']:>8.2f}  {r['max']:>8.2f}  {m['max']:>8.2f}")
+
+        # 3-profile mean (3-scorer ablation 系で比較しやすくするため)
+        raw_3p = np.mean([agg_raw[p]['mean'] for p in agg_raw])
+        mix_3p = np.mean([agg_mixed[p]['mean'] for p in agg_mixed])
+        print(f"\n  3-profile mean:  raw={raw_3p:6.2f}   mixed={mix_3p:6.2f}")
 
     # changepoint summary (first window)
     cp_rows = [r for r in rows if r['cp_raw'] is not None]
