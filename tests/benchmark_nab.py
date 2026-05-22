@@ -30,6 +30,7 @@ from lambda3_detector.scorers import (
     JumpScorer,
     KernelScorer,
     ScoreIntegrator,
+    StructuralDriftScorer,
     StructuralScorer,
 )
 
@@ -45,6 +46,9 @@ PROD_WEIGHTS = {
     # gradual: multi-scale gradual transition (getter-one extended_detector port)
     # 緩やかな状態異常 (machine_temp の前兆、ambient_temp の遷延的異常) を catch。
     'gradual': 0.20,
+    # state_drift: baseline からの distance 軸 (gradual の derivative 軸と直交)
+    # 状態が遷延する型の異常 (ambient/machine の system failure 居座り) を catch。
+    'state_drift': 0.10,
 }
 SYM_COMPONENTS = ['hybrid', 'kernel']
 
@@ -108,6 +112,8 @@ def compute_scorer_outputs(events: np.ndarray, result, use_gpu: bool = False,
     # gradual transition (getter-one extended_detector port)。
     # CPU 軽量 (scipy gaussian_filter1d だけ)。
     np.random.seed(0); out['gradual']    = GradualTransitionScorer().score(events, result)
+    # state drift: baseline (先頭 ref_window 平均) からの距離
+    np.random.seed(0); out['state_drift'] = StructuralDriftScorer().score(events, result)
     return out
 
 
@@ -192,6 +198,7 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
             'kernel': kernel_arr,
             'structural': components['structural'],
             'gradual': components.get('gradual'),
+            'state_drift': components.get('state_drift'),
         }
         comp_subset = {k: v for k, v in comp_full.items()
                        if k in scorers and v is not None}
@@ -354,7 +361,7 @@ def main():
 
     # --scorers パース
     scorers_list = [s.strip() for s in args.scorers.split(',') if s.strip()]
-    valid_scorers = {'jump', 'hybrid', 'kernel', 'structural', 'gradual'}
+    valid_scorers = {'jump', 'hybrid', 'kernel', 'structural', 'gradual', 'state_drift'}
     invalid = [s for s in scorers_list if s not in valid_scorers]
     if invalid:
         raise SystemExit(f"unknown scorer(s): {invalid}, valid={valid_scorers}")
