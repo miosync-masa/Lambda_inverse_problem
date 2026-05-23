@@ -28,6 +28,7 @@ from lambda3_detector.streaming import (
     Lambda3StreamingDetector,
     StreamingGradualScorer,
     StreamingJumpScorer,
+    StreamingKernelScorer,
     StreamingReconstructionScorer,
     StreamingStructuralDriftScorer,
 )
@@ -53,6 +54,12 @@ def make_detector(percentile: float = 99.0) -> Lambda3StreamingDetector:
             StreamingReconstructionScorer(
                 n_components=5,
                 delay_window=20,
+                percentile=percentile,
+            ),
+            StreamingKernelScorer(
+                kernel='polynomial',
+                degree=3,
+                coef0=1.0,
                 percentile=percentile,
             ),
         ],

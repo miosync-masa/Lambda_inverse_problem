@@ -20,6 +20,7 @@ from .jump_streaming import StreamingJumpScorer
 from .gradual_streaming import StreamingGradualScorer
 from .drift_streaming import StreamingStructuralDriftScorer
 from .reconstruction_streaming import StreamingReconstructionScorer
+from .kernel_streaming import StreamingKernelScorer
 from .detector import Lambda3StreamingDetector
 
 __all__ = [
@@ -28,5 +29,6 @@ __all__ = [
     'StreamingGradualScorer',
     'StreamingStructuralDriftScorer',
     'StreamingReconstructionScorer',
+    'StreamingKernelScorer',
     'Lambda3StreamingDetector',
 ]
