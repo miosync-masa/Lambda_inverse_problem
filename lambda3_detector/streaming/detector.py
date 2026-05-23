@@ -29,12 +29,21 @@ class Lambda3StreamingDetector:
     def __init__(self,
                  scorers: List[StreamingScorer],
                  calibration_ratio: float = 0.15,
-                 min_calibration: int = 50):
+                 min_calibration: int = 50,
+                 normalize: bool = True):
+        """
+        normalize: True なら calibration 区間の feature 毎の (mean, std) を
+            測って全 events を z-normalize してから各 scorer に渡す。
+            scorer は scale-invariant な空間で動作する。
+            NAB の disk_write_bytes (値域 数百万) のような巨大スケール file で
+            一部 scorer が threshold 爆発して dead-zero になるのを防ぐ。
+        """
         if not scorers:
             raise ValueError("at least one scorer required")
         self.scorers = list(scorers)
         self.calibration_ratio = float(calibration_ratio)
         self.min_calibration = int(min_calibration)
+        self.normalize = bool(normalize)
 
     def fit_predict(self, events: np.ndarray) -> dict:
         """Calibrate on the first cal_ratio*n frames, then stream.
@@ -45,12 +54,23 @@ class Lambda3StreamingDetector:
             'per_scorer': dict[scorer_name -> (n,) raw scores]
             'thresholds': dict[scorer_name -> float]
             'cal_end'  : int, index where streaming starts
+            'normalized': bool, whether pre-normalization was applied
         """
         n = len(events)
         cal_end = max(self.min_calibration, int(n * self.calibration_ratio))
         cal_end = min(cal_end, n - 1)
 
-        events_cal = events[:cal_end]
+        # ===== Pre-normalize (z-norm per feature, cal-window-fixed) =====
+        if self.normalize:
+            X = events if events.ndim > 1 else events.reshape(-1, 1)
+            mu = X[:cal_end].mean(axis=0)
+            sd = X[:cal_end].std(axis=0) + 1e-10
+            X_norm = (X - mu) / sd
+            events_used = X_norm.reshape(events.shape) if events.ndim == 1 else X_norm
+        else:
+            events_used = events
+
+        events_cal = events_used[:cal_end]
 
         # ===== Calibration phase =====
         for s in self.scorers:
@@ -67,7 +87,7 @@ class Lambda3StreamingDetector:
                 continue
             best_ratio = 0.0
             for s in self.scorers:
-                raw = float(s.score(events, t))
+                raw = float(s.score(events_used, t))
                 per_scorer_scores[s.name][t] = raw
                 thr = s.threshold
                 if thr > 0 and np.isfinite(thr):
@@ -84,4 +104,5 @@ class Lambda3StreamingDetector:
             'per_scorer': per_scorer_scores,
             'thresholds': {s.name: float(s.threshold) for s in self.scorers},
             'cal_end': int(cal_end),
+            'normalized': self.normalize,
         }

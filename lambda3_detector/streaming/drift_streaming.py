@@ -38,7 +38,10 @@ class StreamingStructuralDriftScorer(StreamingScorer):
         if len(seg) < self._min_window:
             return 0.0
         local = float(np.mean(seg))
-        return float(abs(local - self._ref_mean) / (abs(self._ref_mean) + 1e-10))
+        # detector 側で z-normalize されてる前提では ref_mean ≈ 0、ref_std ≈ 1。
+        # 旧式 |local - ref| / (|ref| + eps) は ref ≈ 0 で爆発するので、
+        # 単純な |local - ref| (= z-score 空間での距離) を返す。
+        return float(abs(local - self._ref_mean))
 
     def calibrate(self, events_cal: np.ndarray) -> None:
         sig = _to_1d(events_cal)
