@@ -52,14 +52,21 @@ def compute_robust_threshold(scores: np.ndarray,
                              percentile: float = 99.0,
                              iqr_k: float = 3.0,
                              mad_k: float = 2.5,
-                             trim_fraction: float = 0.01) -> float:
+                             trim_fraction: float = 0.01,
+                             cap_ratio: float = 5.0,
+                             cap_quantile: float = 90.0) -> float:
     """Robust threshold from a 1-D array of positive scores。
 
     Methods:
-        'percentile'         : np.percentile(scores, percentile)  ← baseline
+        'percentile'         : np.percentile(scores, percentile)         ← baseline
         'trimmed_percentile' : 上位 trim_fraction を除外後の percentile
-        'iqr'                : Q3 + iqr_k * IQR   (Tukey の outlier rule)
+        'iqr'                : Q3 + iqr_k * IQR     (Tukey の outlier rule)
         'mad'                : median + mad_k * 1.4826 * MAD
+        'capped'             : min(percentile, cap_ratio * cap_quantile)
+                               normal continuous tail なら p99 ≈ 2-3 × p90 → p99 そのまま
+                               isolated outlier 混入なら p99 ≫ 5 × p90 → p90 × 5 にクリップ
+                               1 ハイパラ (cap_ratio=5.0)、解釈可能、per-scorer 独立に効く。
+                               Adaptive method selection 相当の挙動を線形式で実現。
 
     sample が少ない (< 5) 場合は inf を返して該当 scorer/regime を無効化する。
     """
@@ -91,6 +98,14 @@ def compute_robust_threshold(scores: np.ndarray,
         if mad <= 0:
             return float(np.percentile(scores, percentile))
         return med + mad_k * 1.4826 * mad
+
+    if method == 'capped':
+        p_main = float(np.percentile(scores, percentile))
+        p_cap = float(np.percentile(scores, cap_quantile))
+        if p_cap <= 0:
+            # cap base 0 → cap 不能、percentile そのまま
+            return p_main
+        return float(min(p_main, cap_ratio * p_cap))
 
     raise ValueError(f"unknown threshold_method: {method!r}")
 
@@ -151,6 +166,8 @@ class RegimeAwareDetector:
                  iqr_k: float = 3.0,
                  mad_k: float = 2.5,
                  trim_fraction: float = 0.01,
+                 cap_ratio: float = 5.0,
+                 cap_quantile: float = 90.0,
                  scorer_factories: Optional[List[Callable]] = None,
                  normalize: bool = True,
                  random_state: int = 0,
@@ -190,7 +207,7 @@ class RegimeAwareDetector:
         self.K_max = int(K_max)
         self.mask_margin = int(mask_margin)
         self.percentile = float(percentile)
-        valid_methods = {'percentile', 'trimmed_percentile', 'iqr', 'mad'}
+        valid_methods = {'percentile', 'trimmed_percentile', 'iqr', 'mad', 'capped'}
         if threshold_method not in valid_methods:
             raise ValueError(
                 f"threshold_method must be one of {valid_methods}, got {threshold_method!r}"
@@ -199,6 +216,8 @@ class RegimeAwareDetector:
         self.iqr_k = float(iqr_k)
         self.mad_k = float(mad_k)
         self.trim_fraction = float(trim_fraction)
+        self.cap_ratio = float(cap_ratio)
+        self.cap_quantile = float(cap_quantile)
         self.normalize = bool(normalize)
         self.random_state = int(random_state)
         self.min_frames_per_regime = int(min_frames_per_regime)
@@ -368,6 +387,8 @@ class RegimeAwareDetector:
                     iqr_k=self.iqr_k,
                     mad_k=self.mad_k,
                     trim_fraction=self.trim_fraction,
+                    cap_ratio=self.cap_ratio,
+                    cap_quantile=self.cap_quantile,
                 )
 
         # 6. streaming: 全 frame の regime を一括予測、frame ごとに OR voting

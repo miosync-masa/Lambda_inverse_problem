@@ -51,6 +51,8 @@ def run_one(sample,
             iqr_k: float = 3.0,
             mad_k: float = 2.5,
             trim_fraction: float = 0.01,
+            cap_ratio: float = 5.0,
+            cap_quantile: float = 90.0,
             min_frames_per_regime: int = 50) -> Dict:
     n_windows = len(sample.windows_ts)
     K_disp = K if isinstance(K, str) else int(K)
@@ -74,6 +76,7 @@ def run_one(sample,
         K=K, K_max=K_max, mask_margin=mask_margin, percentile=percentile,
         threshold_method=threshold_method,
         iqr_k=iqr_k, mad_k=mad_k, trim_fraction=trim_fraction,
+        cap_ratio=cap_ratio, cap_quantile=cap_quantile,
         min_frames_per_regime=min_frames_per_regime,
     )
 
@@ -162,7 +165,7 @@ def main():
     ap.add_argument('--min-frames-per-regime', type=int, default=50,
                     help='各 regime に必要な最小サンプル数 (BIC 採用条件)')
     ap.add_argument('--threshold-method', default='percentile',
-                    choices=['percentile', 'trimmed_percentile', 'iqr', 'mad'],
+                    choices=['percentile', 'trimmed_percentile', 'iqr', 'mad', 'capped'],
                     help='regime ごと threshold 計算手法 (default percentile=baseline)')
     ap.add_argument('--iqr-k', type=float, default=3.0,
                     help='iqr method の係数 (default 3.0)')
@@ -170,6 +173,10 @@ def main():
                     help='mad method の係数 (default 2.5)')
     ap.add_argument('--trim-fraction', type=float, default=0.01,
                     help='trimmed_percentile method の上位除外割合 (default 0.01)')
+    ap.add_argument('--cap-ratio', type=float, default=5.0,
+                    help='capped method: cap = cap_ratio * percentile(cap_quantile) (default 5.0)')
+    ap.add_argument('--cap-quantile', type=float, default=90.0,
+                    help='capped method の cap base quantile (default 90.0)')
     args = ap.parse_args()
 
     # K parse: int or 'auto'
@@ -199,6 +206,7 @@ def main():
             percentile=args.percentile,
             threshold_method=args.threshold_method,
             iqr_k=args.iqr_k, mad_k=args.mad_k, trim_fraction=args.trim_fraction,
+            cap_ratio=args.cap_ratio, cap_quantile=args.cap_quantile,
             min_frames_per_regime=args.min_frames_per_regime,
         )
         if r is not None:
