@@ -41,14 +41,17 @@ def make_anomaly_mask(sample) -> np.ndarray:
 
 
 def run_one(sample,
-            K: int = 3,
+            K=3,
+            K_max: int = 5,
             mask_margin: int = 50,
             n_features: int = 5,
             feature_window: int = 30,
-            percentile: float = 99.0) -> Dict:
+            percentile: float = 99.0,
+            min_frames_per_regime: int = 50) -> Dict:
     n_windows = len(sample.windows_ts)
+    K_disp = K if isinstance(K, str) else int(K)
     print(f"\n■ {sample.name}  n={sample.n}  #windows={n_windows}  "
-          f"K={K}  margin={mask_margin}  features={n_features}  "
+          f"K={K_disp}  margin={mask_margin}  features={n_features}  "
           f"percentile={percentile}  [REGIME]")
 
     if n_features == 1:
@@ -64,7 +67,8 @@ def run_one(sample,
         return None
 
     detector = RegimeAwareDetector(
-        K=K, mask_margin=mask_margin, percentile=percentile,
+        K=K, K_max=K_max, mask_margin=mask_margin, percentile=percentile,
+        min_frames_per_regime=min_frames_per_regime,
     )
 
     t0 = time.perf_counter()
@@ -85,10 +89,15 @@ def run_one(sample,
     regime_dist = " ".join(
         f"k{k}={int((regimes == k).sum())}" for k in range(K_eff)
     )
+    bic_str = ""
+    if result.get('bic_per_K'):
+        bic_str = "  bic={" + ", ".join(
+            f"{k}:{v:.0f}" for k, v in sorted(result['bic_per_K'].items())
+        ) + "}"
 
     print(f"  K_eff={K_eff}  clean_frames={clean_n}  "
           f"total_run={t_run:.1f}s  #flagged={int(binary.sum())}/{sample.n}  "
-          f"regime_dist=[{regime_dist}]")
+          f"regime_dist=[{regime_dist}]{bic_str}")
 
     # threshold print: regime 別の dict を見やすく
     for k in range(K_eff):
@@ -137,15 +146,29 @@ def main():
     ap.add_argument('--features', type=int, default=5, choices=[1, 5])
     ap.add_argument('--feature-window', type=int, default=30)
     ap.add_argument('--percentile', type=float, default=99.0)
-    ap.add_argument('--K', type=int, default=3,
-                    help='GMM 成分数 (regime 数)')
+    ap.add_argument('--K', default='auto',
+                    help='GMM 成分数 (regime 数)。int (1-K_max) または "auto" '
+                         '("auto" は BIC 自動選択、default)')
+    ap.add_argument('--K-max', type=int, default=5,
+                    help='K="auto" のときの最大候補 (default 5)')
     ap.add_argument('--mask-margin', type=int, default=50,
                     help='anomaly window 前後の除外マージン (frame)')
+    ap.add_argument('--min-frames-per-regime', type=int, default=50,
+                    help='各 regime に必要な最小サンプル数 (BIC 採用条件)')
     args = ap.parse_args()
 
+    # K parse: int or 'auto'
+    K_raw = args.K
+    if isinstance(K_raw, str) and K_raw.lower() == 'auto':
+        K_param = 'auto'
+    else:
+        K_param = int(K_raw)
+
     print("=" * 110)
+    K_disp = K_param if isinstance(K_param, str) else int(K_param)
     print(f"NAB REGIME-AWARE benchmark  category={args.category}  "
-          f"K={args.K}  mask_margin={args.mask_margin}  "
+          f"K={K_disp}  K_max={args.K_max}  mask_margin={args.mask_margin}  "
+          f"min_frames_per_regime={args.min_frames_per_regime}  "
           f"windows={args.windows_file}  features={args.features}  "
           f"percentile={args.percentile}")
     print("=" * 110)
@@ -154,9 +177,11 @@ def main():
     for sample in iter_category(args.category, windows_file=args.windows_file):
         r = run_one(
             sample,
-            K=args.K, mask_margin=args.mask_margin,
+            K=K_param, K_max=args.K_max,
+            mask_margin=args.mask_margin,
             n_features=args.features, feature_window=args.feature_window,
             percentile=args.percentile,
+            min_frames_per_regime=args.min_frames_per_regime,
         )
         if r is not None:
             rows.append(r)

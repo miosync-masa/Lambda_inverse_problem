@@ -24,7 +24,7 @@ Anomaly の "shape" は使用しない (window 除外のみ):
 
 from __future__ import annotations
 
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Union
 
 import numpy as np
 
@@ -95,24 +95,37 @@ class RegimeAwareDetector:
     """K-regime GMM + per-regime threshold + OR voting。"""
 
     def __init__(self,
-                 K: int = 3,
+                 K: Union[int, str] = 'auto',
+                 K_max: int = 5,
                  mask_margin: int = 50,
                  percentile: float = 99.0,
                  scorer_factories: Optional[List[Callable]] = None,
                  normalize: bool = True,
                  random_state: int = 0,
-                 min_frames_per_regime: int = 20):
+                 min_frames_per_regime: int = 50):
         """
         Args:
-            K: GMM 成分数 (v1 固定、サンプル数が足りなければ自動縮小)
+            K: GMM 成分数。int で固定 (1-K_max)、'auto' で BIC 自動選択。
+               'auto' のとき K_min=1 から K_max まで全て fit し、
+               「最小クラスタが min_frames_per_regime 以上」かつ BIC 最小の K を選ぶ。
+               artificialWithAnomaly の synthetic data 等で K=1 が最適なケースに対応。
+            K_max: K='auto' の最大候補数 (default 5)
             mask_margin: anomaly window の前後 margin (frame)
             percentile: regime ごとの threshold percentile
             scorer_factories: 各 scorer を返す callable list (None で default 6)
             normalize: clean 統計量で z-normalize
             random_state: GMM 再現性
-            min_frames_per_regime: regime k のサンプルがこれ未満なら threshold=inf
+            min_frames_per_regime: regime k のサンプルがこれ未満ならその K は不採用
+                (default 50: K=3 fixed のとき k_size=4-19 の noise regime が
+                 inf threshold を出す問題を BIC で根本解決)
         """
-        self.K = int(K)
+        if isinstance(K, str):
+            if K.lower() != 'auto':
+                raise ValueError(f"K must be int or 'auto', got {K!r}")
+            self.K: Union[int, str] = 'auto'
+        else:
+            self.K = max(1, int(K))
+        self.K_max = int(K_max)
         self.mask_margin = int(mask_margin)
         self.percentile = float(percentile)
         self.normalize = bool(normalize)
@@ -131,6 +144,71 @@ class RegimeAwareDetector:
         self.clean_mu: Optional[np.ndarray] = None
         self.clean_sd: Optional[np.ndarray] = None
         self.cal_clean_frames: int = 0
+        self.bic_per_K: Dict[int, float] = {}
+
+    def _fit_gmm_adaptive(self, clean: np.ndarray) -> tuple:
+        """K∈[1, K_upper] を試して、最小クラスタが min_frames_per_regime
+        以上を満たす範囲で BIC 最小の K を選ぶ。
+
+        K が int 指定の場合: K 固定 (clean サンプル数で自動縮小のみ)。
+        K='auto' の場合: BIC 自動選択。
+
+        Returns:
+            (gmm, K_eff, bic_per_K_dict)
+        """
+        n_clean = len(clean)
+        # 上限: clean サンプル数で物理的に制限 (各 cluster 最低 min_frames_per_regime)
+        K_physical_max = max(1, n_clean // self.min_frames_per_regime)
+
+        if self.K == 'auto':
+            K_upper = min(self.K_max, K_physical_max)
+            candidates = list(range(1, K_upper + 1))
+        else:
+            K_target = min(int(self.K), K_physical_max)
+            candidates = [max(1, K_target)]
+
+        bic_per_K: Dict[int, float] = {}
+        best_K = 1
+        best_bic = float('inf')
+        best_gmm = None
+
+        for K in candidates:
+            try:
+                gmm = GaussianMixture(
+                    n_components=K,
+                    covariance_type='full',
+                    random_state=self.random_state,
+                    reg_covar=1e-6,
+                    max_iter=200,
+                )
+                gmm.fit(clean)
+            except Exception:
+                continue
+            # 全 cluster が min_frames_per_regime 以上か?
+            labels = gmm.predict(clean)
+            sizes = np.bincount(labels, minlength=K)
+            min_size = int(sizes.min())
+            bic = float(gmm.bic(clean))
+            bic_per_K[K] = bic
+            if min_size < self.min_frames_per_regime:
+                # noise cluster あり → 不採用 (K='auto' 時)
+                continue
+            if bic < best_bic:
+                best_bic = bic
+                best_K = K
+                best_gmm = gmm
+
+        # fallback: K=1 (clean 全体を 1 cluster と見做す)
+        if best_gmm is None:
+            best_K = 1
+            best_gmm = GaussianMixture(
+                n_components=1, covariance_type='full',
+                random_state=self.random_state, reg_covar=1e-6, max_iter=200,
+            ).fit(clean)
+            if 1 not in bic_per_K:
+                bic_per_K[1] = float(best_gmm.bic(clean))
+
+        return best_gmm, best_K, bic_per_K
 
     def fit_predict(self, events: np.ndarray, anomaly_mask: np.ndarray) -> dict:
         """One-shot: regime fit (offline) + per-frame streaming OR voting。
@@ -181,17 +259,9 @@ class RegimeAwareDetector:
         clean = events_used[~expanded_mask]
         self.cal_clean_frames = len(clean)
 
-        # 3. GMM fit (K_eff = min(K, clean_size // min_frames_per_regime / 2))
-        K_eff = max(1, min(self.K, len(clean) // (self.min_frames_per_regime * 2)))
+        # 3. GMM fit: K 固定 or BIC 自動選択
+        self.gmm, K_eff, self.bic_per_K = self._fit_gmm_adaptive(clean)
         self.K_eff = K_eff
-        self.gmm = GaussianMixture(
-            n_components=K_eff,
-            covariance_type='full',
-            random_state=self.random_state,
-            reg_covar=1e-6,
-            max_iter=200,
-        )
-        self.gmm.fit(clean)
         regime_labels_clean = self.gmm.predict(clean)
 
         # 4. 全 clean data で scorer を calibrate (共通 baseline)
@@ -256,6 +326,8 @@ class RegimeAwareDetector:
             'thresholds_per_regime': self.thresholds_per_regime,
             'regimes': regimes_all,
             'K_eff': K_eff,
+            'K_requested': self.K,
+            'bic_per_K': self.bic_per_K,
             'cal_clean_frames': self.cal_clean_frames,
             'mask_margin': self.mask_margin,
             'normalized': self.normalize,
