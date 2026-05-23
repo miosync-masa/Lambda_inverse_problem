@@ -31,6 +31,7 @@ from lambda3_detector.streaming import (
     StreamingKernelScorer,
     StreamingReconstructionScorer,
     StreamingStructuralDriftScorer,
+    StreamingStructuralScorer,
 )
 
 from tests.nab_datasets import iter_category
@@ -60,6 +61,10 @@ def make_detector(percentile: float = 99.0) -> Lambda3StreamingDetector:
                 kernel='polynomial',
                 degree=3,
                 coef0=1.0,
+                percentile=percentile,
+            ),
+            StreamingStructuralScorer(
+                delay_window=20,
                 percentile=percentile,
             ),
         ],
