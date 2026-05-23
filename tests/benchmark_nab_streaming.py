@@ -68,10 +68,14 @@ def make_detector(percentile: float = 99.0) -> Lambda3StreamingDetector:
                 delay_window=20,
                 percentile=percentile,
             ),
-            StreamingPeriodicScorer(
-                min_period=12,        # 1時間粒度なら 12h、5分粒度なら 1h 想定
-                percentile=percentile,
-            ),
+            # NOTE: StreamingPeriodicScorer は default 構成から外している。
+            #   理由 (realKnownCause 7-file 実測):
+            #     - ambient_temp (季節 drift で calibration 不整合) で救済不能
+            #     - nyc_taxi で noise floor 上昇により -10.96 ポイント副作用
+            #     - 6-scorer 比 net mean は -1.10
+            #   思想は正しいが static calibration の streaming 設計と相性悪く、
+            #   adaptive baseline (EWMA 等) が必須。研究課題として温存。
+            # StreamingPeriodicScorer(min_period=12, percentile=percentile),
         ],
         calibration_ratio=0.15,
         min_calibration=50,
