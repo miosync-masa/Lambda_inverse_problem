@@ -47,12 +47,16 @@ def run_one(sample,
             n_features: int = 5,
             feature_window: int = 30,
             percentile: float = 99.0,
+            threshold_method: str = 'percentile',
+            iqr_k: float = 3.0,
+            mad_k: float = 2.5,
+            trim_fraction: float = 0.01,
             min_frames_per_regime: int = 50) -> Dict:
     n_windows = len(sample.windows_ts)
     K_disp = K if isinstance(K, str) else int(K)
     print(f"\n■ {sample.name}  n={sample.n}  #windows={n_windows}  "
           f"K={K_disp}  margin={mask_margin}  features={n_features}  "
-          f"percentile={percentile}  [REGIME]")
+          f"percentile={percentile}  thr_method={threshold_method}  [REGIME]")
 
     if n_features == 1:
         events = sample.values
@@ -68,6 +72,8 @@ def run_one(sample,
 
     detector = RegimeAwareDetector(
         K=K, K_max=K_max, mask_margin=mask_margin, percentile=percentile,
+        threshold_method=threshold_method,
+        iqr_k=iqr_k, mad_k=mad_k, trim_fraction=trim_fraction,
         min_frames_per_regime=min_frames_per_regime,
     )
 
@@ -155,6 +161,15 @@ def main():
                     help='anomaly window 前後の除外マージン (frame)')
     ap.add_argument('--min-frames-per-regime', type=int, default=50,
                     help='各 regime に必要な最小サンプル数 (BIC 採用条件)')
+    ap.add_argument('--threshold-method', default='percentile',
+                    choices=['percentile', 'trimmed_percentile', 'iqr', 'mad'],
+                    help='regime ごと threshold 計算手法 (default percentile=baseline)')
+    ap.add_argument('--iqr-k', type=float, default=3.0,
+                    help='iqr method の係数 (default 3.0)')
+    ap.add_argument('--mad-k', type=float, default=2.5,
+                    help='mad method の係数 (default 2.5)')
+    ap.add_argument('--trim-fraction', type=float, default=0.01,
+                    help='trimmed_percentile method の上位除外割合 (default 0.01)')
     args = ap.parse_args()
 
     # K parse: int or 'auto'
@@ -169,6 +184,7 @@ def main():
     print(f"NAB REGIME-AWARE benchmark  category={args.category}  "
           f"K={K_disp}  K_max={args.K_max}  mask_margin={args.mask_margin}  "
           f"min_frames_per_regime={args.min_frames_per_regime}  "
+          f"thr_method={args.threshold_method}  "
           f"windows={args.windows_file}  features={args.features}  "
           f"percentile={args.percentile}")
     print("=" * 110)
@@ -181,6 +197,8 @@ def main():
             mask_margin=args.mask_margin,
             n_features=args.features, feature_window=args.feature_window,
             percentile=args.percentile,
+            threshold_method=args.threshold_method,
+            iqr_k=args.iqr_k, mad_k=args.mad_k, trim_fraction=args.trim_fraction,
             min_frames_per_regime=args.min_frames_per_regime,
         )
         if r is not None:

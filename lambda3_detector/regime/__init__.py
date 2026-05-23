@@ -18,6 +18,14 @@ NAB context では combined_windows.json から anomaly_mask を作る。
 production では operator-tagged post-mortem 記録に相当。
 """
 
-from .regime_detector import RegimeAwareDetector, expand_anomaly_mask
+from .regime_detector import (
+    RegimeAwareDetector,
+    compute_robust_threshold,
+    expand_anomaly_mask,
+)
 
-__all__ = ['RegimeAwareDetector', 'expand_anomaly_mask']
+__all__ = [
+    'RegimeAwareDetector',
+    'compute_robust_threshold',
+    'expand_anomaly_mask',
+]

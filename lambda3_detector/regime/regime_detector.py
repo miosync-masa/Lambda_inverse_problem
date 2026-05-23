@@ -47,6 +47,54 @@ from ..streaming import (
 )
 
 
+def compute_robust_threshold(scores: np.ndarray,
+                             method: str = 'percentile',
+                             percentile: float = 99.0,
+                             iqr_k: float = 3.0,
+                             mad_k: float = 2.5,
+                             trim_fraction: float = 0.01) -> float:
+    """Robust threshold from a 1-D array of positive scores。
+
+    Methods:
+        'percentile'         : np.percentile(scores, percentile)  ← baseline
+        'trimmed_percentile' : 上位 trim_fraction を除外後の percentile
+        'iqr'                : Q3 + iqr_k * IQR   (Tukey の outlier rule)
+        'mad'                : median + mad_k * 1.4826 * MAD
+
+    sample が少ない (< 5) 場合は inf を返して該当 scorer/regime を無効化する。
+    """
+    if scores.size < 5:
+        return float('inf')
+
+    if method == 'percentile':
+        return float(np.percentile(scores, percentile))
+
+    if method == 'trimmed_percentile':
+        # 上位 trim_fraction を除外してから percentile
+        trim_cut = float(np.percentile(scores, 100.0 * (1.0 - trim_fraction)))
+        trimmed = scores[scores <= trim_cut]
+        if trimmed.size < 5:
+            return trim_cut
+        return float(np.percentile(trimmed, percentile))
+
+    if method == 'iqr':
+        q1, q3 = np.percentile(scores, [25.0, 75.0])
+        iqr = float(q3 - q1)
+        if iqr <= 0:
+            # 分布が degenerate (median = Q3) → fallback to percentile
+            return float(np.percentile(scores, percentile))
+        return float(q3 + iqr_k * iqr)
+
+    if method == 'mad':
+        med = float(np.median(scores))
+        mad = float(np.median(np.abs(scores - med)))
+        if mad <= 0:
+            return float(np.percentile(scores, percentile))
+        return med + mad_k * 1.4826 * mad
+
+    raise ValueError(f"unknown threshold_method: {method!r}")
+
+
 def expand_anomaly_mask(mask: np.ndarray, margin: int) -> np.ndarray:
     """anomaly window を前後 margin frame 拡張する (boundary leakage 防止)。
 
@@ -99,6 +147,10 @@ class RegimeAwareDetector:
                  K_max: int = 5,
                  mask_margin: int = 50,
                  percentile: float = 99.0,
+                 threshold_method: str = 'percentile',
+                 iqr_k: float = 3.0,
+                 mad_k: float = 2.5,
+                 trim_fraction: float = 0.01,
                  scorer_factories: Optional[List[Callable]] = None,
                  normalize: bool = True,
                  random_state: int = 0,
@@ -111,7 +163,17 @@ class RegimeAwareDetector:
                artificialWithAnomaly の synthetic data 等で K=1 が最適なケースに対応。
             K_max: K='auto' の最大候補数 (default 5)
             mask_margin: anomaly window の前後 margin (frame)
-            percentile: regime ごとの threshold percentile
+            percentile: 'percentile' / 'trimmed_percentile' 用 percentile (default 99)
+            threshold_method: regime ごとの threshold 計算手法
+                - 'percentile'         : np.percentile(scores, percentile)   ← baseline
+                - 'trimmed_percentile' : 上位 trim_fraction を除外後の percentile
+                - 'iqr'                : Q3 + iqr_k * IQR   (Tukey の outlier rule)
+                - 'mad'                : median + mad_k * 1.4826 * MAD
+                rare extreme value (training 内 outlier) が threshold を爆発させる
+                ケース (realAWSCloudwatch/grok_asg, iio_us-east-1) を救う狙い。
+            iqr_k: 'iqr' method の係数 (default 3.0、Tukey extreme outlier)
+            mad_k: 'mad' method の係数 (default 2.5、~99% 相当)
+            trim_fraction: 'trimmed_percentile' method の上位除外割合 (default 0.01)
             scorer_factories: 各 scorer を返す callable list (None で default 6)
             normalize: clean 統計量で z-normalize
             random_state: GMM 再現性
@@ -128,6 +190,15 @@ class RegimeAwareDetector:
         self.K_max = int(K_max)
         self.mask_margin = int(mask_margin)
         self.percentile = float(percentile)
+        valid_methods = {'percentile', 'trimmed_percentile', 'iqr', 'mad'}
+        if threshold_method not in valid_methods:
+            raise ValueError(
+                f"threshold_method must be one of {valid_methods}, got {threshold_method!r}"
+            )
+        self.threshold_method = threshold_method
+        self.iqr_k = float(iqr_k)
+        self.mad_k = float(mad_k)
+        self.trim_fraction = float(trim_fraction)
         self.normalize = bool(normalize)
         self.random_state = int(random_state)
         self.min_frames_per_regime = int(min_frames_per_regime)
@@ -290,12 +361,14 @@ class RegimeAwareDetector:
             for s in self.scorers:
                 scores_k = clean_scores_by_scorer[s.name][mask_k]
                 positive = scores_k[scores_k > 1e-12]
-                if len(positive) > 5:
-                    self.thresholds_per_regime[k][s.name] = float(
-                        np.percentile(positive, self.percentile)
-                    )
-                else:
-                    self.thresholds_per_regime[k][s.name] = float('inf')
+                self.thresholds_per_regime[k][s.name] = compute_robust_threshold(
+                    positive,
+                    method=self.threshold_method,
+                    percentile=self.percentile,
+                    iqr_k=self.iqr_k,
+                    mad_k=self.mad_k,
+                    trim_fraction=self.trim_fraction,
+                )
 
         # 6. streaming: 全 frame の regime を一括予測、frame ごとに OR voting
         regimes_all = self.gmm.predict(events_used).astype(np.int32)
