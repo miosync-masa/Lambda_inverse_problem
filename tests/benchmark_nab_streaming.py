@@ -29,6 +29,7 @@ from lambda3_detector.streaming import (
     StreamingGradualScorer,
     StreamingJumpScorer,
     StreamingKernelScorer,
+    StreamingPeriodicScorer,
     StreamingReconstructionScorer,
     StreamingStructuralDriftScorer,
     StreamingStructuralScorer,
@@ -65,6 +66,10 @@ def make_detector(percentile: float = 99.0) -> Lambda3StreamingDetector:
             ),
             StreamingStructuralScorer(
                 delay_window=20,
+                percentile=percentile,
+            ),
+            StreamingPeriodicScorer(
+                min_period=12,        # 1時間粒度なら 12h、5分粒度なら 1h 想定
                 percentile=percentile,
             ),
         ],
