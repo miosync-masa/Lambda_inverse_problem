@@ -53,6 +53,7 @@ def run_one(sample,
             trim_fraction: float = 0.01,
             cap_ratio: float = 5.0,
             cap_quantile: float = 90.0,
+            cap_min_regime_size: int = 300,
             min_frames_per_regime: int = 50) -> Dict:
     n_windows = len(sample.windows_ts)
     K_disp = K if isinstance(K, str) else int(K)
@@ -77,6 +78,7 @@ def run_one(sample,
         threshold_method=threshold_method,
         iqr_k=iqr_k, mad_k=mad_k, trim_fraction=trim_fraction,
         cap_ratio=cap_ratio, cap_quantile=cap_quantile,
+        cap_min_regime_size=cap_min_regime_size,
         min_frames_per_regime=min_frames_per_regime,
     )
 
@@ -177,6 +179,8 @@ def main():
                     help='capped method: cap = cap_ratio * percentile(cap_quantile) (default 5.0)')
     ap.add_argument('--cap-quantile', type=float, default=90.0,
                     help='capped method の cap base quantile (default 90.0)')
+    ap.add_argument('--cap-min-regime-size', type=int, default=300,
+                    help='capped を有効化する最小 regime サイズ (default 300、未満は percentile fallback)')
     args = ap.parse_args()
 
     # K parse: int or 'auto'
@@ -207,6 +211,7 @@ def main():
             threshold_method=args.threshold_method,
             iqr_k=args.iqr_k, mad_k=args.mad_k, trim_fraction=args.trim_fraction,
             cap_ratio=args.cap_ratio, cap_quantile=args.cap_quantile,
+            cap_min_regime_size=args.cap_min_regime_size,
             min_frames_per_regime=args.min_frames_per_regime,
         )
         if r is not None:

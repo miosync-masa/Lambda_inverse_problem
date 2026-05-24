@@ -168,6 +168,7 @@ class RegimeAwareDetector:
                  trim_fraction: float = 0.01,
                  cap_ratio: float = 5.0,
                  cap_quantile: float = 90.0,
+                 cap_min_regime_size: int = 300,
                  scorer_factories: Optional[List[Callable]] = None,
                  normalize: bool = True,
                  random_state: int = 0,
@@ -191,6 +192,10 @@ class RegimeAwareDetector:
             iqr_k: 'iqr' method の係数 (default 3.0、Tukey extreme outlier)
             mad_k: 'mad' method の係数 (default 2.5、~99% 相当)
             trim_fraction: 'trimmed_percentile' method の上位除外割合 (default 0.01)
+            cap_min_regime_size: 'capped' を有効化する最小 regime サンプル数 (default 300)。
+                これ未満の regime では cap を無効化し percentile に fallback。
+                小 regime では sample 数不足で p99/p90 > 5 が自然変動でも発生し、
+                cap 誤発動が FP cascade を引き起こすため。
             scorer_factories: 各 scorer を返す callable list (None で default 6)
             normalize: clean 統計量で z-normalize
             random_state: GMM 再現性
@@ -218,6 +223,7 @@ class RegimeAwareDetector:
         self.trim_fraction = float(trim_fraction)
         self.cap_ratio = float(cap_ratio)
         self.cap_quantile = float(cap_quantile)
+        self.cap_min_regime_size = int(cap_min_regime_size)
         self.normalize = bool(normalize)
         self.random_state = int(random_state)
         self.min_frames_per_regime = int(min_frames_per_regime)
@@ -372,11 +378,16 @@ class RegimeAwareDetector:
 
         for k in range(K_eff):
             mask_k = (regime_labels_clean == k)
-            if int(mask_k.sum()) < self.min_frames_per_regime:
+            n_k = int(mask_k.sum())
+            if n_k < self.min_frames_per_regime:
                 # サンプル不足 → 無限大 threshold で実質無効化
                 for s in self.scorers:
                     self.thresholds_per_regime[k][s.name] = float('inf')
                 continue
+            # cap_ratio adaptive: 小 regime では cap 無効化 (percentile fallback)
+            cap_ratio_k = (
+                self.cap_ratio if n_k >= self.cap_min_regime_size else float('inf')
+            )
             for s in self.scorers:
                 scores_k = clean_scores_by_scorer[s.name][mask_k]
                 positive = scores_k[scores_k > 1e-12]
@@ -387,7 +398,7 @@ class RegimeAwareDetector:
                     iqr_k=self.iqr_k,
                     mad_k=self.mad_k,
                     trim_fraction=self.trim_fraction,
-                    cap_ratio=self.cap_ratio,
+                    cap_ratio=cap_ratio_k,
                     cap_quantile=self.cap_quantile,
                 )
 
