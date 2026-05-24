@@ -20,12 +20,14 @@ production では operator-tagged post-mortem 記録に相当。
 
 from .regime_detector import (
     RegimeAwareDetector,
+    adaptive_anomaly_mask,
     compute_robust_threshold,
     expand_anomaly_mask,
 )
 
 __all__ = [
     'RegimeAwareDetector',
+    'adaptive_anomaly_mask',
     'compute_robust_threshold',
     'expand_anomaly_mask',
 ]

@@ -44,6 +44,11 @@ def run_one(sample,
             K=3,
             K_max: int = 5,
             mask_margin: int = 50,
+            margin_adaptive: bool = False,
+            margin_max: int = 300,
+            margin_max_exclusion_ratio: float = 0.4,
+            margin_recovery_window: int = 30,
+            margin_variance_ratio: float = 2.0,
             n_features: int = 5,
             feature_window: int = 30,
             percentile: float = 99.0,
@@ -75,6 +80,11 @@ def run_one(sample,
 
     detector = RegimeAwareDetector(
         K=K, K_max=K_max, mask_margin=mask_margin, percentile=percentile,
+        margin_adaptive=margin_adaptive,
+        margin_max=margin_max,
+        margin_max_exclusion_ratio=margin_max_exclusion_ratio,
+        margin_recovery_window=margin_recovery_window,
+        margin_variance_ratio=margin_variance_ratio,
         threshold_method=threshold_method,
         iqr_k=iqr_k, mad_k=mad_k, trim_fraction=trim_fraction,
         cap_ratio=cap_ratio, cap_quantile=cap_quantile,
@@ -106,9 +116,20 @@ def run_one(sample,
             f"{k}:{v:.0f}" for k, v in sorted(result['bic_per_K'].items())
         ) + "}"
 
+    margin_str = ""
+    minfo = getattr(detector, 'margin_info', None)
+    if minfo is not None:
+        margin_str = (
+            f"  margin_adaptive: pre={minfo['avg_margin_pre']:.0f} "
+            f"post={minfo['avg_margin_post']:.0f} "
+            f"excl_pre={minfo['exclusion_ratio_pre_cap']:.1%} "
+            f"excl_final={minfo['exclusion_ratio_final']:.1%} "
+            f"eff_cap={minfo['effective_margin_after_cap']}"
+        )
+
     print(f"  K_eff={K_eff}  clean_frames={clean_n}  "
           f"total_run={t_run:.1f}s  #flagged={int(binary.sum())}/{sample.n}  "
-          f"regime_dist=[{regime_dist}]{bic_str}")
+          f"regime_dist=[{regime_dist}]{bic_str}{margin_str}")
 
     # threshold print: regime 別の dict を見やすく
     for k in range(K_eff):
@@ -163,7 +184,17 @@ def main():
     ap.add_argument('--K-max', type=int, default=5,
                     help='K="auto" のときの最大候補 (default 5)')
     ap.add_argument('--mask-margin', type=int, default=50,
-                    help='anomaly window 前後の除外マージン (frame)')
+                    help='anomaly window 前後の除外マージン (frame、固定 or adaptive 時の base)')
+    ap.add_argument('--margin-adaptive', action='store_true',
+                    help='adaptive_anomaly_mask を有効化 (gradual leak 検出 + 総除外率 cap)')
+    ap.add_argument('--margin-max', type=int, default=300,
+                    help='adaptive 延長の上限 frame (default 300)')
+    ap.add_argument('--margin-max-exclusion-ratio', type=float, default=0.4,
+                    help='総除外率の cap (default 0.4 = 40%)')
+    ap.add_argument('--margin-recovery-window', type=int, default=30,
+                    help='local variance を測る window size (default 30)')
+    ap.add_argument('--margin-variance-ratio', type=float, default=2.0,
+                    help='baseline の何倍までを recovered と見るか (default 2.0)')
     ap.add_argument('--min-frames-per-regime', type=int, default=50,
                     help='各 regime に必要な最小サンプル数 (BIC 採用条件)')
     ap.add_argument('--threshold-method', default='percentile',
@@ -206,6 +237,11 @@ def main():
             sample,
             K=K_param, K_max=args.K_max,
             mask_margin=args.mask_margin,
+            margin_adaptive=args.margin_adaptive,
+            margin_max=args.margin_max,
+            margin_max_exclusion_ratio=args.margin_max_exclusion_ratio,
+            margin_recovery_window=args.margin_recovery_window,
+            margin_variance_ratio=args.margin_variance_ratio,
             n_features=args.features, feature_window=args.feature_window,
             percentile=args.percentile,
             threshold_method=args.threshold_method,

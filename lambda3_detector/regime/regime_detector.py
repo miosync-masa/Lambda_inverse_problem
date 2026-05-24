@@ -133,6 +133,157 @@ def expand_anomaly_mask(mask: np.ndarray, margin: int) -> np.ndarray:
     return out
 
 
+def adaptive_anomaly_mask(events: np.ndarray,
+                          anomaly_mask: np.ndarray,
+                          base_margin: int = 50,
+                          max_margin: int = 300,
+                          max_exclusion_ratio: float = 0.4,
+                          recovery_window: int = 30,
+                          variance_ratio: float = 2.0) -> tuple:
+    """Adaptive anomaly margin expansion。
+
+    2 つの問題を同時に解決:
+      (1) gradual leak: anomaly window 前後の transient (recovery) 期間が
+          baseline variance に戻るまで margin 延長 (max_margin で上限)
+      (2) clean shrink: 総除外率が max_exclusion_ratio を超えたら
+          base_margin より縮小 (多窓 file での clean サンプル不足防止)
+
+    アルゴリズム:
+      1. baseline variance = events[mask_far_from_anomaly] の std
+      2. 各 window の前後 max_margin 範囲を walk:
+           local variance > variance_ratio * baseline_variance なら margin 延長
+           recovered (or max_margin 到達) で break
+      3. base_margin 最低保証で OR 合成
+      4. 総除外率 > max_exclusion_ratio なら margin を縮小して再構築
+
+    Args:
+        events: (n,) or (n, d) z-normalize 前の生 events
+        anomaly_mask: (n,) bool
+        base_margin: 最低保証 margin (default 50)
+        max_margin: 適応延長の上限 (default 300)
+        max_exclusion_ratio: 総除外率の上限 (default 0.4 = 40%)
+        recovery_window: local variance を測る windowsize (default 30)
+        variance_ratio: baseline の何倍までを "recovered" とみなすか (default 2.0)
+
+    Returns:
+        (expanded_mask, info_dict)
+        info_dict: {
+            'baseline_std': float,
+            'avg_margin_pre': float, 'avg_margin_post': float,
+            'exclusion_ratio_pre_cap': float,
+            'exclusion_ratio_final': float,
+            'effective_margin_after_cap': int,
+        }
+    """
+    n = len(anomaly_mask)
+    if events.ndim == 1:
+        sig_1d = events
+    else:
+        sig_1d = events.mean(axis=1)
+
+    # 1. baseline variance from frames far from any anomaly
+    safe_mask = expand_anomaly_mask(anomaly_mask, max_margin)
+    safe_frames = sig_1d[~safe_mask]
+    if len(safe_frames) < 100:
+        # 安全 baseline 不足 → fallback to base_margin
+        return expand_anomaly_mask(anomaly_mask, base_margin), {
+            'baseline_std': float('nan'),
+            'avg_margin_pre': float(base_margin),
+            'avg_margin_post': float(base_margin),
+            'exclusion_ratio_pre_cap': float(safe_mask.sum() / n),
+            'exclusion_ratio_final': float(
+                expand_anomaly_mask(anomaly_mask, base_margin).sum() / n
+            ),
+            'effective_margin_after_cap': int(base_margin),
+            'fallback': True,
+        }
+
+    baseline_std = float(np.std(safe_frames))
+    threshold_std = variance_ratio * baseline_std
+
+    # 2. find contiguous anomaly windows
+    diff = np.diff(
+        np.concatenate([[False], anomaly_mask, [False]]).astype(np.int8)
+    )
+    starts = np.where(diff == 1)[0]
+    ends = np.where(diff == -1)[0] - 1
+
+    expanded = anomaly_mask.copy()
+    margins_pre = []
+    margins_post = []
+    half_win = recovery_window // 2
+
+    def _local_std(i: int) -> float:
+        lo = max(0, i - half_win)
+        hi = min(n, i + half_win + 1)
+        seg = sig_1d[lo:hi]
+        if len(seg) < 5:
+            return float('inf')
+        return float(np.std(seg))
+
+    for s_idx, e_idx in zip(starts, ends):
+        # Forward (after window end): extend until recovered
+        pe = 0
+        for off in range(1, max_margin + 1):
+            i = e_idx + off
+            if i >= n:
+                break
+            if _local_std(i) <= threshold_std and off >= base_margin:
+                pe = off
+                break
+            expanded[i] = True
+            pe = off
+        margins_post.append(pe)
+
+        # Backward (before window start): extend until normalcy
+        pb = 0
+        for off in range(1, max_margin + 1):
+            i = s_idx - off
+            if i < 0:
+                break
+            if _local_std(i) <= threshold_std and off >= base_margin:
+                pb = off
+                break
+            expanded[i] = True
+            pb = off
+        margins_pre.append(pb)
+
+    # 3. ensure base_margin minimum
+    base_expanded = expand_anomaly_mask(anomaly_mask, base_margin)
+    expanded = expanded | base_expanded
+
+    excl_pre_cap = float(expanded.sum()) / n
+    avg_pre = float(np.mean(margins_pre)) if margins_pre else float(base_margin)
+    avg_post = float(np.mean(margins_post)) if margins_post else float(base_margin)
+    eff_margin = max_margin
+
+    # 4. cap total exclusion
+    if excl_pre_cap > max_exclusion_ratio:
+        # margin を base_margin から段階的に縮小して max_exclusion_ratio 以下を目指す
+        for m in range(base_margin, -1, -5):
+            candidate = expand_anomaly_mask(anomaly_mask, m)
+            if candidate.sum() / n <= max_exclusion_ratio:
+                expanded = candidate
+                eff_margin = m
+                break
+        else:
+            expanded = anomaly_mask.copy()
+            eff_margin = 0
+
+    excl_final = float(expanded.sum()) / n
+
+    info = {
+        'baseline_std': baseline_std,
+        'avg_margin_pre': avg_pre,
+        'avg_margin_post': avg_post,
+        'exclusion_ratio_pre_cap': excl_pre_cap,
+        'exclusion_ratio_final': excl_final,
+        'effective_margin_after_cap': int(eff_margin),
+        'fallback': False,
+    }
+    return expanded, info
+
+
 def _default_scorer_factories(percentile: float = 99.0) -> List[Callable]:
     return [
         lambda: StreamingJumpScorer(percentile=percentile),
@@ -161,6 +312,11 @@ class RegimeAwareDetector:
                  K: Union[int, str] = 'auto',
                  K_max: int = 5,
                  mask_margin: int = 50,
+                 margin_adaptive: bool = False,
+                 margin_max: int = 300,
+                 margin_max_exclusion_ratio: float = 0.4,
+                 margin_recovery_window: int = 30,
+                 margin_variance_ratio: float = 2.0,
                  percentile: float = 99.0,
                  threshold_method: str = 'percentile',
                  iqr_k: float = 3.0,
@@ -180,7 +336,15 @@ class RegimeAwareDetector:
                「最小クラスタが min_frames_per_regime 以上」かつ BIC 最小の K を選ぶ。
                artificialWithAnomaly の synthetic data 等で K=1 が最適なケースに対応。
             K_max: K='auto' の最大候補数 (default 5)
-            mask_margin: anomaly window の前後 margin (frame)
+            mask_margin: anomaly window の前後 margin (frame)。
+                margin_adaptive=True のときは「base_margin = 最低保証」として機能。
+            margin_adaptive: True で adaptive_anomaly_mask を使用 (default False)
+                gradual leak (anomaly 影響が window 外に染み出す) と
+                clean shrink (多窓 file で除外過剰) を同時対処。
+            margin_max: 適応延長の上限 frame (default 300)
+            margin_max_exclusion_ratio: 総除外率の cap (default 0.4)
+            margin_recovery_window: local variance を測る window (default 30)
+            margin_variance_ratio: baseline の何倍までを recovered と見るか (default 2.0)
             percentile: 'percentile' / 'trimmed_percentile' 用 percentile (default 99)
             threshold_method: regime ごとの threshold 計算手法
                 - 'percentile'         : np.percentile(scores, percentile)   ← baseline
@@ -211,6 +375,11 @@ class RegimeAwareDetector:
             self.K = max(1, int(K))
         self.K_max = int(K_max)
         self.mask_margin = int(mask_margin)
+        self.margin_adaptive = bool(margin_adaptive)
+        self.margin_max = int(margin_max)
+        self.margin_max_exclusion_ratio = float(margin_max_exclusion_ratio)
+        self.margin_recovery_window = int(margin_recovery_window)
+        self.margin_variance_ratio = float(margin_variance_ratio)
         self.percentile = float(percentile)
         valid_methods = {'percentile', 'trimmed_percentile', 'iqr', 'mad', 'capped'}
         if threshold_method not in valid_methods:
@@ -241,6 +410,7 @@ class RegimeAwareDetector:
         self.clean_sd: Optional[np.ndarray] = None
         self.cal_clean_frames: int = 0
         self.bic_per_K: Dict[int, float] = {}
+        self.margin_info: Optional[Dict] = None
 
     def _fit_gmm_adaptive(self, clean: np.ndarray) -> tuple:
         """K∈[1, K_upper] を試して、最小クラスタが min_frames_per_regime
@@ -331,8 +501,20 @@ class RegimeAwareDetector:
                 f"anomaly_mask shape {anomaly_mask.shape} != events length {n}"
             )
 
-        # 1. マスク拡張
-        expanded_mask = expand_anomaly_mask(anomaly_mask, self.mask_margin)
+        # 1. マスク拡張 (固定 margin or adaptive)
+        if self.margin_adaptive:
+            expanded_mask, self.margin_info = adaptive_anomaly_mask(
+                events,
+                anomaly_mask,
+                base_margin=self.mask_margin,
+                max_margin=self.margin_max,
+                max_exclusion_ratio=self.margin_max_exclusion_ratio,
+                recovery_window=self.margin_recovery_window,
+                variance_ratio=self.margin_variance_ratio,
+            )
+        else:
+            expanded_mask = expand_anomaly_mask(anomaly_mask, self.mask_margin)
+            self.margin_info = None
         clean_idx = np.where(~expanded_mask)[0]
         if len(clean_idx) < max(self.min_frames_per_regime * 2, 100):
             raise ValueError(
