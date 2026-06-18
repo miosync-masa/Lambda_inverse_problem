@@ -197,9 +197,10 @@ def main():
                     help='baseline の何倍までを recovered と見るか (default 2.0)')
     ap.add_argument('--min-frames-per-regime', type=int, default=50,
                     help='各 regime に必要な最小サンプル数 (BIC 採用条件)')
-    ap.add_argument('--threshold-method', default='percentile',
+    ap.add_argument('--threshold-method', default='trimmed_percentile',
                     choices=['percentile', 'trimmed_percentile', 'iqr', 'mad', 'capped'],
-                    help='regime ごと threshold 計算手法 (default percentile=baseline)')
+                    help='regime ごと threshold 計算手法 '
+                         '(default trimmed_percentile = NAB 72.02 確定値)')
     ap.add_argument('--iqr-k', type=float, default=3.0,
                     help='iqr method の係数 (default 3.0)')
     ap.add_argument('--mad-k', type=float, default=2.5,

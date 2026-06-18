@@ -318,7 +318,7 @@ class RegimeAwareDetector:
                  margin_recovery_window: int = 30,
                  margin_variance_ratio: float = 2.0,
                  percentile: float = 99.0,
-                 threshold_method: str = 'percentile',
+                 threshold_method: str = 'trimmed_percentile',
                  iqr_k: float = 3.0,
                  mad_k: float = 2.5,
                  trim_fraction: float = 0.01,
@@ -341,18 +341,22 @@ class RegimeAwareDetector:
             margin_adaptive: True で adaptive_anomaly_mask を使用 (default False)
                 gradual leak (anomaly 影響が window 外に染み出す) と
                 clean shrink (多窓 file で除外過剰) を同時対処。
+                NAB 実験では効果なし (NAB ラベルは tight なため variance recovery が即起こる)。
+                seasonal drift / long-tail recovery を持つ domain で有効と想定。
             margin_max: 適応延長の上限 frame (default 300)
             margin_max_exclusion_ratio: 総除外率の cap (default 0.4)
             margin_recovery_window: local variance を測る window (default 30)
             margin_variance_ratio: baseline の何倍までを recovered と見るか (default 2.0)
             percentile: 'percentile' / 'trimmed_percentile' 用 percentile (default 99)
             threshold_method: regime ごとの threshold 計算手法
-                - 'percentile'         : np.percentile(scores, percentile)   ← baseline
-                - 'trimmed_percentile' : 上位 trim_fraction を除外後の percentile
-                - 'iqr'                : Q3 + iqr_k * IQR   (Tukey の outlier rule)
-                - 'mad'                : median + mad_k * 1.4826 * MAD
-                rare extreme value (training 内 outlier) が threshold を爆発させる
-                ケース (realAWSCloudwatch/grok_asg, iio_us-east-1) を救う狙い。
+                ★ Default: 'trimmed_percentile' (NAB 全 52 file 加重 72.02 確定)
+                - 'trimmed_percentile' : 上位 trim_fraction (default 1%) 除外後の percentile
+                                         ← RECOMMENDED (training 内 rare outlier を除去)
+                - 'percentile'         : np.percentile(scores, percentile)  (baseline 71.29)
+                - 'iqr'                : Q3 + iqr_k * IQR (experimental, NAB 66.88)
+                - 'mad'                : median + mad_k * 1.4826 * MAD (experimental, NAB 66.09)
+                - 'capped'             : min(p99, cap_ratio * p_cap_quantile) (experimental,
+                                         small regime で誤発動するため非推奨, NAB 70.69)
             iqr_k: 'iqr' method の係数 (default 3.0、Tukey extreme outlier)
             mad_k: 'mad' method の係数 (default 2.5、~99% 相当)
             trim_fraction: 'trimmed_percentile' method の上位除外割合 (default 0.01)
