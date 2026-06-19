@@ -40,52 +40,53 @@ from tests.nab_features import expand_to_5d
 from tests.nab_metrics import format_nab_score, score_all_profiles
 
 
-def make_detector(percentile: float = 99.0) -> Lambda3StreamingDetector:
-    """Default streaming detector configuration。"""
+#: Mapping from short scorer name → factory builder for streaming.
+#: Mirrors lambda3_detector.regime.SCORER_FACTORIES but for the streaming
+#: scorer classes (per-scorer ablation via --scorers / --exclude-scorers).
+STREAMING_SCORER_FACTORIES = {
+    'jump':    lambda p: StreamingJumpScorer(percentile=p),
+    'gradual': lambda p: StreamingGradualScorer(
+        window_sizes=[50, 200, 500], percentile=p),
+    'drift':   lambda p: StreamingStructuralDriftScorer(
+        local_window=200, percentile=p),
+    'recon':   lambda p: StreamingReconstructionScorer(
+        n_components=5, delay_window=20, percentile=p),
+    'kernel':  lambda p: StreamingKernelScorer(
+        kernel='polynomial', degree=3, coef0=1.0, percentile=p),
+    'struct':  lambda p: StreamingStructuralScorer(
+        delay_window=20, percentile=p),
+}
+
+STREAMING_SCORER_NAMES = ['jump', 'gradual', 'drift', 'recon', 'kernel', 'struct']
+
+# NOTE: StreamingPeriodicScorer は default 構成から外している。
+#   理由 (realKnownCause 7-file 実測):
+#     - ambient_temp (季節 drift で calibration 不整合) で救済不能
+#     - nyc_taxi で noise floor 上昇により -10.96 ポイント副作用
+#     - 6-scorer 比 net mean は -1.10
+#   思想は正しいが static calibration の streaming 設計と相性悪く、
+#   adaptive baseline (EWMA 等) が必須。研究課題として温存。
+
+
+def make_detector(percentile: float = 99.0,
+                  scorer_names: list = None) -> Lambda3StreamingDetector:
+    """Streaming detector configuration with optional scorer subset。"""
+    names = scorer_names if scorer_names is not None else STREAMING_SCORER_NAMES
+    scorers = [STREAMING_SCORER_FACTORIES[n](percentile) for n in names]
     return Lambda3StreamingDetector(
-        scorers=[
-            StreamingJumpScorer(percentile=percentile),
-            StreamingGradualScorer(
-                window_sizes=[50, 200, 500],
-                percentile=percentile,
-            ),
-            StreamingStructuralDriftScorer(
-                local_window=200,
-                percentile=percentile,
-            ),
-            StreamingReconstructionScorer(
-                n_components=5,
-                delay_window=20,
-                percentile=percentile,
-            ),
-            StreamingKernelScorer(
-                kernel='polynomial',
-                degree=3,
-                coef0=1.0,
-                percentile=percentile,
-            ),
-            StreamingStructuralScorer(
-                delay_window=20,
-                percentile=percentile,
-            ),
-            # NOTE: StreamingPeriodicScorer は default 構成から外している。
-            #   理由 (realKnownCause 7-file 実測):
-            #     - ambient_temp (季節 drift で calibration 不整合) で救済不能
-            #     - nyc_taxi で noise floor 上昇により -10.96 ポイント副作用
-            #     - 6-scorer 比 net mean は -1.10
-            #   思想は正しいが static calibration の streaming 設計と相性悪く、
-            #   adaptive baseline (EWMA 等) が必須。研究課題として温存。
-            # StreamingPeriodicScorer(min_period=12, percentile=percentile),
-        ],
+        scorers=scorers,
         calibration_ratio=0.15,
         min_calibration=50,
     )
 
 
 def run_one(sample, n_features: int = 5, feature_window: int = 30,
-            percentile: float = 99.0) -> Dict:
+            percentile: float = 99.0,
+            scorer_names: list = None) -> Dict:
+    sc_disp = ",".join(scorer_names) if scorer_names else "all"
     print(f"\n■ {sample.name}  n={sample.n}  #windows={len(sample.windows_ts)}  "
-          f"features={n_features}  percentile={percentile}  [STREAMING]")
+          f"features={n_features}  percentile={percentile}  "
+          f"scorers=[{sc_disp}]  [STREAMING]")
 
     if n_features == 1:
         events = sample.values
@@ -94,7 +95,7 @@ def run_one(sample, n_features: int = 5, feature_window: int = 30,
     else:
         raise ValueError(f"unsupported n_features={n_features}")
 
-    detector = make_detector(percentile=percentile)
+    detector = make_detector(percentile=percentile, scorer_names=scorer_names)
     t0 = time.perf_counter()
     result = detector.fit_predict(events)
     t_run = time.perf_counter() - t0
@@ -148,10 +149,34 @@ def main():
     ap.add_argument('--feature-window', type=int, default=30)
     ap.add_argument('--percentile', type=float, default=99.0,
                     help='calibration threshold percentile (default 99.0)')
+    ap.add_argument('--scorers', default='all',
+                    help=f'使用する scorer のカンマ区切り (default all = {",".join(STREAMING_SCORER_NAMES)})。'
+                         f'例: "jump,kernel"')
+    ap.add_argument('--exclude-scorers', default='',
+                    help='除外する scorer のカンマ区切り (leave-one-out ablation 用)')
     args = ap.parse_args()
+
+    # Scorer selection
+    if args.scorers.strip().lower() == 'all':
+        included = list(STREAMING_SCORER_NAMES)
+    else:
+        included = [s.strip() for s in args.scorers.split(',') if s.strip()]
+        for s in included:
+            if s not in STREAMING_SCORER_NAMES:
+                ap.error(f"unknown scorer {s!r}; valid: {STREAMING_SCORER_NAMES}")
+    if args.exclude_scorers.strip():
+        excluded = {s.strip() for s in args.exclude_scorers.split(',') if s.strip()}
+        for s in excluded:
+            if s not in STREAMING_SCORER_NAMES:
+                ap.error(f"unknown exclude scorer {s!r}; valid: {STREAMING_SCORER_NAMES}")
+        included = [s for s in included if s not in excluded]
+    if not included:
+        ap.error("no scorers selected after include/exclude")
+    scorer_names_active = included
 
     print("=" * 110)
     print(f"NAB STREAMING benchmark  category={args.category}  "
+          f"scorers=[{','.join(scorer_names_active)}]  "
           f"windows={args.windows_file}  features={args.features}  "
           f"percentile={args.percentile}")
     print("=" * 110)
@@ -160,7 +185,8 @@ def main():
     for sample in iter_category(args.category, windows_file=args.windows_file):
         rows.append(run_one(sample, n_features=args.features,
                             feature_window=args.feature_window,
-                            percentile=args.percentile))
+                            percentile=args.percentile,
+                            scorer_names=scorer_names_active))
 
     if not rows:
         print("\n(no samples matched)")

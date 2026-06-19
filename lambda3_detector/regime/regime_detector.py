@@ -284,25 +284,54 @@ def adaptive_anomaly_mask(events: np.ndarray,
     return expanded, info
 
 
+#: Mapping from short scorer name → factory. Used for per-scorer ablation
+#: ("--scorers jump,kernel" or "--exclude-scorers kernel" in CLI).
+SCORER_FACTORIES: Dict[str, Callable[[float], Callable]] = {
+    'jump':    lambda p: (lambda: StreamingJumpScorer(percentile=p)),
+    'gradual': lambda p: (lambda: StreamingGradualScorer(
+        window_sizes=[50, 200, 500], percentile=p)),
+    'drift':   lambda p: (lambda: StreamingStructuralDriftScorer(
+        local_window=200, percentile=p)),
+    'recon':   lambda p: (lambda: StreamingReconstructionScorer(
+        n_components=5, delay_window=20, percentile=p)),
+    'kernel':  lambda p: (lambda: StreamingKernelScorer(
+        kernel='polynomial', degree=3, coef0=1.0, percentile=p)),
+    'struct':  lambda p: (lambda: StreamingStructuralScorer(
+        delay_window=20, percentile=p)),
+}
+
+#: Canonical ordering (for reproducibility, deterministic results).
+SCORER_NAMES: List[str] = ['jump', 'gradual', 'drift', 'recon', 'kernel', 'struct']
+
+
+def build_scorer_factories(scorer_names: Optional[List[str]] = None,
+                           percentile: float = 99.0) -> List[Callable]:
+    """Build scorer factory list from short names.
+
+    Args:
+        scorer_names: subset of SCORER_NAMES (default = all 6 in canonical order)
+        percentile: passed to each scorer
+
+    Raises:
+        ValueError: unknown scorer name or empty list
+    """
+    if scorer_names is None:
+        scorer_names = SCORER_NAMES
+    if not scorer_names:
+        raise ValueError("scorer_names must be non-empty")
+    out = []
+    for name in scorer_names:
+        if name not in SCORER_FACTORIES:
+            raise ValueError(
+                f"unknown scorer name {name!r}; valid: {SCORER_NAMES}"
+            )
+        out.append(SCORER_FACTORIES[name](percentile))
+    return out
+
+
 def _default_scorer_factories(percentile: float = 99.0) -> List[Callable]:
-    return [
-        lambda: StreamingJumpScorer(percentile=percentile),
-        lambda: StreamingGradualScorer(
-            window_sizes=[50, 200, 500], percentile=percentile
-        ),
-        lambda: StreamingStructuralDriftScorer(
-            local_window=200, percentile=percentile
-        ),
-        lambda: StreamingReconstructionScorer(
-            n_components=5, delay_window=20, percentile=percentile
-        ),
-        lambda: StreamingKernelScorer(
-            kernel='polynomial', degree=3, coef0=1.0, percentile=percentile
-        ),
-        lambda: StreamingStructuralScorer(
-            delay_window=20, percentile=percentile
-        ),
-    ]
+    """Backward-compat: build all 6 default scorer factories."""
+    return build_scorer_factories(None, percentile=percentile)
 
 
 class RegimeAwareDetector:

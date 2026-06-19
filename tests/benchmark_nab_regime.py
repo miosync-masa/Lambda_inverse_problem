@@ -25,7 +25,11 @@ from typing import Dict, List
 
 import numpy as np
 
-from lambda3_detector.regime import RegimeAwareDetector
+from lambda3_detector.regime import (
+    RegimeAwareDetector,
+    SCORER_NAMES,
+    build_scorer_factories,
+)
 
 from tests.nab_datasets import iter_category
 from tests.nab_features import expand_to_5d
@@ -59,7 +63,8 @@ def run_one(sample,
             cap_ratio: float = 5.0,
             cap_quantile: float = 90.0,
             cap_min_regime_size: int = 300,
-            min_frames_per_regime: int = 50) -> Dict:
+            min_frames_per_regime: int = 50,
+            scorer_names: list = None) -> Dict:
     n_windows = len(sample.windows_ts)
     K_disp = K if isinstance(K, str) else int(K)
     print(f"\n■ {sample.name}  n={sample.n}  #windows={n_windows}  "
@@ -78,6 +83,11 @@ def run_one(sample,
         print("  (no anomaly windows, skipping)")
         return None
 
+    # Build scorer factories (default = all 6, or subset via --scorers)
+    scorer_factories = build_scorer_factories(
+        scorer_names=scorer_names, percentile=percentile
+    )
+
     detector = RegimeAwareDetector(
         K=K, K_max=K_max, mask_margin=mask_margin, percentile=percentile,
         margin_adaptive=margin_adaptive,
@@ -90,6 +100,7 @@ def run_one(sample,
         cap_ratio=cap_ratio, cap_quantile=cap_quantile,
         cap_min_regime_size=cap_min_regime_size,
         min_frames_per_regime=min_frames_per_regime,
+        scorer_factories=scorer_factories,
     )
 
     t0 = time.perf_counter()
@@ -213,6 +224,11 @@ def main():
                     help='capped method の cap base quantile (default 90.0)')
     ap.add_argument('--cap-min-regime-size', type=int, default=300,
                     help='capped を有効化する最小 regime サイズ (default 300、未満は percentile fallback)')
+    ap.add_argument('--scorers', default='all',
+                    help=f'使用する scorer のカンマ区切り (default all = {",".join(SCORER_NAMES)})。'
+                         f'例: "jump,kernel" / 利用可能: {SCORER_NAMES}')
+    ap.add_argument('--exclude-scorers', default='',
+                    help='除外する scorer のカンマ区切り (leave-one-out ablation 用)')
     args = ap.parse_args()
 
     # K parse: int or 'auto'
@@ -222,12 +238,32 @@ def main():
     else:
         K_param = int(K_raw)
 
+    # Scorer selection (--scorers / --exclude-scorers)
+    if args.scorers.strip().lower() == 'all':
+        included = list(SCORER_NAMES)
+    else:
+        included = [s.strip() for s in args.scorers.split(',') if s.strip()]
+        for s in included:
+            if s not in SCORER_NAMES:
+                ap.error(f"unknown scorer {s!r}; valid: {SCORER_NAMES}")
+    if args.exclude_scorers.strip():
+        excluded = {s.strip() for s in args.exclude_scorers.split(',') if s.strip()}
+        for s in excluded:
+            if s not in SCORER_NAMES:
+                ap.error(f"unknown exclude scorer {s!r}; valid: {SCORER_NAMES}")
+        included = [s for s in included if s not in excluded]
+    if not included:
+        ap.error("no scorers selected after include/exclude")
+    scorer_names_active = included
+
     print("=" * 110)
     K_disp = K_param if isinstance(K_param, str) else int(K_param)
+    scorers_disp = ",".join(scorer_names_active)
     print(f"NAB REGIME-AWARE benchmark  category={args.category}  "
           f"K={K_disp}  K_max={args.K_max}  mask_margin={args.mask_margin}  "
           f"min_frames_per_regime={args.min_frames_per_regime}  "
           f"thr_method={args.threshold_method}  "
+          f"scorers=[{scorers_disp}]  "
           f"windows={args.windows_file}  features={args.features}  "
           f"percentile={args.percentile}")
     print("=" * 110)
@@ -250,6 +286,7 @@ def main():
             cap_ratio=args.cap_ratio, cap_quantile=args.cap_quantile,
             cap_min_regime_size=args.cap_min_regime_size,
             min_frames_per_regime=args.min_frames_per_regime,
+            scorer_names=scorer_names_active,
         )
         if r is not None:
             rows.append(r)
