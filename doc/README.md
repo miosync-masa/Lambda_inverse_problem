@@ -8,6 +8,7 @@ Paper / publication drafts and detailed benchmarking artifacts.
 - **[abstract.md](abstract.md)** — Paper abstract drafts (long/short/tagline) + title candidates + method paragraph + limitations
 - **[scoreboard.md](scoreboard.md)** — Full NAB scoreboard comparison: per-category, per-file, Tier 0 vs Tier 2, experimental progression, honest framing, reproducibility recipe
 - **[future_work.md](future_work.md)** — Future-work proposals: BatchDriftDetector (long-term drift, time-resolution extension) + MultiChannelDiagnostics (multi-channel fault mode, spatial-dimension extension). Implementation specs for a future Claude Code session, not yet implemented.
+- **[industrial_brief.md](industrial_brief.md)** — 産業顧客向け技術概要（日本語）。何ができる/できない/メリットを honest framing で整理。計算性能・アーキテクチャ図・PoC 提案・NAB 結果参考表を含む。
 
 ## Quick navigation
 
