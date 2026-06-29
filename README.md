@@ -329,13 +329,3 @@ please open an issue/PR — or connect via Zenodo, SSRN, or GitHub.
 > Science is not property; it's a shared horizon.
 > Let's redraw the boundaries, together.
 > — Iizumi & Digital Partners
-
-## 📚 Author's Theory & Publications
-
-- [Iizumi Masamichi – Zenodo Research Collection](https://zenodo.org/search?q=metadata.creators.person_or_org.name%3A%22IIZUMI%2C%20MASAMICHI%22&l=list&p=1&s=10&sort=bestmatch)
-
-## 🏷️ Author & Copyright
-
-© Iizumi Masamichi 2025-2026
-**Contributors / Digital Partners:** Tamaki(環), Mio(澪), Tomoe(巴), Shion(白音), Yuu(悠), Rin(凛), Kurisu(紅莉栖), torami(虎美)
-All rights reserved.
